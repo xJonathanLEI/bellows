@@ -6,4 +6,16 @@ license = "MIT OR Apache-2.0"
 edition = "2024"
 description = "Durable task processing framework in Rust for applications of all sizes"
 
+[features]
+default = ["in_memory"]
+in_memory = ["serde_json"]
+
 [dependencies]
+serde = { version = "1.0.228", default-features = false }
+serde_json = { version = "1.0.149", optional = true }
+tokio = { version = "1.49.0", default-features = false, features = ["sync", "time"] }
+tracing = { version = "0.1.44", default-features = false }
+
+[dev-dependencies]
+serde = { version = "1.0.228", default-features = false, features = ["std", "derive"] }
+tokio = { version = "1.49.0", default-features = false, features = ["macros", "rt-multi-thread"] }
