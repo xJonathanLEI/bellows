@@ -82,9 +82,13 @@ async fn test_in_memory_backend() {
         .await
         .unwrap();
 
+    // Wait for all 3 tasks to be processed. This must be called before `drain()` to avoid a race
+    // condition where the dispatcher hasn't managed to claim all the tasks before being drained
+    assert_names_echoed(&mut processed_rx, &["Alice", "Bob", "Charlie"]).await;
+
     dispatcher_handle.drain().await;
 
-    assert_names_echoed(&mut processed_rx, &["Alice", "Bob", "Charlie"]).await;
+    assert!(processed_rx.recv().await.is_none());
 }
 
 #[tokio::test]
@@ -118,15 +122,19 @@ async fn test_sweeping() {
         .await
         .unwrap();
 
-    dispatcher_handle.drain().await;
-
     // All 3 tasks must have been processed despite the late dispatcher launch
     assert_names_echoed(&mut processed_rx, &["Alice", "Bob", "Charlie"]).await;
+
+    dispatcher_handle.drain().await;
+
+    assert!(processed_rx.recv().await.is_none());
 }
 
 async fn assert_names_echoed(rx: &mut MpscReceiver<ProcessedTask>, names: &[&str]) {
     let mut processed = Vec::new();
-    while let Some(task) = rx.recv().await {
+    while processed.len() < names.len()
+        && let Some(task) = rx.recv().await
+    {
         processed.push(task);
     }
 
