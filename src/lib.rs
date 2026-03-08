@@ -41,6 +41,12 @@ pub mod dispatcher;
 pub(crate) mod runtime;
 
 pub trait TaskDefinition {
+    /// A globally stable backend namespace for this task definition.
+    ///
+    /// Backends use this name to physically separate tasks belonging to different definitions so a
+    /// worker can never successfully claim a task for the wrong payload type.
+    const NAME: &'static str;
+
     /// The instance-specific data provided by the task.
     type Payload: Serialize + DeserializeOwned + Send;
 }

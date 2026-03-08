@@ -1,9 +1,11 @@
 //! SQLite task backend implementation.
 
 use std::{
+    collections::HashMap,
     error::Error as StdError,
     fmt::{Display, Formatter},
     str::FromStr,
+    sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -24,6 +26,7 @@ const SIGNAL_CHANNEL_SIZE: usize = 1024;
 const INITIALIZE_SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS bellows_tasks (
     task_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_name TEXT NOT NULL,
     payload_json TEXT NOT NULL,
     lease_worker_id INTEGER,
     lease_expiration_unix_ms INTEGER,
@@ -31,7 +34,7 @@ CREATE TABLE IF NOT EXISTS bellows_tasks (
 );
 
 CREATE INDEX IF NOT EXISTS bellows_tasks_sweep_idx
-    ON bellows_tasks (lease_expiration_unix_ms, task_id);
+    ON bellows_tasks (task_name, lease_expiration_unix_ms, task_id);
 "#;
 
 #[derive(Debug)]
@@ -84,7 +87,7 @@ impl StdError for SqliteBackendError {
 #[derive(Clone, Debug)]
 pub struct SqliteBackend {
     pool: SqlitePool,
-    signal: BroadcastSender<BackendSignal>,
+    signals: Arc<Mutex<HashMap<&'static str, BroadcastSender<BackendSignal>>>>,
 }
 
 impl SqliteBackend {
@@ -110,9 +113,10 @@ impl SqliteBackend {
             .connect_with(options)
             .await?;
 
-        let (signal, _) = broadcast::channel(SIGNAL_CHANNEL_SIZE);
-
-        Ok(Self { pool, signal })
+        Ok(Self {
+            pool,
+            signals: Default::default(),
+        })
     }
 
     /// Initializes the SQLite schema required by the backend.
@@ -125,25 +129,49 @@ impl SqliteBackend {
 
         Ok(())
     }
+
+    fn signal_for_task(&self, task_name: &'static str) -> BroadcastSender<BackendSignal> {
+        let mut signals = self
+            .signals
+            .lock()
+            .expect("sqlite backend signal registry mutex should not be poisoned");
+
+        signals
+            .entry(task_name)
+            .or_insert_with(|| broadcast::channel(SIGNAL_CHANNEL_SIZE).0)
+            .clone()
+    }
 }
 
 impl Backend for SqliteBackend {
-    async fn subscribe(&self) -> Result<BackendSignalSubscription, SubscribeError> {
-        Ok(BackendSignalSubscription::new(self.signal.subscribe()))
+    async fn subscribe<T>(&self) -> Result<BackendSignalSubscription<T>, SubscribeError>
+    where
+        T: TaskDefinition,
+    {
+        Ok(BackendSignalSubscription::new(
+            self.signal_for_task(T::NAME).subscribe(),
+        ))
     }
 
-    async fn sweep(&self) -> Result<Vec<SweptTask>, SweepTasksError> {
+    async fn sweep<T>(&self) -> Result<Vec<SweptTask>, SweepTasksError>
+    where
+        T: TaskDefinition,
+    {
         let now_unix_ms = unix_timestamp_ms(SystemTime::now());
         let rows = sqlx::query(
             r#"
 SELECT task_id
 FROM bellows_tasks
-WHERE lease_worker_id IS NULL
-   OR lease_expiration_unix_ms IS NULL
-   OR lease_expiration_unix_ms <= ?
+WHERE task_name = ?
+  AND (
+        lease_worker_id IS NULL
+        OR lease_expiration_unix_ms IS NULL
+        OR lease_expiration_unix_ms <= ?
+      )
 ORDER BY task_id
 "#,
         )
+        .bind(T::NAME)
         .bind(now_unix_ms)
         .fetch_all(&self.pool)
         .await
@@ -170,10 +198,11 @@ ORDER BY task_id
 
         let result = sqlx::query(
             r#"
-INSERT INTO bellows_tasks (payload_json)
-VALUES (?)
+INSERT INTO bellows_tasks (task_name, payload_json)
+VALUES (?, ?)
 "#,
         )
+        .bind(T::NAME)
         .bind(payload_json)
         .execute(&self.pool)
         .await
@@ -183,9 +212,11 @@ VALUES (?)
             PublishTaskError::Backend(Box::new(SqliteBackendError::InvalidTaskId(err)))
         })?;
 
-        let _ = self.signal.send(BackendSignal::NewTaskAvailable(
-            NewTaskAvailableSignalPayload { task_id },
-        ));
+        let _ = self
+            .signal_for_task(T::NAME)
+            .send(BackendSignal::NewTaskAvailable(
+                NewTaskAvailableSignalPayload { task_id },
+            ));
 
         Ok(PublishedTask { task_id })
     }
@@ -214,6 +245,7 @@ VALUES (?)
 UPDATE bellows_tasks
 SET lease_worker_id = ?, lease_expiration_unix_ms = ?
 WHERE task_id = ?
+  AND task_name = ?
   AND (
         lease_worker_id IS NULL
         OR lease_expiration_unix_ms IS NULL
@@ -225,6 +257,7 @@ RETURNING payload_json
         .bind(worker_id_db)
         .bind(lease_expiration_unix_ms)
         .bind(task_id_db)
+        .bind(T::NAME)
         .bind(now_unix_ms)
         .fetch_optional(&self.pool)
         .await
@@ -251,9 +284,11 @@ RETURNING payload_json
 SELECT lease_expiration_unix_ms
 FROM bellows_tasks
 WHERE task_id = ?
+  AND task_name = ?
 "#,
                 )
                 .bind(task_id_db)
+                .bind(T::NAME)
                 .fetch_optional(&self.pool)
                 .await
                 .map_err(|err| ClaimTaskError::Backend(Box::new(SqliteBackendError::Sqlx(err))))?;

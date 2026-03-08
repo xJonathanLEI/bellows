@@ -5,11 +5,10 @@ use tokio::sync::mpsc::{UnboundedReceiver as MpscReceiver, UnboundedSender as Mp
 
 use crate::runtime::WorkerRuntime;
 use crate::{
-    Backend, WorkerFactory,
+    Backend, Worker, WorkerFactory,
     backends::{BackendSignal, BackendSignalSubscription, SubscribeError, SweepTasksError},
 };
 
-#[derive(Debug)]
 pub struct WorkerDispatcher<B, F> {
     backend: B,
     factory: Arc<F>,
@@ -28,6 +27,8 @@ impl<B, F> WorkerDispatcher<B, F>
 where
     B: Backend + 'static,
     F: WorkerFactory + 'static,
+    F::Worker: 'static,
+    <F::Worker as Worker>::Task: 'static,
 {
     pub async fn launch(self) -> Result<WorkerDispatcherHandle, WorkerDispatcherLaunchError> {
         let drain_signal = Arc::new(Notify::const_new());
@@ -36,12 +37,12 @@ where
 
         let subscription = self
             .backend
-            .subscribe()
+            .subscribe::<<F::Worker as Worker>::Task>()
             .await
             .map_err(WorkerDispatcherLaunchError::SubscribeFailed)?;
         let swept_tasks = self
             .backend
-            .sweep()
+            .sweep::<<F::Worker as Worker>::Task>()
             .await
             .map_err(WorkerDispatcherLaunchError::SweepFailed)?;
 
@@ -106,8 +107,10 @@ impl Drop for WorkerDispatcherHandle {
     }
 }
 
-#[derive(Debug)]
-struct Daemon<B, F> {
+struct Daemon<B, F>
+where
+    F: WorkerFactory,
+{
     context: DaemonContext<B, F>,
     state: DaemonState,
 }
@@ -116,7 +119,8 @@ impl<B, F> Daemon<B, F>
 where
     B: Backend + 'static,
     F: WorkerFactory + 'static,
-    <F as WorkerFactory>::Worker: 'static,
+    F::Worker: 'static,
+    <F::Worker as Worker>::Task: 'static,
 {
     async fn run(mut self) {
         while let EventLoopResult::Continue =
@@ -201,11 +205,13 @@ enum EventLoopResult {
     Exit,
 }
 
-#[derive(Debug)]
-struct DaemonContext<B, F> {
+struct DaemonContext<B, F>
+where
+    F: WorkerFactory,
+{
     backend: B,
     factory: Arc<F>,
-    subscription: BackendSignalSubscription,
+    subscription: BackendSignalSubscription<<F::Worker as Worker>::Task>,
     drain_signal: Arc<Notify>,
     drained_signal: Arc<Notify>,
     finished_tx: MpscSender<()>,

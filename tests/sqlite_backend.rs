@@ -15,6 +15,8 @@ struct EchoTaskPayload {
 }
 
 impl TaskDefinition for EchoTaskSpec {
+    const NAME: &str = "echo";
+
     type Payload = EchoTaskPayload;
 }
 

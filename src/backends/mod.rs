@@ -3,6 +3,7 @@
 use std::{
     error::Error as StdError,
     fmt::{Display, Formatter},
+    marker::PhantomData,
     time::Instant,
 };
 
@@ -27,20 +28,30 @@ pub mod sqlite;
 /// Other implementations may not have those and might use a two-step register-trigger process
 /// where dispatchers handle signaling on the side.
 pub trait Backend: Clone + Send {
-    /// Subscribes for signals for important task updates.
+    /// Subscribes for signals for important task updates for a specific task definition.
     ///
-    /// This is usually used by worker dispatchers to react to task availability.
-    fn subscribe(
+    /// This is usually used by worker dispatchers to react to task availability. Backends must
+    /// ensure subscriptions are namespaced by [`TaskDefinition::NAME`] so subscribers only observe
+    /// tasks for the requested definition.
+    fn subscribe<T>(
         &self,
-    ) -> impl Future<Output = Result<BackendSignalSubscription, SubscribeError>> + Send;
+    ) -> impl Future<Output = Result<BackendSignalSubscription<T>, SubscribeError>> + Send
+    where
+        T: TaskDefinition;
 
-    /// Lists tasks that are currently pending and should be considered for dispatch.
+    /// Lists tasks that are currently pending and should be considered for dispatch for a specific
+    /// task definition.
     ///
     /// This is used by dispatchers during startup to sweep for pre-existing work that may not have
     /// produced an observable signal for the current subscriber. Backends should return only task
     /// IDs that are currently claimable: tasks that are not durably finished and either have no
     /// active lease or only have an expired lease.
-    fn sweep(&self) -> impl Future<Output = Result<Vec<SweptTask>, SweepTasksError>> + Send;
+    ///
+    /// Backends must ensure sweep results are namespaced by [`TaskDefinition::NAME`] so dispatchers
+    /// only consider tasks for the requested definition.
+    fn sweep<T>(&self) -> impl Future<Output = Result<Vec<SweptTask>, SweepTasksError>> + Send
+    where
+        T: TaskDefinition;
 
     /// Publishes a task to be processed by workers.
     fn publish<T>(
@@ -129,12 +140,15 @@ impl StdError for SweepTasksError {
     }
 }
 
-#[derive(Debug)]
-pub struct BackendSignalSubscription {
+pub struct BackendSignalSubscription<T> {
     rx: BroadcastReceiver<BackendSignal>,
+    _task: PhantomData<fn() -> T>,
 }
 
-impl BackendSignalSubscription {
+impl<T> BackendSignalSubscription<T>
+where
+    T: TaskDefinition,
+{
     pub async fn recv(
         &mut self,
     ) -> Result<BackendSignal, tokio::sync::broadcast::error::RecvError> {
@@ -142,9 +156,12 @@ impl BackendSignalSubscription {
     }
 }
 
-impl BackendSignalSubscription {
+impl<T> BackendSignalSubscription<T> {
     pub fn new(rx: BroadcastReceiver<BackendSignal>) -> Self {
-        Self { rx }
+        Self {
+            rx,
+            _task: PhantomData,
+        }
     }
 }
 

@@ -77,12 +77,10 @@ impl InMemoryBackend {
     pub fn new() -> Self {
         let (command_tx, command_rx) = tokio::sync::mpsc::unbounded_channel::<DaemonCommand>();
 
-        let (sub_tx, _) = tokio::sync::broadcast::channel(SIGNAL_CHANNEL_SIZE);
-
         let daemon = Daemon {
             command_pipe: command_rx,
             next_task_id: 0,
-            signal: sub_tx,
+            signals: Default::default(),
             tasks: Default::default(),
         };
 
@@ -101,11 +99,15 @@ impl Default for InMemoryBackend {
 }
 
 impl Backend for InMemoryBackend {
-    async fn subscribe(&self) -> Result<BackendSignalSubscription, SubscribeError> {
+    async fn subscribe<T>(&self) -> Result<BackendSignalSubscription<T>, SubscribeError>
+    where
+        T: TaskDefinition,
+    {
         let (callback_tx, callback_rx) = tokio::sync::oneshot::channel();
 
         self.command_sink
             .send(DaemonCommand::Subscribe(SubscribeArgs {
+                task_name: T::NAME,
                 callback: callback_tx,
             }))
             .map_err(|_| {
@@ -119,11 +121,15 @@ impl Backend for InMemoryBackend {
         Ok(BackendSignalSubscription::new(result.sub_rx))
     }
 
-    async fn sweep(&self) -> Result<Vec<SweptTask>, SweepTasksError> {
+    async fn sweep<T>(&self) -> Result<Vec<SweptTask>, SweepTasksError>
+    where
+        T: TaskDefinition,
+    {
         let (callback_tx, callback_rx) = tokio::sync::oneshot::channel();
 
         self.command_sink
             .send(DaemonCommand::SweepTasks(SweepTasksArgs {
+                task_name: T::NAME,
                 callback: callback_tx,
             }))
             .map_err(|_| {
@@ -151,6 +157,7 @@ impl Backend for InMemoryBackend {
 
         self.command_sink
             .send(DaemonCommand::PublishTask(PublishTaskArgs {
+                task_name: T::NAME,
                 payload_json,
                 callback: callback_tx,
             }))
@@ -180,6 +187,7 @@ impl Backend for InMemoryBackend {
 
         self.command_sink
             .send(DaemonCommand::ClaimTask(ClaimTaskArgs {
+                task_name: T::NAME,
                 worker_id,
                 task_id,
                 lease_expiration,
@@ -276,7 +284,7 @@ impl Backend for InMemoryBackend {
 struct Daemon {
     command_pipe: MpscReceiver<DaemonCommand>,
     next_task_id: u64,
-    signal: BroadcastSender<BackendSignal>,
+    signals: HashMap<&'static str, BroadcastSender<BackendSignal>>,
     tasks: HashMap<u64, TaskEntry>,
 }
 
@@ -295,7 +303,11 @@ impl Daemon {
     }
 
     fn handle_subscribe(&mut self, args: SubscribeArgs) {
-        let rx = self.signal.subscribe();
+        let rx = self
+            .signals
+            .entry(args.task_name)
+            .or_insert_with(|| tokio::sync::broadcast::channel(SIGNAL_CHANNEL_SIZE).0)
+            .subscribe();
 
         // It doesn't matter if the caller is gone
         let _ = args.callback.send(SubscribeReturn { sub_rx: rx });
@@ -306,9 +318,15 @@ impl Daemon {
         let tasks = self
             .tasks
             .iter()
-            .filter_map(|(&task_id, task)| match task.claim.as_ref() {
-                Some(claim) if claim.lease_expiration > now => None,
-                _ => Some(SweptTask { task_id }),
+            .filter_map(|(&task_id, task)| {
+                if task.task_name != args.task_name {
+                    return None;
+                }
+
+                match task.claim.as_ref() {
+                    Some(claim) if claim.lease_expiration > now => None,
+                    _ => Some(SweptTask { task_id }),
+                }
             })
             .collect();
 
@@ -322,14 +340,17 @@ impl Daemon {
         self.tasks.insert(
             task_id,
             TaskEntry {
+                task_name: args.task_name,
                 payload: args.payload_json,
                 claim: None,
             },
         );
 
-        let _ = self.signal.send(BackendSignal::NewTaskAvailable(
-            NewTaskAvailableSignalPayload { task_id },
-        ));
+        if let Some(signal) = self.signals.get(args.task_name) {
+            let _ = signal.send(BackendSignal::NewTaskAvailable(
+                NewTaskAvailableSignalPayload { task_id },
+            ));
+        }
 
         // It doesn't matter if the caller is gone
         let _ = args.callback.send(PublishTaskReturn { task_id });
@@ -339,31 +360,36 @@ impl Daemon {
         let res = match self.tasks.entry(args.task_id) {
             HashMapEntry::Occupied(mut entry) => {
                 let task = entry.get_mut();
-                let claim = &mut task.claim;
 
-                if let Some(claim) = claim {
-                    if claim.lease_expiration <= Instant::now() {
-                        *claim = ClaimEntry {
+                if task.task_name != args.task_name {
+                    ClaimTaskReturn::TaskNotFound
+                } else {
+                    let claim = &mut task.claim;
+
+                    if let Some(claim) = claim {
+                        if claim.lease_expiration <= Instant::now() {
+                            *claim = ClaimEntry {
+                                worker_id: args.worker_id,
+                                lease_expiration: args.lease_expiration,
+                            };
+                            ClaimTaskReturn::Claimed {
+                                payload_json: task.payload.clone(),
+                                expiration: args.lease_expiration,
+                            }
+                        } else {
+                            ClaimTaskReturn::TaskUnavailable {
+                                expiration: claim.lease_expiration,
+                            }
+                        }
+                    } else {
+                        *claim = Some(ClaimEntry {
                             worker_id: args.worker_id,
                             lease_expiration: args.lease_expiration,
-                        };
+                        });
                         ClaimTaskReturn::Claimed {
                             payload_json: task.payload.clone(),
                             expiration: args.lease_expiration,
                         }
-                    } else {
-                        ClaimTaskReturn::TaskUnavailable {
-                            expiration: claim.lease_expiration,
-                        }
-                    }
-                } else {
-                    *claim = Some(ClaimEntry {
-                        worker_id: args.worker_id,
-                        lease_expiration: args.lease_expiration,
-                    });
-                    ClaimTaskReturn::Claimed {
-                        payload_json: task.payload.clone(),
-                        expiration: args.lease_expiration,
                     }
                 }
             }
@@ -429,6 +455,7 @@ impl Daemon {
 
 #[derive(Debug)]
 struct TaskEntry {
+    task_name: &'static str,
     payload: String,
     claim: Option<ClaimEntry>,
 }
@@ -451,6 +478,7 @@ enum DaemonCommand {
 
 #[derive(Debug)]
 struct SubscribeArgs {
+    task_name: &'static str,
     callback: OneshotSender<SubscribeReturn>,
 }
 
@@ -461,6 +489,7 @@ struct SubscribeReturn {
 
 #[derive(Debug)]
 struct SweepTasksArgs {
+    task_name: &'static str,
     callback: OneshotSender<SweepTasksReturn>,
 }
 
@@ -471,6 +500,7 @@ struct SweepTasksReturn {
 
 #[derive(Debug)]
 struct PublishTaskArgs {
+    task_name: &'static str,
     payload_json: String,
     callback: OneshotSender<PublishTaskReturn>,
 }
@@ -482,6 +512,7 @@ struct PublishTaskReturn {
 
 #[derive(Debug)]
 struct ClaimTaskArgs {
+    task_name: &'static str,
     worker_id: u64,
     task_id: u64,
     lease_expiration: Instant,
