@@ -1,0 +1,50 @@
+on:
+  push:
+    branches:
+      - "master"
+  pull_request:
+
+name: "Code checks"
+
+jobs:
+  rustfmt:
+    name: "Check code format"
+    runs-on: "ubuntu-latest"
+    steps:
+      - name: "Checkout source code"
+        uses: "actions/checkout@v6"
+
+      - name: "Setup toolchain"
+        uses: "actions-rs/toolchain@v1"
+        with:
+          toolchain: "stable"
+          components: "clippy"
+          override: true
+
+      - name: "Check Rust format"
+        run: |
+          cargo fmt --all -- --check
+
+  clippy:
+    name: "Run Clippy"
+    runs-on: "ubuntu-latest"
+
+    steps:
+      - name: "Checkout source code"
+        uses: "actions/checkout@v6"
+
+      - name: "Setup toolchain"
+        uses: "actions-rs/toolchain@v1"
+        with:
+          toolchain: "stable"
+          components: "clippy"
+          override: true
+
+      - name: "Use Rust cache"
+        uses: "Swatinem/rust-cache@v2"
+        with:
+          cache-on-failure: true
+
+      - name: "Run Clippy"
+        run: |
+          cargo clippy --all --all-targets -- -D warnings
