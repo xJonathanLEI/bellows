@@ -1,7 +1,7 @@
-#![cfg(feature = "in_memory")]
+#![cfg(feature = "sqlite")]
 
 use bellows::{
-    Backend, TaskDefinition, Worker, WorkerFactory, backends::in_memory::InMemoryBackend,
+    Backend, TaskDefinition, Worker, WorkerFactory, backends::sqlite::SqliteBackend,
     dispatcher::WorkerDispatcher,
 };
 use serde::{Deserialize, Serialize};
@@ -56,8 +56,10 @@ impl Worker for EchoWorker {
 }
 
 #[tokio::test]
-async fn test_in_memory_backend() {
-    let backend = InMemoryBackend::new();
+async fn test_sqlite_backend() {
+    let database = TestDatabase::new();
+    let backend = SqliteBackend::connect(database.url()).await.unwrap();
+    backend.initialize().await.unwrap();
     let (processed_tx, mut processed_rx) = tokio::sync::mpsc::unbounded_channel();
 
     let factory = EchoWorkerFactory { processed_tx };
@@ -84,8 +86,6 @@ async fn test_in_memory_backend() {
         .await
         .unwrap();
 
-    // Wait for all 3 tasks to be processed. This must be called before `drain()` to avoid a race
-    // condition where the dispatcher hasn't managed to claim all the tasks before being drained
     assert_names_echoed(&mut processed_rx, &["Alice", "Bob", "Charlie"]).await;
 
     dispatcher_handle.drain().await;
@@ -94,8 +94,10 @@ async fn test_in_memory_backend() {
 }
 
 #[tokio::test]
-async fn test_sweeping() {
-    let backend = InMemoryBackend::new();
+async fn test_sqlite_sweeping() {
+    let database = TestDatabase::new();
+    let backend = SqliteBackend::connect(database.url()).await.unwrap();
+    backend.initialize().await.unwrap();
     let (processed_tx, mut processed_rx) = tokio::sync::mpsc::unbounded_channel();
 
     let factory = EchoWorkerFactory { processed_tx };
@@ -108,7 +110,6 @@ async fn test_sweeping() {
         .await
         .unwrap();
 
-    // Launch dispatcher _after_ a task has already been published
     let dispatcher_handle = dispatcher.launch().await.unwrap();
 
     backend
@@ -124,7 +125,6 @@ async fn test_sweeping() {
         .await
         .unwrap();
 
-    // All 3 tasks must have been processed despite the late dispatcher launch
     assert_names_echoed(&mut processed_rx, &["Alice", "Bob", "Charlie"]).await;
 
     dispatcher_handle.drain().await;
@@ -143,5 +143,27 @@ async fn assert_names_echoed(rx: &mut MpscReceiver<ProcessedTask>, names: &[&str
     assert_eq!(processed.len(), names.len());
     for name in names {
         assert!(processed.iter().any(|task| task.name == *name));
+    }
+}
+
+struct TestDatabase {
+    _temp_dir: tempfile::TempDir,
+    url: String,
+}
+
+impl TestDatabase {
+    fn new() -> Self {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("test.sqlite");
+        std::fs::File::create(&db_path).unwrap();
+
+        Self {
+            _temp_dir: temp_dir,
+            url: format!("sqlite://{}", db_path.display()),
+        }
+    }
+
+    fn url(&self) -> &str {
+        &self.url
     }
 }

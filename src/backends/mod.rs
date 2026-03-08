@@ -1,6 +1,10 @@
 //! Built-in task backend implementations.
 
-use std::{future::Future, time::Instant};
+use std::{
+    error::Error as StdError,
+    fmt::{Display, Formatter},
+    time::Instant,
+};
 
 use tokio::sync::broadcast::Receiver as BroadcastReceiver;
 
@@ -8,6 +12,8 @@ use crate::TaskDefinition;
 
 #[cfg(feature = "in_memory")]
 pub mod in_memory;
+#[cfg(feature = "sqlite")]
+pub mod sqlite;
 
 /// A [`Backend`] is a means to connect to and interact the underlying task registry and its
 /// associated signal channel.
@@ -24,7 +30,9 @@ pub trait Backend: Clone + Send {
     /// Subscribes for signals for important task updates.
     ///
     /// This is usually used by worker dispatchers to react to task availability.
-    fn subscribe(&self) -> impl Future<Output = BackendSignalSubscription> + Send;
+    fn subscribe(
+        &self,
+    ) -> impl Future<Output = Result<BackendSignalSubscription, SubscribeError>> + Send;
 
     /// Lists tasks that are currently pending and should be considered for dispatch.
     ///
@@ -32,7 +40,7 @@ pub trait Backend: Clone + Send {
     /// produced an observable signal for the current subscriber. Backends should return only task
     /// IDs that are currently claimable: tasks that are not durably finished and either have no
     /// active lease or only have an expired lease.
-    fn sweep(&self) -> impl Future<Output = Vec<SweptTask>> + Send;
+    fn sweep(&self) -> impl Future<Output = Result<Vec<SweptTask>, SweepTasksError>> + Send;
 
     /// Publishes a task to be processed by workers.
     fn publish<T>(
@@ -70,6 +78,55 @@ pub trait Backend: Clone + Send {
         worker_id: u64,
         task_id: u64,
     ) -> impl Future<Output = Result<FinishedTask, FinishTaskError>> + Send;
+}
+
+/// Boxed backend-specific error source exposed by the public backend API.
+///
+/// This keeps `bellows` open to arbitrary external backend implementations without forcing an
+/// associated error type into the `Backend` trait, while still preserving the original error's
+/// `Display`, `Debug`, and `source` chain for downstream inspection and logging.
+pub type BoxBackendError = Box<dyn StdError + Send + Sync + 'static>;
+
+#[derive(Debug)]
+pub enum SubscribeError {
+    Backend(BoxBackendError),
+}
+
+impl Display for SubscribeError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Backend(error) => write!(f, "backend subscribe failed: {error}"),
+        }
+    }
+}
+
+impl StdError for SubscribeError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match self {
+            Self::Backend(error) => Some(error.as_ref()),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum SweepTasksError {
+    Backend(BoxBackendError),
+}
+
+impl Display for SweepTasksError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Backend(error) => write!(f, "backend sweep failed: {error}"),
+        }
+    }
+}
+
+impl StdError for SweepTasksError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match self {
+            Self::Backend(error) => Some(error.as_ref()),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -113,7 +170,23 @@ pub struct PublishedTask {
 
 #[derive(Debug)]
 pub enum PublishTaskError {
-    PayloadSerialization(String),
+    Backend(BoxBackendError),
+}
+
+impl Display for PublishTaskError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Backend(error) => write!(f, "backend publish failed: {error}"),
+        }
+    }
+}
+
+impl StdError for PublishTaskError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match self {
+            Self::Backend(error) => Some(error.as_ref()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,9 +198,30 @@ pub struct ClaimedTask<T> {
 
 #[derive(Debug)]
 pub enum ClaimTaskError {
-    PayloadDeserialization(String),
+    Backend(BoxBackendError),
     TaskLeased { expiration: Instant },
     TaskNotFound,
+}
+
+impl Display for ClaimTaskError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Backend(error) => write!(f, "backend claim failed: {error}"),
+            Self::TaskLeased { expiration } => {
+                write!(f, "task is currently leased until {expiration:?}")
+            }
+            Self::TaskNotFound => f.write_str("task not found"),
+        }
+    }
+}
+
+impl StdError for ClaimTaskError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match self {
+            Self::Backend(error) => Some(error.as_ref()),
+            Self::TaskLeased { .. } | Self::TaskNotFound => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,7 +231,26 @@ pub struct RenewedTaskLease {
 
 #[derive(Debug)]
 pub enum RenewTaskError {
+    Backend(BoxBackendError),
     LeaseLost,
+}
+
+impl Display for RenewTaskError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Backend(error) => write!(f, "backend lease renewal failed: {error}"),
+            Self::LeaseLost => f.write_str("task lease lost"),
+        }
+    }
+}
+
+impl StdError for RenewTaskError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match self {
+            Self::Backend(error) => Some(error.as_ref()),
+            Self::LeaseLost => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -147,5 +260,24 @@ pub struct FinishedTask {
 
 #[derive(Debug)]
 pub enum FinishTaskError {
+    Backend(BoxBackendError),
     LeaseLost,
+}
+
+impl Display for FinishTaskError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Backend(error) => write!(f, "backend finish failed: {error}"),
+            Self::LeaseLost => f.write_str("task lease lost"),
+        }
+    }
+}
+
+impl StdError for FinishTaskError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match self {
+            Self::Backend(error) => Some(error.as_ref()),
+            Self::LeaseLost => None,
+        }
+    }
 }

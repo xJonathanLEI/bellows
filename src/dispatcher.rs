@@ -6,7 +6,7 @@ use tokio::sync::mpsc::{UnboundedReceiver as MpscReceiver, UnboundedSender as Mp
 use crate::runtime::WorkerRuntime;
 use crate::{
     Backend, WorkerFactory,
-    backends::{BackendSignal, BackendSignalSubscription},
+    backends::{BackendSignal, BackendSignalSubscription, SubscribeError, SweepTasksError},
 };
 
 #[derive(Debug)]
@@ -29,14 +29,21 @@ where
     B: Backend + 'static,
     F: WorkerFactory + 'static,
 {
-    #[must_use]
-    pub async fn launch(self) -> WorkerDispatcherHandle {
+    pub async fn launch(self) -> Result<WorkerDispatcherHandle, WorkerDispatcherLaunchError> {
         let drain_signal = Arc::new(Notify::const_new());
         let drained_signal = Arc::new(Notify::const_new());
         let (finished_tx, finished_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
 
-        let subscription = self.backend.subscribe().await;
-        let swept_tasks = self.backend.sweep().await;
+        let subscription = self
+            .backend
+            .subscribe()
+            .await
+            .map_err(WorkerDispatcherLaunchError::SubscribeFailed)?;
+        let swept_tasks = self
+            .backend
+            .sweep()
+            .await
+            .map_err(WorkerDispatcherLaunchError::SweepFailed)?;
 
         let daemon = Daemon {
             context: DaemonContext {
@@ -61,11 +68,17 @@ where
 
         tokio::spawn(daemon.run());
 
-        WorkerDispatcherHandle {
+        Ok(WorkerDispatcherHandle {
             drain_signal,
             drained_signal,
-        }
+        })
     }
+}
+
+#[derive(Debug)]
+pub enum WorkerDispatcherLaunchError {
+    SubscribeFailed(SubscribeError),
+    SweepFailed(SweepTasksError),
 }
 
 /// A handle for controlling the background worker dispatcher task.

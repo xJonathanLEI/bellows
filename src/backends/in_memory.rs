@@ -2,6 +2,8 @@
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry as HashMapEntry;
+use std::error::Error as StdError;
+use std::fmt::{Display, Formatter};
 use std::time::Instant;
 
 use tokio::sync::broadcast::{Receiver as BroadcastReceiver, Sender as BroadcastSender};
@@ -10,7 +12,8 @@ use tokio::sync::oneshot::Sender as OneshotSender;
 
 use crate::backends::{
     BackendSignal, BackendSignalSubscription, ClaimTaskError, ClaimedTask, FinishTaskError,
-    FinishedTask, NewTaskAvailableSignalPayload, RenewTaskError, RenewedTaskLease, SweptTask,
+    FinishedTask, NewTaskAvailableSignalPayload, RenewTaskError, RenewedTaskLease, SubscribeError,
+    SweepTasksError, SweptTask,
 };
 use crate::{
     Backend, TaskDefinition,
@@ -19,9 +22,48 @@ use crate::{
 
 const SIGNAL_CHANNEL_SIZE: usize = 1024;
 
+#[derive(Debug)]
+pub enum InMemoryBackendError {
+    DaemonUnavailable,
+    ResponseDropped,
+    PayloadSerialization(serde_json::Error),
+    PayloadDeserialization(serde_json::Error),
+}
+
+impl Display for InMemoryBackendError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DaemonUnavailable => f.write_str("in-memory backend daemon is unavailable"),
+            Self::ResponseDropped => {
+                f.write_str("in-memory backend daemon dropped the response channel")
+            }
+            Self::PayloadSerialization(error) => {
+                write!(f, "task payload serialization failed: {error}")
+            }
+            Self::PayloadDeserialization(error) => {
+                write!(f, "task payload deserialization failed: {error}")
+            }
+        }
+    }
+}
+
+impl StdError for InMemoryBackendError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match self {
+            Self::DaemonUnavailable | Self::ResponseDropped => None,
+            Self::PayloadSerialization(error) => Some(error),
+            Self::PayloadDeserialization(error) => Some(error),
+        }
+    }
+}
+
 /// In-memory task backend implementation.
 ///
 /// This type can be cheaply cloned. All cloned instances share a single task registry.
+///
+/// The in-memory backend uses JSON to hold task payloads. While the (de)serilization is technically
+/// unnecessary as the data is never persisted, since the in-memory backend is typically used for
+/// testing, going through the process helps uncover potential serialization bugs.
 #[derive(Clone)]
 pub struct InMemoryBackend {
     command_sink: MpscSender<DaemonCommand>,
@@ -59,36 +101,40 @@ impl Default for InMemoryBackend {
 }
 
 impl Backend for InMemoryBackend {
-    async fn subscribe(&self) -> BackendSignalSubscription {
+    async fn subscribe(&self) -> Result<BackendSignalSubscription, SubscribeError> {
         let (callback_tx, callback_rx) = tokio::sync::oneshot::channel();
 
         self.command_sink
             .send(DaemonCommand::Subscribe(SubscribeArgs {
                 callback: callback_tx,
             }))
-            .expect("In-memory daemon should never be dropped");
+            .map_err(|_| {
+                SubscribeError::Backend(Box::new(InMemoryBackendError::DaemonUnavailable))
+            })?;
 
-        let result = callback_rx
-            .await
-            .expect("In-memory daemon should never be dropped");
+        let result = callback_rx.await.map_err(|_| {
+            SubscribeError::Backend(Box::new(InMemoryBackendError::ResponseDropped))
+        })?;
 
-        BackendSignalSubscription::new(result.sub_rx)
+        Ok(BackendSignalSubscription::new(result.sub_rx))
     }
 
-    async fn sweep(&self) -> Vec<SweptTask> {
+    async fn sweep(&self) -> Result<Vec<SweptTask>, SweepTasksError> {
         let (callback_tx, callback_rx) = tokio::sync::oneshot::channel();
 
         self.command_sink
             .send(DaemonCommand::SweepTasks(SweepTasksArgs {
                 callback: callback_tx,
             }))
-            .expect("In-memory daemon should never be dropped");
+            .map_err(|_| {
+                SweepTasksError::Backend(Box::new(InMemoryBackendError::DaemonUnavailable))
+            })?;
 
-        let result = callback_rx
-            .await
-            .expect("In-memory daemon should never be dropped");
+        let result = callback_rx.await.map_err(|_| {
+            SweepTasksError::Backend(Box::new(InMemoryBackendError::ResponseDropped))
+        })?;
 
-        result.tasks
+        Ok(result.tasks)
     }
 
     async fn publish<T>(&self, payload: T::Payload) -> Result<PublishedTask, PublishTaskError>
@@ -97,8 +143,9 @@ impl Backend for InMemoryBackend {
     {
         // In-memory backend is mostly used for testing. So we use a human-readable payload
         // serialization format here.
-        let payload_json = serde_json::to_string(&payload)
-            .map_err(|err| PublishTaskError::PayloadSerialization(err.to_string()))?;
+        let payload_json = serde_json::to_string(&payload).map_err(|err| {
+            PublishTaskError::Backend(Box::new(InMemoryBackendError::PayloadSerialization(err)))
+        })?;
 
         let (callback_tx, callback_rx) = tokio::sync::oneshot::channel();
 
@@ -107,11 +154,13 @@ impl Backend for InMemoryBackend {
                 payload_json,
                 callback: callback_tx,
             }))
-            .expect("In-memory daemon should never be dropped");
+            .map_err(|_| {
+                PublishTaskError::Backend(Box::new(InMemoryBackendError::DaemonUnavailable))
+            })?;
 
-        let result = callback_rx
-            .await
-            .expect("In-memory daemon should never be dropped");
+        let result = callback_rx.await.map_err(|_| {
+            PublishTaskError::Backend(Box::new(InMemoryBackendError::ResponseDropped))
+        })?;
 
         Ok(PublishedTask {
             task_id: result.task_id,
@@ -136,19 +185,24 @@ impl Backend for InMemoryBackend {
                 lease_expiration,
                 callback: callback_tx,
             }))
-            .expect("In-memory daemon should never be dropped");
+            .map_err(|_| {
+                ClaimTaskError::Backend(Box::new(InMemoryBackendError::DaemonUnavailable))
+            })?;
 
-        let result = callback_rx
-            .await
-            .expect("In-memory daemon should never be dropped");
+        let result = callback_rx.await.map_err(|_| {
+            ClaimTaskError::Backend(Box::new(InMemoryBackendError::ResponseDropped))
+        })?;
 
         match result {
             ClaimTaskReturn::Claimed {
                 payload_json,
                 expiration,
             } => {
-                let payload = serde_json::from_str(&payload_json)
-                    .map_err(|err| ClaimTaskError::PayloadDeserialization(err.to_string()))?;
+                let payload = serde_json::from_str(&payload_json).map_err(|err| {
+                    ClaimTaskError::Backend(Box::new(InMemoryBackendError::PayloadDeserialization(
+                        err,
+                    )))
+                })?;
 
                 Ok(ClaimedTask {
                     task_id,
@@ -178,11 +232,13 @@ impl Backend for InMemoryBackend {
                 lease_expiration,
                 callback: callback_tx,
             }))
-            .expect("In-memory daemon should never be dropped");
+            .map_err(|_| {
+                RenewTaskError::Backend(Box::new(InMemoryBackendError::DaemonUnavailable))
+            })?;
 
-        let result = callback_rx
-            .await
-            .expect("In-memory daemon should never be dropped");
+        let result = callback_rx.await.map_err(|_| {
+            RenewTaskError::Backend(Box::new(InMemoryBackendError::ResponseDropped))
+        })?;
 
         match result {
             RenewTaskReturn::Renewed { expiration } => Ok(RenewedTaskLease {
@@ -201,11 +257,13 @@ impl Backend for InMemoryBackend {
                 task_id,
                 callback: callback_tx,
             }))
-            .expect("In-memory daemon should never be dropped");
+            .map_err(|_| {
+                FinishTaskError::Backend(Box::new(InMemoryBackendError::DaemonUnavailable))
+            })?;
 
-        let result = callback_rx
-            .await
-            .expect("In-memory daemon should never be dropped");
+        let result = callback_rx.await.map_err(|_| {
+            FinishTaskError::Backend(Box::new(InMemoryBackendError::ResponseDropped))
+        })?;
 
         match result {
             FinishTaskReturn::Finished => Ok(FinishedTask { task_id }),

@@ -5,7 +5,7 @@ use std::{
 
 use crate::{
     Backend, TaskDefinition, Worker, WorkerFactory,
-    backends::{FinishTaskError, RenewTaskError},
+    backends::{ClaimTaskError, FinishTaskError, RenewTaskError},
 };
 
 use tokio::sync::mpsc::UnboundedSender as MpscSender;
@@ -90,9 +90,16 @@ where
                         },
                         EventLoopResult::Continue,
                     ),
-                    Err(_) => {
+                    Err(ClaimTaskError::TaskLeased { .. } | ClaimTaskError::TaskNotFound) => {
                         // This is fine as it's likely that another worker claimed the task.
                         trace!("Unable to claim task #{}", self.task_id);
+                        (DaemonStatus::WaitingForTask, EventLoopResult::Exit)
+                    }
+                    Err(ClaimTaskError::Backend(err)) => {
+                        warn!(
+                            "Unable to claim task #{} due to backend error: {}",
+                            self.task_id, err
+                        );
                         (DaemonStatus::WaitingForTask, EventLoopResult::Exit)
                     }
                 }
@@ -156,6 +163,16 @@ where
                                 worker_handle.abort();
                                 (DaemonStatus::WorkerExited, EventLoopResult::Exit)
                             }
+                            Err(RenewTaskError::Backend(err)) => {
+                                warn!(
+                                    "Unable to renew lease for task #{} with worker #{}: {}",
+                                    self.task_id,
+                                    self.worker_id,
+                                    err
+                                );
+                                worker_handle.abort();
+                                (DaemonStatus::WorkerExited, EventLoopResult::Exit)
+                            }
                         }
                     },
                     join_result = &mut worker_handle => {
@@ -192,6 +209,12 @@ where
                         warn!(
                             "Worker #{} finished task #{} but no longer holds its lease; assuming another worker took over",
                             self.worker_id, self.task_id
+                        );
+                    }
+                    Err(FinishTaskError::Backend(err)) => {
+                        warn!(
+                            "Unable to finalize task #{} with worker #{} due to backend error: {}",
+                            self.task_id, self.worker_id, err
                         );
                     }
                 }
