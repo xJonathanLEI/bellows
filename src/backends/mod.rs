@@ -13,6 +13,8 @@ use crate::TaskDefinition;
 
 #[cfg(feature = "in_memory")]
 pub mod in_memory;
+#[cfg(feature = "postgres")]
+pub mod postgres;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 

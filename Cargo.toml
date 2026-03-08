@@ -7,14 +7,15 @@ edition = "2024"
 description = "Durable task processing framework in Rust for applications of all sizes"
 
 [features]
-default = ["in_memory", "sqlite"]
+default = ["in_memory", "sqlite", "postgres"]
 in_memory = ["serde_json"]
 sqlite = ["sqlx", "serde_json"]
+postgres = ["sqlx", "serde_json"]
 
 [dependencies]
 serde = { version = "1.0.228", default-features = false }
 serde_json = { version = "1.0.149", optional = true }
-sqlx = { version = "0.8.6", default-features = false, optional = true, features = ["runtime-tokio", "sqlite"] }
+sqlx = { version = "0.8.6", default-features = false, optional = true, features = ["runtime-tokio", "sqlite", "postgres"] }
 tokio = { version = "1.49.0", default-features = false, features = ["macros", "rt", "sync"] }
 tracing = { version = "0.1.44", default-features = false }
 
