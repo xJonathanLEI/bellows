@@ -91,6 +91,17 @@ pub struct SqliteBackend {
 }
 
 impl SqliteBackend {
+    /// Creates a [`SqliteBackend`] from an existing connection pool.
+    ///
+    /// This can be useful for applications already using `sqlx` that want to reuse the existing
+    /// connection.
+    pub fn new(pool: SqlitePool) -> Self {
+        Self {
+            pool,
+            signals: Default::default(),
+        }
+    }
+
     /// Connects to a SQLite database URL.
     ///
     /// This only establishes the connection pool. Call [`Self::initialize`] separately if you want
@@ -113,10 +124,7 @@ impl SqliteBackend {
             .connect_with(options)
             .await?;
 
-        Ok(Self {
-            pool,
-            signals: Default::default(),
-        })
+        Ok(Self::new(pool))
     }
 
     /// Initializes the SQLite schema required by the backend.
