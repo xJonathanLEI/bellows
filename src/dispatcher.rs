@@ -1,4 +1,7 @@
-use std::{collections::VecDeque, sync::Arc};
+use std::collections::VecDeque;
+use std::error::Error as StdError;
+use std::fmt::{Display, Formatter};
+use std::sync::Arc;
 
 use tokio::sync::Notify;
 use tokio::sync::mpsc::{UnboundedReceiver as MpscReceiver, UnboundedSender as MpscSender};
@@ -80,6 +83,24 @@ where
 pub enum WorkerDispatcherLaunchError {
     SubscribeFailed(SubscribeError),
     SweepFailed(SweepTasksError),
+}
+
+impl Display for WorkerDispatcherLaunchError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SubscribeFailed(error) => write!(f, "subscription failed: {error}"),
+            Self::SweepFailed(error) => write!(f, "sweep failed: {error}"),
+        }
+    }
+}
+
+impl StdError for WorkerDispatcherLaunchError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match self {
+            Self::SubscribeFailed(error) => Some(error),
+            Self::SweepFailed(error) => Some(error),
+        }
+    }
 }
 
 /// A handle for controlling the background worker dispatcher task.
