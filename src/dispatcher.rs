@@ -8,8 +8,12 @@ use tokio::sync::mpsc::{UnboundedReceiver as MpscReceiver, UnboundedSender as Mp
 
 use crate::runtime::WorkerRuntime;
 use crate::{
-    Backend, Worker, WorkerFactory,
-    backends::{BackendSignal, BackendSignalSubscription, SubscribeError, SweepTasksError},
+    ActivationStrategy, Backend, PublishTrigger, SingletonTrigger, TaskDefinition, Worker,
+    WorkerFactory,
+    backends::{
+        BackendSignal, BackendSignalSubscription, NewTaskAvailableSignalPayload, SubscribeError,
+        SweepTasksError,
+    },
 };
 
 pub struct WorkerDispatcher<B, F> {
@@ -33,7 +37,10 @@ where
     F::Worker: 'static,
     <F::Worker as Worker>::Task: 'static,
 {
-    pub async fn launch(self) -> Result<WorkerDispatcherHandle, WorkerDispatcherLaunchError> {
+    pub async fn launch(self) -> Result<WorkerDispatcherHandle, WorkerDispatcherLaunchError>
+    where
+        <<F::Worker as Worker>::Task as TaskDefinition>::Trigger: SignalDispatch,
+    {
         let drain_signal = Arc::new(Notify::const_new());
         let drained_signal = Arc::new(Notify::const_new());
         let (finished_tx, finished_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
@@ -43,11 +50,10 @@ where
             .subscribe::<<F::Worker as Worker>::Task>()
             .await
             .map_err(WorkerDispatcherLaunchError::SubscribeFailed)?;
-        let swept_tasks = self
-            .backend
-            .sweep::<<F::Worker as Worker>::Task>()
-            .await
-            .map_err(WorkerDispatcherLaunchError::SweepFailed)?;
+        let swept_tasks =
+            <<<F::Worker as Worker>::Task as TaskDefinition>::Trigger as ActivationStrategy>::sweep_tasks::<B, <F::Worker as Worker>::Task>(&self.backend)
+                .await
+                .map_err(WorkerDispatcherLaunchError::SweepFailed)?;
 
         let daemon = Daemon {
             context: DaemonContext {
@@ -63,10 +69,7 @@ where
                 draining: false,
                 pending_workers: 0,
                 next_worker_id: 0,
-                startup_tasks: swept_tasks
-                    .into_iter()
-                    .map(|task| task.task_id)
-                    .collect::<VecDeque<_>>(),
+                startup_tasks: swept_tasks.into_iter().collect::<VecDeque<_>>(),
             },
         };
 
@@ -133,7 +136,7 @@ where
     F: WorkerFactory,
 {
     context: DaemonContext<B, F>,
-    state: DaemonState,
+    state: DaemonState<<F::Worker as Worker>::Task>,
 }
 
 impl<B, F> Daemon<B, F>
@@ -142,6 +145,7 @@ where
     F: WorkerFactory + 'static,
     F::Worker: 'static,
     <F::Worker as Worker>::Task: 'static,
+    <<F::Worker as Worker>::Task as TaskDefinition>::Trigger: SignalDispatch,
 {
     async fn run(mut self) {
         while let EventLoopResult::Continue =
@@ -151,28 +155,35 @@ where
         self.context.drained_signal.notify_one();
     }
 
-    async fn event_loop(ctx: &mut DaemonContext<B, F>, state: &mut DaemonState) -> EventLoopResult {
+    async fn event_loop(
+        ctx: &mut DaemonContext<B, F>,
+        state: &mut DaemonState<<F::Worker as Worker>::Task>,
+    ) -> EventLoopResult {
         if !state.draining
-            && let Some(task_id) = state.startup_tasks.pop_front()
+            && let Some(dispatch_token) = state.startup_tasks.pop_front()
         {
-            return Self::dispatch_task(task_id, ctx, state);
+            return Self::dispatch_task(dispatch_token, ctx, state);
         }
 
         tokio::select! {
-            sub = ctx.subscription.recv() => Self::handle_sub(sub, ctx, state),
-            _ = ctx.finished_rx.recv() => Self::handle_finished(ctx, state),
+            biased;
+
             _ = ctx.drain_signal.notified() => Self::handle_drain(ctx, state),
+            _ = ctx.finished_rx.recv() => Self::handle_finished(ctx, state),
+            sub = ctx.subscription.recv() => Self::handle_sub(sub, ctx, state),
         }
     }
 
     fn handle_sub(
         sub: Result<BackendSignal, tokio::sync::broadcast::error::RecvError>,
         ctx: &DaemonContext<B, F>,
-        state: &mut DaemonState,
+        state: &mut DaemonState<<F::Worker as Worker>::Task>,
     ) -> EventLoopResult {
         match sub {
             Ok(BackendSignal::NewTaskAvailable(signal)) => {
-                Self::dispatch_task(signal.task_id, ctx, state)
+                let dispatch_token =
+                    <<<F::Worker as Worker>::Task as TaskDefinition>::Trigger as SignalDispatch>::from_signal(signal);
+                Self::dispatch_task(dispatch_token, ctx, state)
             }
             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => EventLoopResult::Continue,
             Err(_) => EventLoopResult::Exit,
@@ -180,9 +191,9 @@ where
     }
 
     fn dispatch_task(
-        task_id: u64,
+        dispatch_token: <<<F::Worker as Worker>::Task as TaskDefinition>::Trigger as ActivationStrategy>::DispatchToken,
         ctx: &DaemonContext<B, F>,
-        state: &mut DaemonState,
+        state: &mut DaemonState<<F::Worker as Worker>::Task>,
     ) -> EventLoopResult {
         // Only start new work if not draining
         if !state.draining {
@@ -192,7 +203,7 @@ where
                 worker_id: state.next_worker_id,
                 finished_signal: ctx.finished_tx.clone(),
             };
-            runtime.run(task_id);
+            runtime.run(dispatch_token);
 
             state.pending_workers += 1;
             state.next_worker_id += 1;
@@ -201,7 +212,10 @@ where
         EventLoopResult::Continue
     }
 
-    fn handle_finished(_ctx: &DaemonContext<B, F>, state: &mut DaemonState) -> EventLoopResult {
+    fn handle_finished(
+        _ctx: &DaemonContext<B, F>,
+        state: &mut DaemonState<<F::Worker as Worker>::Task>,
+    ) -> EventLoopResult {
         state.pending_workers -= 1;
         if state.draining && state.pending_workers == 0 {
             EventLoopResult::Exit
@@ -210,7 +224,10 @@ where
         }
     }
 
-    fn handle_drain(_ctx: &DaemonContext<B, F>, state: &mut DaemonState) -> EventLoopResult {
+    fn handle_drain(
+        _ctx: &DaemonContext<B, F>,
+        state: &mut DaemonState<<F::Worker as Worker>::Task>,
+    ) -> EventLoopResult {
         if state.pending_workers == 0 {
             EventLoopResult::Exit
         } else {
@@ -239,10 +256,30 @@ where
     finished_rx: MpscReceiver<()>,
 }
 
-#[derive(Debug)]
-struct DaemonState {
+struct DaemonState<T>
+where
+    T: TaskDefinition,
+{
     draining: bool,
     pending_workers: usize,
     next_worker_id: u64,
-    startup_tasks: VecDeque<u64>,
+    startup_tasks: VecDeque<<T::Trigger as ActivationStrategy>::DispatchToken>,
+}
+
+#[doc(hidden)]
+pub trait SignalDispatch: ActivationStrategy {
+    fn from_signal(signal: NewTaskAvailableSignalPayload) -> Self::DispatchToken;
+}
+
+impl<Payload> SignalDispatch for PublishTrigger<Payload>
+where
+    Payload: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
+{
+    fn from_signal(signal: NewTaskAvailableSignalPayload) -> Self::DispatchToken {
+        signal.task_id
+    }
+}
+
+impl SignalDispatch for SingletonTrigger {
+    fn from_signal(_signal: NewTaskAvailableSignalPayload) -> Self::DispatchToken {}
 }

@@ -10,6 +10,7 @@ use tokio::sync::broadcast::{Receiver as BroadcastReceiver, Sender as BroadcastS
 use tokio::sync::mpsc::{UnboundedReceiver as MpscReceiver, UnboundedSender as MpscSender};
 use tokio::sync::oneshot::Sender as OneshotSender;
 
+use crate::PublishActivationStrategy;
 use crate::backends::{
     BackendSignal, BackendSignalSubscription, ClaimTaskError, ClaimedTask, FinishTaskError,
     FinishedTask, NewTaskAvailableSignalPayload, RenewTaskError, RenewedTaskLease, SubscribeError,
@@ -143,9 +144,13 @@ impl Backend for InMemoryBackend {
         Ok(result.tasks)
     }
 
-    async fn publish<T>(&self, payload: T::Payload) -> Result<PublishedTask, PublishTaskError>
+    async fn publish<T>(
+        &self,
+        payload: <<T as TaskDefinition>::Trigger as PublishActivationStrategy>::Payload,
+    ) -> Result<PublishedTask, PublishTaskError>
     where
         T: TaskDefinition,
+        T::Trigger: PublishActivationStrategy,
     {
         // In-memory backend is mostly used for testing. So we use a human-readable payload
         // serialization format here.
@@ -174,19 +179,23 @@ impl Backend for InMemoryBackend {
         })
     }
 
-    async fn claim<T>(
+    async fn claim_published<T>(
         &self,
         worker_id: u64,
         task_id: u64,
         lease_expiration: Instant,
-    ) -> Result<ClaimedTask<T::Payload>, ClaimTaskError>
+    ) -> Result<
+        ClaimedTask<<<T as TaskDefinition>::Trigger as PublishActivationStrategy>::Payload>,
+        ClaimTaskError,
+    >
     where
         T: TaskDefinition,
+        T::Trigger: PublishActivationStrategy,
     {
         let (callback_tx, callback_rx) = tokio::sync::oneshot::channel();
 
         self.command_sink
-            .send(DaemonCommand::ClaimTask(ClaimTaskArgs {
+            .send(DaemonCommand::ClaimPublishedTask(ClaimPublishedTaskArgs {
                 task_name: T::NAME,
                 worker_id,
                 task_id,
@@ -203,6 +212,7 @@ impl Backend for InMemoryBackend {
 
         match result {
             ClaimTaskReturn::Claimed {
+                task_id,
                 payload_json,
                 expiration,
             } => {
@@ -218,6 +228,48 @@ impl Backend for InMemoryBackend {
                     lease_expiration: expiration,
                 })
             }
+            ClaimTaskReturn::TaskUnavailable { expiration } => {
+                Err(ClaimTaskError::TaskLeased { expiration })
+            }
+            ClaimTaskReturn::TaskNotFound => Err(ClaimTaskError::TaskNotFound),
+        }
+    }
+
+    async fn claim_singleton<T>(
+        &self,
+        worker_id: u64,
+        lease_expiration: Instant,
+    ) -> Result<ClaimedTask<()>, ClaimTaskError>
+    where
+        T: TaskDefinition,
+    {
+        let (callback_tx, callback_rx) = tokio::sync::oneshot::channel();
+
+        self.command_sink
+            .send(DaemonCommand::ClaimSingletonTask(ClaimSingletonTaskArgs {
+                task_name: T::NAME,
+                worker_id,
+                lease_expiration,
+                callback: callback_tx,
+            }))
+            .map_err(|_| {
+                ClaimTaskError::Backend(Box::new(InMemoryBackendError::DaemonUnavailable))
+            })?;
+
+        let result = callback_rx.await.map_err(|_| {
+            ClaimTaskError::Backend(Box::new(InMemoryBackendError::ResponseDropped))
+        })?;
+
+        match result {
+            ClaimTaskReturn::Claimed {
+                task_id,
+                expiration,
+                ..
+            } => Ok(ClaimedTask {
+                task_id,
+                task_payload: (),
+                lease_expiration: expiration,
+            }),
             ClaimTaskReturn::TaskUnavailable { expiration } => {
                 Err(ClaimTaskError::TaskLeased { expiration })
             }
@@ -295,7 +347,8 @@ impl Daemon {
                 DaemonCommand::Subscribe(args) => self.handle_subscribe(args),
                 DaemonCommand::SweepTasks(args) => self.handle_sweep_tasks(args),
                 DaemonCommand::PublishTask(args) => self.handle_publish_task(args),
-                DaemonCommand::ClaimTask(args) => self.handle_claim_task(args),
+                DaemonCommand::ClaimPublishedTask(args) => self.handle_claim_published_task(args),
+                DaemonCommand::ClaimSingletonTask(args) => self.handle_claim_singleton_task(args),
                 DaemonCommand::RenewTask(args) => self.handle_renew_task(args),
                 DaemonCommand::FinishTask(args) => self.handle_finish_task(args),
             }
@@ -343,6 +396,7 @@ impl Daemon {
                 task_name: args.task_name,
                 payload: args.payload_json,
                 claim: None,
+                kind: TaskKind::Published,
             },
         );
 
@@ -356,12 +410,12 @@ impl Daemon {
         let _ = args.callback.send(PublishTaskReturn { task_id });
     }
 
-    fn handle_claim_task(&mut self, args: ClaimTaskArgs) {
+    fn handle_claim_published_task(&mut self, args: ClaimPublishedTaskArgs) {
         let res = match self.tasks.entry(args.task_id) {
             HashMapEntry::Occupied(mut entry) => {
                 let task = entry.get_mut();
 
-                if task.task_name != args.task_name {
+                if task.task_name != args.task_name || !matches!(task.kind, TaskKind::Published) {
                     ClaimTaskReturn::TaskNotFound
                 } else {
                     let claim = &mut task.claim;
@@ -373,6 +427,7 @@ impl Daemon {
                                 lease_expiration: args.lease_expiration,
                             };
                             ClaimTaskReturn::Claimed {
+                                task_id: args.task_id,
                                 payload_json: task.payload.clone(),
                                 expiration: args.lease_expiration,
                             }
@@ -387,6 +442,7 @@ impl Daemon {
                             lease_expiration: args.lease_expiration,
                         });
                         ClaimTaskReturn::Claimed {
+                            task_id: args.task_id,
                             payload_json: task.payload.clone(),
                             expiration: args.lease_expiration,
                         }
@@ -394,6 +450,67 @@ impl Daemon {
                 }
             }
             HashMapEntry::Vacant(_) => ClaimTaskReturn::TaskNotFound,
+        };
+
+        // It doesn't matter if the caller is gone
+        let _ = args.callback.send(res);
+    }
+
+    fn handle_claim_singleton_task(&mut self, args: ClaimSingletonTaskArgs) {
+        let existing_task_id = self.tasks.iter().find_map(|(&task_id, task)| {
+            (task.task_name == args.task_name && matches!(task.kind, TaskKind::Singleton))
+                .then_some(task_id)
+        });
+
+        let task_id = match existing_task_id {
+            Some(task_id) => task_id,
+            None => {
+                let task_id = self.next_task_id;
+                self.next_task_id += 1;
+                self.tasks.insert(
+                    task_id,
+                    TaskEntry {
+                        task_name: args.task_name,
+                        payload: "null".to_string(),
+                        claim: None,
+                        kind: TaskKind::Singleton,
+                    },
+                );
+                task_id
+            }
+        };
+
+        let task = self
+            .tasks
+            .get_mut(&task_id)
+            .expect("singleton task must exist after lookup or insertion");
+
+        let res = if let Some(claim) = &mut task.claim {
+            if claim.lease_expiration <= Instant::now() {
+                *claim = ClaimEntry {
+                    worker_id: args.worker_id,
+                    lease_expiration: args.lease_expiration,
+                };
+                ClaimTaskReturn::Claimed {
+                    task_id,
+                    payload_json: task.payload.clone(),
+                    expiration: args.lease_expiration,
+                }
+            } else {
+                ClaimTaskReturn::TaskUnavailable {
+                    expiration: claim.lease_expiration,
+                }
+            }
+        } else {
+            task.claim = Some(ClaimEntry {
+                worker_id: args.worker_id,
+                lease_expiration: args.lease_expiration,
+            });
+            ClaimTaskReturn::Claimed {
+                task_id,
+                payload_json: task.payload.clone(),
+                expiration: args.lease_expiration,
+            }
         };
 
         // It doesn't matter if the caller is gone
@@ -430,8 +547,10 @@ impl Daemon {
     }
 
     fn handle_finish_task(&mut self, args: FinishTaskArgs) {
+        let mut signal_task_name = None;
+
         let res = match self.tasks.entry(args.task_id) {
-            HashMapEntry::Occupied(entry) => {
+            HashMapEntry::Occupied(mut entry) => {
                 let claim_owned_by_worker = entry
                     .get()
                     .claim
@@ -439,7 +558,14 @@ impl Daemon {
                     .is_some_and(|claim| claim.worker_id == args.worker_id);
 
                 if claim_owned_by_worker {
-                    entry.remove();
+                    if matches!(entry.get().kind, TaskKind::Singleton) {
+                        let task = entry.get_mut();
+                        task.claim = None;
+                        signal_task_name = Some(task.task_name);
+                    } else {
+                        entry.remove();
+                    }
+
                     FinishTaskReturn::Finished
                 } else {
                     FinishTaskReturn::LeaseLost
@@ -447,6 +573,16 @@ impl Daemon {
             }
             HashMapEntry::Vacant(_) => FinishTaskReturn::LeaseLost,
         };
+
+        if let Some(task_name) = signal_task_name
+            && let Some(signal) = self.signals.get(task_name)
+        {
+            let _ = signal.send(BackendSignal::NewTaskAvailable(
+                NewTaskAvailableSignalPayload {
+                    task_id: args.task_id,
+                },
+            ));
+        }
 
         // It doesn't matter if the caller is gone
         let _ = args.callback.send(res);
@@ -458,6 +594,13 @@ struct TaskEntry {
     task_name: &'static str,
     payload: String,
     claim: Option<ClaimEntry>,
+    kind: TaskKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskKind {
+    Published,
+    Singleton,
 }
 
 #[derive(Debug)]
@@ -471,7 +614,8 @@ enum DaemonCommand {
     Subscribe(SubscribeArgs),
     SweepTasks(SweepTasksArgs),
     PublishTask(PublishTaskArgs),
-    ClaimTask(ClaimTaskArgs),
+    ClaimPublishedTask(ClaimPublishedTaskArgs),
+    ClaimSingletonTask(ClaimSingletonTaskArgs),
     RenewTask(RenewTaskArgs),
     FinishTask(FinishTaskArgs),
 }
@@ -511,7 +655,7 @@ struct PublishTaskReturn {
 }
 
 #[derive(Debug)]
-struct ClaimTaskArgs {
+struct ClaimPublishedTaskArgs {
     task_name: &'static str,
     worker_id: u64,
     task_id: u64,
@@ -520,8 +664,17 @@ struct ClaimTaskArgs {
 }
 
 #[derive(Debug)]
+struct ClaimSingletonTaskArgs {
+    task_name: &'static str,
+    worker_id: u64,
+    lease_expiration: Instant,
+    callback: OneshotSender<ClaimTaskReturn>,
+}
+
+#[derive(Debug)]
 enum ClaimTaskReturn {
     Claimed {
+        task_id: u64,
         payload_json: String,
         expiration: Instant,
     },

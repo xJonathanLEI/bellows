@@ -9,7 +9,7 @@ use std::{
 
 use tokio::sync::broadcast::Receiver as BroadcastReceiver;
 
-use crate::TaskDefinition;
+use crate::{PublishActivationStrategy, TaskDefinition};
 
 #[cfg(feature = "in_memory")]
 pub mod in_memory;
@@ -29,7 +29,7 @@ pub mod sqlite;
 ///
 /// Other implementations may not have those and might use a two-step register-trigger process
 /// where dispatchers handle signaling on the side.
-pub trait Backend: Clone + Send {
+pub trait Backend: Clone + Send + Sync {
     /// Subscribes for signals for important task updates for a specific task definition.
     ///
     /// This is usually used by worker dispatchers to react to task availability. Backends must
@@ -58,18 +58,34 @@ pub trait Backend: Clone + Send {
     /// Publishes a task to be processed by workers.
     fn publish<T>(
         &self,
-        payload: T::Payload,
+        payload: <<T as TaskDefinition>::Trigger as PublishActivationStrategy>::Payload,
     ) -> impl Future<Output = Result<PublishedTask, PublishTaskError>> + Send
     where
-        T: TaskDefinition;
+        T: TaskDefinition,
+        T::Trigger: PublishActivationStrategy;
 
-    /// Claims a task until a lease expiration time.
-    fn claim<T>(
+    /// Claims a published task until a lease expiration time.
+    fn claim_published<T>(
         &self,
         worker_id: u64,
         task_id: u64,
         lease_expiration: Instant,
-    ) -> impl Future<Output = Result<ClaimedTask<T::Payload>, ClaimTaskError>> + Send
+    ) -> impl Future<
+        Output = Result<
+            ClaimedTask<<<T as TaskDefinition>::Trigger as PublishActivationStrategy>::Payload>,
+            ClaimTaskError,
+        >,
+    > + Send
+    where
+        T: TaskDefinition,
+        T::Trigger: PublishActivationStrategy;
+
+    /// Claims the singleton task for a definition until a lease expiration time.
+    fn claim_singleton<T>(
+        &self,
+        worker_id: u64,
+        lease_expiration: Instant,
+    ) -> impl Future<Output = Result<ClaimedTask<()>, ClaimTaskError>> + Send
     where
         T: TaskDefinition;
 

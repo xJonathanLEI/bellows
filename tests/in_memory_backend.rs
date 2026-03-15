@@ -1,11 +1,16 @@
 #![cfg(feature = "in_memory")]
 
+use std::sync::Arc;
+
 use bellows::{
-    Backend, TaskDefinition, Worker, WorkerFactory, backends::in_memory::InMemoryBackend,
-    dispatcher::WorkerDispatcher,
+    Backend, PublishTrigger, SingletonTrigger, TaskDefinition, Worker, WorkerFactory,
+    backends::in_memory::InMemoryBackend, dispatcher::WorkerDispatcher,
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc::{UnboundedReceiver as MpscReceiver, UnboundedSender as MpscSender};
+use tokio::sync::{
+    Semaphore,
+    mpsc::{UnboundedReceiver as MpscReceiver, UnboundedSender as MpscSender},
+};
 
 struct EchoTaskSpec;
 
@@ -17,7 +22,15 @@ struct EchoTaskPayload {
 impl TaskDefinition for EchoTaskSpec {
     const NAME: &str = "echo";
 
-    type Payload = EchoTaskPayload;
+    type Trigger = PublishTrigger<EchoTaskPayload>;
+}
+
+struct SingletonTaskSpec;
+
+impl TaskDefinition for SingletonTaskSpec {
+    const NAME: &str = "singleton_echo";
+
+    type Trigger = SingletonTrigger;
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -57,6 +70,42 @@ impl Worker for EchoWorker {
     }
 }
 
+struct SingletonWorkerFactory {
+    processed_tx: MpscSender<u64>,
+    release_signal: Arc<Semaphore>,
+}
+
+impl WorkerFactory for SingletonWorkerFactory {
+    type Worker = SingletonWorker;
+
+    fn build(&self, _worker_id: u64) -> Self::Worker {
+        SingletonWorker {
+            processed_tx: self.processed_tx.clone(),
+            release_signal: self.release_signal.clone(),
+        }
+    }
+}
+
+struct SingletonWorker {
+    processed_tx: MpscSender<u64>,
+    release_signal: Arc<Semaphore>,
+}
+
+impl Worker for SingletonWorker {
+    type Task = SingletonTaskSpec;
+
+    async fn process(self, task_id: u64, _task_payload: ()) {
+        self.processed_tx
+            .send(task_id)
+            .expect("processed task collector should remain available during the test");
+        self.release_signal
+            .acquire()
+            .await
+            .expect("singleton worker gate semaphore should remain available")
+            .forget();
+    }
+}
+
 #[tokio::test]
 async fn test_in_memory_backend() {
     let backend = InMemoryBackend::new();
@@ -93,6 +142,41 @@ async fn test_in_memory_backend() {
     dispatcher_handle.drain().await;
 
     assert!(processed_rx.recv().await.is_none());
+}
+
+#[tokio::test]
+async fn test_in_memory_singleton_task_dispatch() {
+    let backend = InMemoryBackend::new();
+    let (processed_tx, mut processed_rx) = tokio::sync::mpsc::unbounded_channel();
+    let release_signal = Arc::new(Semaphore::new(0));
+
+    let factory = SingletonWorkerFactory {
+        processed_tx,
+        release_signal: release_signal.clone(),
+    };
+    let dispatcher = WorkerDispatcher::new(backend, factory);
+
+    let dispatcher_handle = dispatcher.launch().await.unwrap();
+
+    let first_task_id = processed_rx
+        .recv()
+        .await
+        .expect("singleton task should be processed without publishing");
+    assert_eq!(first_task_id, 0);
+
+    release_signal.add_permits(1);
+
+    let second_task_id = processed_rx
+        .recv()
+        .await
+        .expect("singleton task should be re-dispatched after finishing");
+    assert_eq!(second_task_id, first_task_id);
+
+    let drain_handle = tokio::spawn(dispatcher_handle.drain());
+    release_signal.add_permits(1);
+    drain_handle.await.unwrap();
+
+    assert!(processed_rx.try_recv().is_err());
 }
 
 #[tokio::test]
