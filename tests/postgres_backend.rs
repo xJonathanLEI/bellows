@@ -1,6 +1,6 @@
 #![cfg(feature = "postgres")]
 
-//! Ignored integration tests for the Postgres backend.
+//! Integration tests for the Postgres backend.
 //!
 //! These tests require a Postgres server listening on `localhost:5432`.
 //!
@@ -14,10 +14,6 @@
 //!     -p 5432:5432 \
 //!     postgres:17
 //! ```
-//!
-//! Then run the ignored tests explicitly:
-//!
-//! cargo test --features postgres --test postgres_backend -- --ignored
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -129,7 +125,6 @@ impl Worker for SingletonWorker {
 }
 
 #[tokio::test]
-#[ignore = "requires Postgres instance"]
 async fn test_postgres_backend() {
     let database = TestDatabase::new("backend").await;
     let backend = PostgresBackend::connect(database.url()).await.unwrap();
@@ -170,7 +165,6 @@ async fn test_postgres_backend() {
 }
 
 #[tokio::test]
-#[ignore = "requires Postgres instance"]
 async fn test_postgres_singleton_task_dispatch() {
     let database = TestDatabase::new("singleton").await;
     let backend = PostgresBackend::connect(database.url()).await.unwrap();
@@ -210,7 +204,6 @@ async fn test_postgres_singleton_task_dispatch() {
 }
 
 #[tokio::test]
-#[ignore = "requires Postgres instance"]
 async fn test_postgres_sweeping() {
     let database = TestDatabase::new("sweeping").await;
     let backend = PostgresBackend::connect(database.url()).await.unwrap();
