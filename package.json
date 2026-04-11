@@ -1,0 +1,19 @@
+{
+  "name": "bellows-workspace",
+  "private": true,
+  "scripts": {
+    "build": "pnpm -r build",
+    "test": "pnpm -r test",
+    "lint": "biome lint .",
+    "check": "biome check .",
+    "typecheck": "pnpm -r typecheck"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "catalog:",
+    "typescript": "catalog:"
+  },
+  "packageManager": "pnpm@10.32.1",
+  "engines": {
+    "node": ">=22"
+  }
+}
