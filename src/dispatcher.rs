@@ -11,8 +11,7 @@ use crate::{
     ActivationStrategy, Backend, PublishTrigger, SingletonTrigger, TaskDefinition, Worker,
     WorkerFactory,
     backends::{
-        BackendSignal, BackendSignalSubscription, NewTaskAvailableSignalPayload, SubscribeError,
-        SweepTasksError,
+        BackendSignalSubscription, NewTaskAvailableSignalPayload, SubscribeError, SweepTasksError,
     },
 };
 
@@ -175,12 +174,12 @@ where
     }
 
     fn handle_sub(
-        sub: Result<BackendSignal, tokio::sync::broadcast::error::RecvError>,
+        sub: Result<NewTaskAvailableSignalPayload, tokio::sync::broadcast::error::RecvError>,
         ctx: &DaemonContext<B, F>,
         state: &mut DaemonState<<F::Worker as Worker>::Task>,
     ) -> EventLoopResult {
         match sub {
-            Ok(BackendSignal::NewTaskAvailable(signal)) => {
+            Ok(signal) => {
                 let dispatch_token =
                     <<<F::Worker as Worker>::Task as TaskDefinition>::Trigger as SignalDispatch>::from_signal(signal);
                 Self::dispatch_task(dispatch_token, ctx, state)

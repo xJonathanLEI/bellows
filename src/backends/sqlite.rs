@@ -1,7 +1,7 @@
 //! SQLite task backend implementation.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, hash_map::Entry as HashMapEntry},
     error::Error as StdError,
     fmt::{Display, Formatter},
     str::FromStr,
@@ -9,18 +9,22 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use rand::RngExt;
 use sqlx::{
     Row,
     sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions},
 };
-use tokio::sync::broadcast::{self, Sender as BroadcastSender};
+use tokio::sync::{
+    broadcast::{self, Sender as BroadcastSender},
+    oneshot::Sender as OneshotSender,
+};
 
 use crate::backends::{
     BackendSignal, BackendSignalSubscription, ClaimTaskError, ClaimedTask, FinishTaskError,
     FinishedTask, NewTaskAvailableSignalPayload, PublishTaskError, PublishedTask, RenewTaskError,
     RenewedTaskLease, SubscribeError, SweepTasksError, SweptTask,
 };
-use crate::{Backend, PublishActivationStrategy, TaskDefinition};
+use crate::{AwaitableTask, Backend, PublishActivationStrategy, TaskDefinition};
 
 const SIGNAL_CHANNEL_SIZE: usize = 1024;
 const INITIALIZE_SCHEMA_SQL: &str = r#"
@@ -29,6 +33,7 @@ CREATE TABLE IF NOT EXISTS bellows_tasks (
     task_name TEXT NOT NULL,
     task_unique_key TEXT,
     payload_json TEXT NOT NULL,
+    callback_id INTEGER,
     lease_worker_id INTEGER,
     lease_expiration_unix_ms INTEGER,
     CHECK ((lease_worker_id IS NULL) = (lease_expiration_unix_ms IS NULL))
@@ -48,6 +53,7 @@ pub enum SqliteBackendError {
     InvalidWorkerId(std::num::TryFromIntError),
     PayloadSerialization(serde_json::Error),
     PayloadDeserialization(serde_json::Error),
+    CallbackSerialization(serde_json::Error),
 }
 
 impl Display for SqliteBackendError {
@@ -66,6 +72,9 @@ impl Display for SqliteBackendError {
             Self::PayloadDeserialization(error) => {
                 write!(f, "task payload deserialization failed: {error}")
             }
+            Self::CallbackSerialization(error) => {
+                write!(f, "task callback serialization failed: {error}")
+            }
         }
     }
 }
@@ -78,6 +87,7 @@ impl StdError for SqliteBackendError {
             Self::InvalidWorkerId(error) => Some(error),
             Self::PayloadSerialization(error) => Some(error),
             Self::PayloadDeserialization(error) => Some(error),
+            Self::CallbackSerialization(error) => Some(error),
         }
     }
 }
@@ -88,10 +98,23 @@ impl StdError for SqliteBackendError {
 /// only. That means dispatchers in other processes will not receive new task notifications until
 /// they perform a startup sweep again. This makes the backend suitable for local development,
 /// testing, and single-process deployments, but not for truly distributed systems.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct SqliteBackend {
     pool: SqlitePool,
-    signals: Arc<Mutex<HashMap<&'static str, BroadcastSender<BackendSignal>>>>,
+    shared: Arc<Shared>,
+}
+
+struct Shared {
+    signals: Mutex<HashMap<&'static str, BroadcastSender<BackendSignal>>>,
+    callbacks: Mutex<HashMap<u64, Box<dyn CallbackSink>>>,
+}
+
+impl std::fmt::Debug for SqliteBackend {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SqliteBackend")
+            .field("pool", &self.pool)
+            .finish_non_exhaustive()
+    }
 }
 
 impl SqliteBackend {
@@ -100,10 +123,12 @@ impl SqliteBackend {
     /// This can be useful for applications already using `sqlx` that want to reuse the existing
     /// connection.
     pub fn new(pool: SqlitePool) -> Self {
-        Self {
-            pool,
+        let shared = Arc::new(Shared {
             signals: Default::default(),
-        }
+            callbacks: Default::default(),
+        });
+
+        Self { pool, shared }
     }
 
     /// Connects to a SQLite database URL.
@@ -144,6 +169,7 @@ impl SqliteBackend {
 
     fn signal_for_task(&self, task_name: &'static str) -> BroadcastSender<BackendSignal> {
         let mut signals = self
+            .shared
             .signals
             .lock()
             .expect("sqlite backend signal registry mutex should not be poisoned");
@@ -152,6 +178,118 @@ impl SqliteBackend {
             .entry(task_name)
             .or_insert_with(|| broadcast::channel(SIGNAL_CHANNEL_SIZE).0)
             .clone()
+    }
+
+    fn reserve_callback<T>(&self) -> (i64, tokio::sync::oneshot::Receiver<T>)
+    where
+        T: serde::de::DeserializeOwned + Send + 'static,
+    {
+        let (callback_tx, callback_rx) = tokio::sync::oneshot::channel();
+        let mut callbacks = self
+            .shared
+            .callbacks
+            .lock()
+            .expect("sqlite backend callback registry mutex should not be poisoned");
+        let mut rng = rand::rng();
+
+        let callback_id = loop {
+            let callback_id = rng.random::<i64>();
+            if callback_id >= 0
+                && let HashMapEntry::Vacant(entry) = callbacks.entry(callback_id as u64)
+            {
+                entry.insert(Box::new(TypedCallbackSink { tx: callback_tx }));
+                break callback_id;
+            }
+        };
+
+        (callback_id, callback_rx)
+    }
+
+    fn drop_reserved_callback(&self, callback_id: i64) {
+        if let Ok(callback_id) = u64::try_from(callback_id) {
+            self.shared
+                .callbacks
+                .lock()
+                .expect("sqlite backend callback registry mutex should not be poisoned")
+                .remove(&callback_id);
+        }
+    }
+
+    fn emit_signal(&self, task_name: &'static str, signal: BackendSignal) {
+        if let Some(signal_tx) = self
+            .shared
+            .signals
+            .lock()
+            .expect("sqlite backend signal registry mutex should not be poisoned")
+            .get(task_name)
+            .cloned()
+        {
+            let _ = signal_tx.send(signal);
+        }
+    }
+
+    fn deliver_callback(&self, callback_id: u64, callback_payload_json: String) {
+        if let Some(callback_sink) = self
+            .shared
+            .callbacks
+            .lock()
+            .expect("sqlite backend callback registry mutex should not be poisoned")
+            .remove(&callback_id)
+        {
+            callback_sink.send(callback_payload_json);
+        }
+    }
+
+    async fn publish_impl<T>(
+        &self,
+        payload: <<T as TaskDefinition>::Trigger as PublishActivationStrategy>::Payload,
+        callback_id: Option<i64>,
+    ) -> Result<PublishedTask, PublishTaskError>
+    where
+        T: TaskDefinition,
+        T::Trigger: PublishActivationStrategy,
+    {
+        let payload_json = serde_json::to_string(&payload).map_err(|err| {
+            PublishTaskError::Backend(Box::new(SqliteBackendError::PayloadSerialization(err)))
+        })?;
+
+        let result = sqlx::query(
+            r#"
+INSERT INTO bellows_tasks (task_name, task_unique_key, payload_json, callback_id)
+VALUES (?, NULL, ?, ?)
+"#,
+        )
+        .bind(T::NAME)
+        .bind(payload_json)
+        .bind(callback_id)
+        .execute(&self.pool)
+        .await;
+
+        let result = match result {
+            Ok(result) => result,
+            Err(err) => {
+                if let Some(callback_id) = callback_id {
+                    self.drop_reserved_callback(callback_id);
+                }
+                return Err(PublishTaskError::Backend(Box::new(
+                    SqliteBackendError::Sqlx(err),
+                )));
+            }
+        };
+
+        let task_id = u64::try_from(result.last_insert_rowid()).map_err(|err| {
+            if let Some(callback_id) = callback_id {
+                self.drop_reserved_callback(callback_id);
+            }
+            PublishTaskError::Backend(Box::new(SqliteBackendError::InvalidTaskId(err)))
+        })?;
+
+        self.emit_signal(
+            T::NAME,
+            BackendSignal::NewTaskAvailable(NewTaskAvailableSignalPayload { task_id }),
+        );
+
+        Ok(PublishedTask { task_id })
     }
 }
 
@@ -208,33 +346,20 @@ ORDER BY task_id
         T: TaskDefinition,
         T::Trigger: PublishActivationStrategy,
     {
-        let payload_json = serde_json::to_string(&payload).map_err(|err| {
-            PublishTaskError::Backend(Box::new(SqliteBackendError::PayloadSerialization(err)))
-        })?;
+        self.publish_impl::<T>(payload, None).await
+    }
 
-        let result = sqlx::query(
-            r#"
-INSERT INTO bellows_tasks (task_name, task_unique_key, payload_json)
-VALUES (?, NULL, ?)
-"#,
-        )
-        .bind(T::NAME)
-        .bind(payload_json)
-        .execute(&self.pool)
-        .await
-        .map_err(|err| PublishTaskError::Backend(Box::new(SqliteBackendError::Sqlx(err))))?;
-
-        let task_id = u64::try_from(result.last_insert_rowid()).map_err(|err| {
-            PublishTaskError::Backend(Box::new(SqliteBackendError::InvalidTaskId(err)))
-        })?;
-
-        let _ = self
-            .signal_for_task(T::NAME)
-            .send(BackendSignal::NewTaskAvailable(
-                NewTaskAvailableSignalPayload { task_id },
-            ));
-
-        Ok(PublishedTask { task_id })
+    async fn publish_awaitable<T>(
+        &self,
+        payload: <<T as TaskDefinition>::Trigger as PublishActivationStrategy>::Payload,
+    ) -> Result<AwaitableTask<T::Callback>, PublishTaskError>
+    where
+        T: TaskDefinition,
+        T::Trigger: PublishActivationStrategy,
+    {
+        let (callback_id, callback_rx) = self.reserve_callback::<T::Callback>();
+        let published = self.publish_impl::<T>(payload, Some(callback_id)).await?;
+        Ok(AwaitableTask::new(published.task_id, callback_rx))
     }
 
     async fn claim_published<T>(
@@ -352,10 +477,11 @@ INSERT INTO bellows_tasks (
     task_name,
     task_unique_key,
     payload_json,
+    callback_id,
     lease_worker_id,
     lease_expiration_unix_ms
 )
-VALUES (?, ?, 'null', ?, ?)
+VALUES (?, ?, 'null', NULL, ?, ?)
 ON CONFLICT(task_unique_key) DO UPDATE
 SET lease_worker_id = excluded.lease_worker_id,
     lease_expiration_unix_ms = excluded.lease_expiration_unix_ms
@@ -461,12 +587,23 @@ WHERE task_id = ?
         }
     }
 
-    async fn finish(&self, worker_id: u64, task_id: u64) -> Result<FinishedTask, FinishTaskError> {
+    async fn finish<T>(
+        &self,
+        worker_id: u64,
+        task_id: u64,
+        callback_payload: T::Callback,
+    ) -> Result<FinishedTask, FinishTaskError>
+    where
+        T: TaskDefinition,
+    {
         let task_id_db = i64::try_from(task_id).map_err(|err| {
             FinishTaskError::Backend(Box::new(SqliteBackendError::InvalidTaskId(err)))
         })?;
         let worker_id_db = i64::try_from(worker_id).map_err(|err| {
             FinishTaskError::Backend(Box::new(SqliteBackendError::InvalidWorkerId(err)))
+        })?;
+        let callback_payload_json = serde_json::to_string(&callback_payload).map_err(|err| {
+            FinishTaskError::Backend(Box::new(SqliteBackendError::CallbackSerialization(err)))
         })?;
 
         let cleared_singleton_task = sqlx::query(
@@ -477,7 +614,7 @@ SET lease_worker_id = NULL,
 WHERE task_id = ?
   AND lease_worker_id = ?
   AND task_unique_key IS NOT NULL
-RETURNING task_name
+RETURNING task_name, callback_id
 "#,
         )
         .bind(task_id_db)
@@ -488,41 +625,98 @@ RETURNING task_name
 
         if let Some(cleared_singleton_task) = cleared_singleton_task {
             let task_name = cleared_singleton_task.get::<String, _>("task_name");
-            let signal = self
+            let callback_id = cleared_singleton_task.get::<Option<i64>, _>("callback_id");
+
+            let registered_task_name = self
+                .shared
                 .signals
                 .lock()
                 .expect("sqlite backend signal registry mutex should not be poisoned")
-                .iter()
-                .find(|(registered_task_name, _)| **registered_task_name == task_name)
-                .map(|(_, signal)| signal.clone());
+                .keys()
+                .copied()
+                .find(|registered_task_name| *registered_task_name == task_name);
 
-            if let Some(signal) = signal {
-                let _ = signal.send(BackendSignal::NewTaskAvailable(
-                    NewTaskAvailableSignalPayload { task_id },
-                ));
+            if let Some(task_name) = registered_task_name {
+                if let Some(callback_id) = callback_id
+                    && let Ok(callback_id) = u64::try_from(callback_id)
+                {
+                    self.deliver_callback(callback_id, callback_payload_json.clone());
+                }
+
+                self.emit_signal(
+                    task_name,
+                    BackendSignal::NewTaskAvailable(NewTaskAvailableSignalPayload { task_id }),
+                );
+            } else if let Some(callback_id) = callback_id
+                && let Ok(callback_id) = u64::try_from(callback_id)
+            {
+                self.deliver_callback(callback_id, callback_payload_json);
             }
 
             return Ok(FinishedTask { task_id });
         }
 
-        let delete_published_result = sqlx::query(
+        let deleted_published_task = sqlx::query(
             r#"
 DELETE FROM bellows_tasks
 WHERE task_id = ?
   AND lease_worker_id = ?
   AND task_unique_key IS NULL
+RETURNING task_name, callback_id
 "#,
         )
         .bind(task_id_db)
         .bind(worker_id_db)
-        .execute(&self.pool)
+        .fetch_optional(&self.pool)
         .await
         .map_err(|err| FinishTaskError::Backend(Box::new(SqliteBackendError::Sqlx(err))))?;
 
-        if delete_published_result.rows_affected() == 0 {
-            Err(FinishTaskError::LeaseLost)
-        } else {
-            Ok(FinishedTask { task_id })
+        let Some(deleted_published_task) = deleted_published_task else {
+            return Err(FinishTaskError::LeaseLost);
+        };
+
+        let task_name = deleted_published_task.get::<String, _>("task_name");
+        let callback_id = deleted_published_task.get::<Option<i64>, _>("callback_id");
+
+        let registered_task_name = self
+            .shared
+            .signals
+            .lock()
+            .expect("sqlite backend signal registry mutex should not be poisoned")
+            .keys()
+            .copied()
+            .find(|registered_task_name| *registered_task_name == task_name);
+
+        if registered_task_name.is_some()
+            && let Some(callback_id) = callback_id
+            && let Ok(callback_id) = u64::try_from(callback_id)
+        {
+            self.deliver_callback(callback_id, callback_payload_json);
+        } else if let Some(callback_id) = callback_id
+            && let Ok(callback_id) = u64::try_from(callback_id)
+        {
+            self.deliver_callback(callback_id, callback_payload_json);
+        }
+
+        Ok(FinishedTask { task_id })
+    }
+}
+
+struct TypedCallbackSink<T> {
+    tx: OneshotSender<T>,
+}
+
+trait CallbackSink: Send {
+    fn send(self: Box<Self>, callback_payload_json: String);
+}
+
+impl<T> CallbackSink for TypedCallbackSink<T>
+where
+    T: serde::de::DeserializeOwned + Send + 'static,
+{
+    fn send(self: Box<Self>, callback_payload_json: String) {
+        if let Ok(callback_payload) = serde_json::from_str(&callback_payload_json) {
+            let _ = self.tx.send(callback_payload);
         }
     }
 }

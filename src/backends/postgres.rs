@@ -1,20 +1,22 @@
 //! Postgres task backend implementation.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, hash_map::Entry as HashMapEntry},
     error::Error as StdError,
     fmt::{Display, Formatter},
     sync::{Arc, Mutex, Weak},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use serde::Deserialize;
+use rand::RngExt;
+use serde::{Deserialize, Serialize};
 use sqlx::{
     Row,
     postgres::{PgListener, PgPool, PgPoolOptions},
 };
 use tokio::sync::{
     broadcast::{self, Sender as BroadcastSender},
+    oneshot::Sender as OneshotSender,
     watch,
 };
 use tracing::warn;
@@ -24,7 +26,7 @@ use crate::backends::{
     FinishedTask, NewTaskAvailableSignalPayload, PublishTaskError, PublishedTask, RenewTaskError,
     RenewedTaskLease, SubscribeError, SweepTasksError, SweptTask,
 };
-use crate::{Backend, PublishActivationStrategy, TaskDefinition};
+use crate::{AwaitableTask, Backend, PublishActivationStrategy, TaskDefinition};
 
 const SIGNAL_CHANNEL_SIZE: usize = 1024;
 const NOTIFY_CHANNEL: &str = "bellows_tasks";
@@ -36,6 +38,7 @@ CREATE TABLE IF NOT EXISTS bellows_tasks (
     task_name TEXT NOT NULL,
     task_unique_key TEXT,
     payload_json TEXT NOT NULL,
+    callback_id BIGINT,
     lease_worker_id BIGINT,
     lease_expiration_unix_ms BIGINT,
     CHECK ((lease_worker_id IS NULL) = (lease_expiration_unix_ms IS NULL))
@@ -56,6 +59,7 @@ BEGIN
         PERFORM pg_notify(
             'bellows_tasks',
             json_build_object(
+                'kind', 'new_task_available',
                 'task_name', NEW.task_name,
                 'task_id', NEW.task_id
             )::text
@@ -70,6 +74,7 @@ BEGIN
         PERFORM pg_notify(
             'bellows_tasks',
             json_build_object(
+                'kind', 'new_task_available',
                 'task_name', NEW.task_name,
                 'task_id', NEW.task_id
             )::text
@@ -80,32 +85,12 @@ BEGIN
 END;
 $$;
 
-DO $$
-BEGIN
-    IF EXISTS (
-        SELECT 1
-        FROM pg_trigger
-        WHERE tgname = 'bellows_tasks_notify_insert'
-          AND tgrelid = 'bellows_tasks'::regclass
-          AND NOT tgisinternal
-    ) THEN
-        DROP TRIGGER bellows_tasks_notify_insert ON bellows_tasks;
-    END IF;
+DROP TRIGGER IF EXISTS bellows_tasks_notify_available ON bellows_tasks;
 
-    IF NOT EXISTS (
-        SELECT 1
-        FROM pg_trigger
-        WHERE tgname = 'bellows_tasks_notify_available'
-          AND tgrelid = 'bellows_tasks'::regclass
-          AND NOT tgisinternal
-    ) THEN
-        CREATE TRIGGER bellows_tasks_notify_available
-        AFTER INSERT OR UPDATE OF lease_worker_id, lease_expiration_unix_ms ON bellows_tasks
-        FOR EACH ROW
-        EXECUTE FUNCTION bellows_notify_task_available();
-    END IF;
-END;
-$$;
+CREATE TRIGGER bellows_tasks_notify_available
+AFTER INSERT OR UPDATE OF lease_worker_id, lease_expiration_unix_ms ON bellows_tasks
+FOR EACH ROW
+EXECUTE FUNCTION bellows_notify_task_available();
 "#;
 
 #[derive(Debug)]
@@ -115,6 +100,7 @@ pub enum PostgresBackendError {
     InvalidWorkerId(std::num::TryFromIntError),
     PayloadSerialization(serde_json::Error),
     PayloadDeserialization(serde_json::Error),
+    CallbackSerialization(serde_json::Error),
 }
 
 impl Display for PostgresBackendError {
@@ -133,6 +119,9 @@ impl Display for PostgresBackendError {
             Self::PayloadDeserialization(error) => {
                 write!(f, "task payload deserialization failed: {error}")
             }
+            Self::CallbackSerialization(error) => {
+                write!(f, "task callback serialization failed: {error}")
+            }
         }
     }
 }
@@ -145,6 +134,7 @@ impl StdError for PostgresBackendError {
             Self::InvalidWorkerId(error) => Some(error),
             Self::PayloadSerialization(error) => Some(error),
             Self::PayloadDeserialization(error) => Some(error),
+            Self::CallbackSerialization(error) => Some(error),
         }
     }
 }
@@ -156,21 +146,29 @@ impl StdError for PostgresBackendError {
 /// Unlike the SQLite backend, task availability signals are emitted directly by Postgres via a
 /// trigger on the task table, making this backend suitable for multi-process and distributed
 /// deployments as long as all participants can reach the same database.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct PostgresBackend {
     pool: PgPool,
     shared: Arc<Shared>,
 }
 
-#[derive(Debug)]
 struct Shared {
     signals: Mutex<HashMap<&'static str, BroadcastSender<BackendSignal>>>,
+    callbacks: Mutex<HashMap<u64, Box<dyn CallbackSink>>>,
     shutdown_signal: watch::Sender<bool>,
 }
 
 impl Drop for Shared {
     fn drop(&mut self) {
         let _ = self.shutdown_signal.send(true);
+    }
+}
+
+impl std::fmt::Debug for PostgresBackend {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PostgresBackend")
+            .field("pool", &self.pool)
+            .finish_non_exhaustive()
     }
 }
 
@@ -187,6 +185,7 @@ impl PostgresBackend {
 
         let shared = Arc::new(Shared {
             signals: Default::default(),
+            callbacks: Default::default(),
             shutdown_signal: shutdown_tx,
         });
 
@@ -224,6 +223,89 @@ impl PostgresBackend {
             .entry(task_name)
             .or_insert_with(|| broadcast::channel(SIGNAL_CHANNEL_SIZE).0)
             .clone()
+    }
+
+    fn reserve_callback<T>(&self) -> (i64, tokio::sync::oneshot::Receiver<T>)
+    where
+        T: serde::de::DeserializeOwned + Send + 'static,
+    {
+        let (callback_tx, callback_rx) = tokio::sync::oneshot::channel();
+        let mut callbacks = self
+            .shared
+            .callbacks
+            .lock()
+            .expect("postgres backend callback registry mutex should not be poisoned");
+        let mut rng = rand::rng();
+
+        let callback_id = loop {
+            let callback_id = rng.random::<i64>();
+            if callback_id >= 0
+                && let HashMapEntry::Vacant(entry) = callbacks.entry(callback_id as u64)
+            {
+                entry.insert(Box::new(TypedCallbackSink { tx: callback_tx }));
+                break callback_id;
+            }
+        };
+
+        (callback_id, callback_rx)
+    }
+
+    fn drop_reserved_callback(&self, callback_id: i64) {
+        if let Ok(callback_id) = u64::try_from(callback_id) {
+            self.shared
+                .callbacks
+                .lock()
+                .expect("postgres backend callback registry mutex should not be poisoned")
+                .remove(&callback_id);
+        }
+    }
+
+    async fn publish_impl<T>(
+        &self,
+        payload: <<T as TaskDefinition>::Trigger as PublishActivationStrategy>::Payload,
+        callback_id: Option<i64>,
+    ) -> Result<PublishedTask, PublishTaskError>
+    where
+        T: TaskDefinition,
+        T::Trigger: PublishActivationStrategy,
+    {
+        let payload_json = serde_json::to_string(&payload).map_err(|err| {
+            PublishTaskError::Backend(Box::new(PostgresBackendError::PayloadSerialization(err)))
+        })?;
+
+        let row = sqlx::query(
+            r#"
+INSERT INTO bellows_tasks (task_name, task_unique_key, payload_json, callback_id)
+VALUES ($1, NULL, $2, $3)
+RETURNING task_id
+"#,
+        )
+        .bind(T::NAME)
+        .bind(payload_json)
+        .bind(callback_id)
+        .fetch_one(&self.pool)
+        .await;
+
+        let row = match row {
+            Ok(row) => row,
+            Err(err) => {
+                if let Some(callback_id) = callback_id {
+                    self.drop_reserved_callback(callback_id);
+                }
+                return Err(PublishTaskError::Backend(Box::new(
+                    PostgresBackendError::Sqlx(err),
+                )));
+            }
+        };
+
+        let task_id = u64::try_from(row.get::<i64, _>("task_id")).map_err(|err| {
+            if let Some(callback_id) = callback_id {
+                self.drop_reserved_callback(callback_id);
+            }
+            PublishTaskError::Backend(Box::new(PostgresBackendError::InvalidTaskId(err)))
+        })?;
+
+        Ok(PublishedTask { task_id })
     }
 }
 
@@ -280,28 +362,20 @@ ORDER BY task_id
         T: TaskDefinition,
         T::Trigger: PublishActivationStrategy,
     {
-        let payload_json = serde_json::to_string(&payload).map_err(|err| {
-            PublishTaskError::Backend(Box::new(PostgresBackendError::PayloadSerialization(err)))
-        })?;
+        self.publish_impl::<T>(payload, None).await
+    }
 
-        let row = sqlx::query(
-            r#"
-INSERT INTO bellows_tasks (task_name, task_unique_key, payload_json)
-VALUES ($1, NULL, $2)
-RETURNING task_id
-"#,
-        )
-        .bind(T::NAME)
-        .bind(payload_json)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|err| PublishTaskError::Backend(Box::new(PostgresBackendError::Sqlx(err))))?;
-
-        let task_id = u64::try_from(row.get::<i64, _>("task_id")).map_err(|err| {
-            PublishTaskError::Backend(Box::new(PostgresBackendError::InvalidTaskId(err)))
-        })?;
-
-        Ok(PublishedTask { task_id })
+    async fn publish_awaitable<T>(
+        &self,
+        payload: <<T as TaskDefinition>::Trigger as PublishActivationStrategy>::Payload,
+    ) -> Result<AwaitableTask<T::Callback>, PublishTaskError>
+    where
+        T: TaskDefinition,
+        T::Trigger: PublishActivationStrategy,
+    {
+        let (callback_id, callback_rx) = self.reserve_callback::<T::Callback>();
+        let published = self.publish_impl::<T>(payload, Some(callback_id)).await?;
+        Ok(AwaitableTask::new(published.task_id, callback_rx))
     }
 
     async fn claim_published<T>(
@@ -421,10 +495,11 @@ INSERT INTO bellows_tasks (
     task_name,
     task_unique_key,
     payload_json,
+    callback_id,
     lease_worker_id,
     lease_expiration_unix_ms
 )
-VALUES ($1, $2, 'null', $3, $4)
+VALUES ($1, $2, 'null', NULL, $3, $4)
 ON CONFLICT (task_unique_key) DO UPDATE
 SET lease_worker_id = EXCLUDED.lease_worker_id,
     lease_expiration_unix_ms = EXCLUDED.lease_expiration_unix_ms
@@ -532,15 +607,31 @@ WHERE task_id = $2
         }
     }
 
-    async fn finish(&self, worker_id: u64, task_id: u64) -> Result<FinishedTask, FinishTaskError> {
+    async fn finish<T>(
+        &self,
+        worker_id: u64,
+        task_id: u64,
+        callback_payload: T::Callback,
+    ) -> Result<FinishedTask, FinishTaskError>
+    where
+        T: TaskDefinition,
+    {
         let task_id_db = i64::try_from(task_id).map_err(|err| {
             FinishTaskError::Backend(Box::new(PostgresBackendError::InvalidTaskId(err)))
         })?;
         let worker_id_db = i64::try_from(worker_id).map_err(|err| {
             FinishTaskError::Backend(Box::new(PostgresBackendError::InvalidWorkerId(err)))
         })?;
+        let callback_payload_json = serde_json::to_string(&callback_payload).map_err(|err| {
+            FinishTaskError::Backend(Box::new(PostgresBackendError::CallbackSerialization(err)))
+        })?;
 
-        let singleton_result = sqlx::query(
+        let mut tx =
+            self.pool.begin().await.map_err(|err| {
+                FinishTaskError::Backend(Box::new(PostgresBackendError::Sqlx(err)))
+            })?;
+
+        let singleton_row = sqlx::query(
             r#"
 UPDATE bellows_tasks
 SET lease_worker_id = NULL,
@@ -548,36 +639,83 @@ SET lease_worker_id = NULL,
 WHERE task_id = $1
   AND lease_worker_id = $2
   AND task_unique_key IS NOT NULL
+RETURNING task_name, callback_id
 "#,
         )
         .bind(task_id_db)
         .bind(worker_id_db)
-        .execute(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|err| FinishTaskError::Backend(Box::new(PostgresBackendError::Sqlx(err))))?;
 
-        if singleton_result.rows_affected() != 0 {
-            return Ok(FinishedTask { task_id });
-        }
-
-        let published_result = sqlx::query(
-            r#"
+        let finished_row = if let Some(row) = singleton_row {
+            Some(row)
+        } else {
+            sqlx::query(
+                r#"
 DELETE FROM bellows_tasks
 WHERE task_id = $1
   AND lease_worker_id = $2
   AND task_unique_key IS NULL
+RETURNING task_name, callback_id
 "#,
-        )
-        .bind(task_id_db)
-        .bind(worker_id_db)
-        .execute(&self.pool)
-        .await
-        .map_err(|err| FinishTaskError::Backend(Box::new(PostgresBackendError::Sqlx(err))))?;
+            )
+            .bind(task_id_db)
+            .bind(worker_id_db)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|err| FinishTaskError::Backend(Box::new(PostgresBackendError::Sqlx(err))))?
+        };
 
-        if published_result.rows_affected() == 0 {
-            Err(FinishTaskError::LeaseLost)
-        } else {
-            Ok(FinishedTask { task_id })
+        let Some(finished_row) = finished_row else {
+            tx.rollback().await.ok();
+            return Err(FinishTaskError::LeaseLost);
+        };
+
+        let task_name = finished_row.get::<String, _>("task_name");
+        let callback_id = finished_row.get::<Option<i64>, _>("callback_id");
+
+        if let Some(callback_id) = callback_id {
+            let payload_json = serde_json::to_string(&NotificationPayload::TaskCallback {
+                task_name,
+                callback_id,
+                callback_payload_json,
+            })
+            .expect("postgres callback notification payload should serialize");
+
+            sqlx::query("SELECT pg_notify($1, $2)")
+                .bind(NOTIFY_CHANNEL)
+                .bind(payload_json)
+                .execute(&mut *tx)
+                .await
+                .map_err(|err| {
+                    FinishTaskError::Backend(Box::new(PostgresBackendError::Sqlx(err)))
+                })?;
+        }
+
+        tx.commit()
+            .await
+            .map_err(|err| FinishTaskError::Backend(Box::new(PostgresBackendError::Sqlx(err))))?;
+
+        Ok(FinishedTask { task_id })
+    }
+}
+
+struct TypedCallbackSink<T> {
+    tx: OneshotSender<T>,
+}
+
+trait CallbackSink: Send {
+    fn send(self: Box<Self>, callback_payload_json: String);
+}
+
+impl<T> CallbackSink for TypedCallbackSink<T>
+where
+    T: serde::de::DeserializeOwned + Send + 'static,
+{
+    fn send(self: Box<Self>, callback_payload_json: String) {
+        if let Ok(callback_payload) = serde_json::from_str(&callback_payload_json) {
+            let _ = self.tx.send(callback_payload);
         }
     }
 }
@@ -651,30 +789,56 @@ impl Daemon {
             }
         };
 
-        let Ok(task_id) = u64::try_from(payload.task_id) else {
-            warn!(
-                "received postgres notification with out-of-range task ID: {}",
-                payload.task_id
-            );
-            return EventLoopResult::Continue;
-        };
-
         let Some(shared) = self.shared.upgrade() else {
             return EventLoopResult::Exit;
         };
 
-        let sender = {
-            let signals = shared
-                .signals
-                .lock()
-                .expect("postgres backend signal registry mutex should not be poisoned");
-            signals.get(payload.task_name.as_str()).cloned()
-        };
+        match payload {
+            NotificationPayload::NewTaskAvailable { task_name, task_id } => {
+                let Ok(task_id) = u64::try_from(task_id) else {
+                    warn!(
+                        "received postgres notification with out-of-range task ID: {}",
+                        task_id
+                    );
+                    return EventLoopResult::Continue;
+                };
 
-        if let Some(sender) = sender {
-            let _ = sender.send(BackendSignal::NewTaskAvailable(
-                NewTaskAvailableSignalPayload { task_id },
-            ));
+                let sender = {
+                    let signals = shared
+                        .signals
+                        .lock()
+                        .expect("postgres backend signal registry mutex should not be poisoned");
+                    signals.get(task_name.as_str()).cloned()
+                };
+
+                if let Some(sender) = sender {
+                    let _ = sender.send(BackendSignal::NewTaskAvailable(
+                        NewTaskAvailableSignalPayload { task_id },
+                    ));
+                }
+            }
+            NotificationPayload::TaskCallback {
+                task_name: _,
+                callback_id,
+                callback_payload_json,
+            } => {
+                let Ok(callback_id) = u64::try_from(callback_id) else {
+                    warn!(
+                        "received postgres callback notification with out-of-range callback ID: {}",
+                        callback_id
+                    );
+                    return EventLoopResult::Continue;
+                };
+
+                if let Some(callback_sink) = shared
+                    .callbacks
+                    .lock()
+                    .expect("postgres backend callback registry mutex should not be poisoned")
+                    .remove(&callback_id)
+                {
+                    callback_sink.send(callback_payload_json);
+                }
+            }
         }
 
         EventLoopResult::Continue
@@ -709,10 +873,18 @@ async fn connect_listener(database_url: &str) -> Result<PgListener, sqlx::Error>
     Ok(listener)
 }
 
-#[derive(Debug, Deserialize)]
-struct NotificationPayload {
-    task_name: String,
-    task_id: i64,
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum NotificationPayload {
+    NewTaskAvailable {
+        task_name: String,
+        task_id: i64,
+    },
+    TaskCallback {
+        task_name: String,
+        callback_id: i64,
+        callback_payload_json: String,
+    },
 }
 
 fn unix_timestamp_ms(time: SystemTime) -> i64 {

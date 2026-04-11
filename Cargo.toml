@@ -16,6 +16,7 @@ sqlite = ["sqlx", "serde_json"]
 postgres = ["sqlx", "serde_json"]
 
 [dependencies]
+rand = { version = "0.10.0", default-features = false, features = ["thread_rng"] }
 serde = { version = "1.0.228", default-features = false }
 serde_json = { version = "1.0.149", optional = true }
 sqlx = { version = "0.8.6", default-features = false, optional = true, features = ["runtime-tokio", "sqlite", "postgres"] }

@@ -110,9 +110,8 @@ where
                 lease_expiration,
             } => {
                 let worker = self.factory.build(self.worker_id);
-                let worker_handle = tokio::spawn(async move {
-                    worker.process(task_id, task_payload).await;
-                });
+                let worker_handle =
+                    tokio::spawn(async move { worker.process(task_id, task_payload).await });
 
                 (
                     DaemonStatus::WorkerStarted {
@@ -180,8 +179,11 @@ where
                     },
                     join_result = &mut worker_handle => {
                         match join_result {
-                            Ok(()) => (
-                                DaemonStatus::WorkerFinishedProcessing { task_id },
+                            Ok(callback_payload) => (
+                                DaemonStatus::WorkerFinishedProcessing {
+                                    task_id,
+                                    callback_payload,
+                                },
                                 EventLoopResult::Continue,
                             ),
                             Err(err) => {
@@ -200,8 +202,19 @@ where
                     },
                 }
             }
-            DaemonStatus::WorkerFinishedProcessing { task_id } => {
-                match self.backend.finish(self.worker_id, task_id).await {
+            DaemonStatus::WorkerFinishedProcessing {
+                task_id,
+                callback_payload,
+            } => {
+                match self
+                    .backend
+                    .finish::<<F::Worker as Worker>::Task>(
+                        self.worker_id,
+                        task_id,
+                        callback_payload,
+                    )
+                    .await
+                {
                     Ok(_) => {
                         trace!("Finished task #{} with worker #{}", task_id, self.worker_id);
                     }
@@ -255,11 +268,14 @@ where
     /// The background worker has been spawned.
     WorkerStarted {
         task_id: u64,
-        worker_handle: tokio::task::JoinHandle<()>,
+        worker_handle: tokio::task::JoinHandle<T::Callback>,
         lease_expiration: Instant,
     },
     /// The worker future completed successfully and the task should be finalized in the backend.
-    WorkerFinishedProcessing { task_id: u64 },
+    WorkerFinishedProcessing {
+        task_id: u64,
+        callback_payload: T::Callback,
+    },
     /// The worker runtime is done.
     WorkerExited,
 }

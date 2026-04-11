@@ -22,7 +22,17 @@ struct EchoTaskPayload {
 impl TaskDefinition for EchoTaskSpec {
     const NAME: &str = "echo";
 
+    type Callback = String;
     type Trigger = PublishTrigger<EchoTaskPayload>;
+}
+
+struct AckTaskSpec;
+
+impl TaskDefinition for AckTaskSpec {
+    const NAME: &str = "ack";
+
+    type Callback = ();
+    type Trigger = PublishTrigger<()>;
 }
 
 struct SingletonTaskSpec;
@@ -30,6 +40,7 @@ struct SingletonTaskSpec;
 impl TaskDefinition for SingletonTaskSpec {
     const NAME: &str = "singleton_echo";
 
+    type Callback = ();
     type Trigger = SingletonTrigger;
 }
 
@@ -60,13 +71,43 @@ struct EchoWorker {
 impl Worker for EchoWorker {
     type Task = EchoTaskSpec;
 
-    async fn process(self, task_id: u64, task_payload: EchoTaskPayload) {
+    async fn process(self, task_id: u64, task_payload: EchoTaskPayload) -> String {
         self.processed_tx
             .send(ProcessedTask {
                 task_id,
-                name: task_payload.name,
+                name: task_payload.name.clone(),
             })
             .expect("processed task collector should remain available during the test");
+
+        task_payload.name
+    }
+}
+
+struct AckWorkerFactory {
+    processed_tx: MpscSender<u64>,
+}
+
+impl WorkerFactory for AckWorkerFactory {
+    type Worker = AckWorker;
+
+    fn build(&self, _worker_id: u64) -> Self::Worker {
+        AckWorker {
+            processed_tx: self.processed_tx.clone(),
+        }
+    }
+}
+
+struct AckWorker {
+    processed_tx: MpscSender<u64>,
+}
+
+impl Worker for AckWorker {
+    type Task = AckTaskSpec;
+
+    async fn process(self, task_id: u64, _task_payload: ()) {
+        self.processed_tx
+            .send(task_id)
+            .expect("ack task collector should remain available during the test");
     }
 }
 
@@ -142,6 +183,42 @@ async fn test_in_memory_backend() {
     dispatcher_handle.drain().await;
 
     assert!(processed_rx.recv().await.is_none());
+}
+
+#[tokio::test]
+async fn test_publish_awaitable_returns_typed_callback() {
+    let backend = InMemoryBackend::new();
+    let (processed_tx, mut processed_rx) = tokio::sync::mpsc::unbounded_channel();
+    let dispatcher = WorkerDispatcher::new(backend.clone(), EchoWorkerFactory { processed_tx });
+    let dispatcher_handle = dispatcher.launch().await.unwrap();
+
+    let awaitable = backend
+        .publish_awaitable::<EchoTaskSpec>(EchoTaskPayload {
+            name: "Alice".to_string(),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(awaitable.wait().await.unwrap(), "Alice");
+    assert_eq!(processed_rx.recv().await.unwrap().name, "Alice");
+
+    dispatcher_handle.drain().await;
+}
+
+#[tokio::test]
+async fn test_publish_awaitable_supports_unit_callback() {
+    let backend = InMemoryBackend::new();
+    let (processed_tx, mut processed_rx) = tokio::sync::mpsc::unbounded_channel();
+    let dispatcher = WorkerDispatcher::new(backend.clone(), AckWorkerFactory { processed_tx });
+    let dispatcher_handle = dispatcher.launch().await.unwrap();
+
+    let awaitable = backend.publish_awaitable::<AckTaskSpec>(()).await.unwrap();
+    let task_id = awaitable.task_id();
+
+    assert_eq!(awaitable.wait().await.unwrap(), ());
+    assert_eq!(processed_rx.recv().await.unwrap(), task_id);
+
+    dispatcher_handle.drain().await;
 }
 
 #[tokio::test]

@@ -34,6 +34,7 @@
 use std::{marker::PhantomData, time::Instant};
 
 use serde::{Serialize, de::DeserializeOwned};
+use tokio::sync::oneshot;
 
 pub mod backends;
 pub use backends::Backend;
@@ -49,6 +50,12 @@ pub trait TaskDefinition: Send {
     /// Backends use this name to physically separate tasks belonging to different definitions so a
     /// worker can never successfully claim a task for the wrong payload type.
     const NAME: &'static str;
+
+    /// The callback payload emitted when a worker successfully finishes the task.
+    ///
+    /// This is used by [`Backend::publish_awaitable`] to produce a typed completion handle. Tasks
+    /// that do not need to return extra information should use `()`.
+    type Callback: Serialize + DeserializeOwned + Send + Sync + 'static;
 
     /// Specifies how the task should be activated for processing. Use one of the two possible
     /// activation types:
@@ -109,7 +116,7 @@ pub trait Worker: Send {
         self,
         task_id: u64,
         task_payload: <<Self::Task as TaskDefinition>::Trigger as ActivationStrategy>::EffectivePayload,
-    ) -> impl Future<Output = ()> + Send;
+    ) -> impl Future<Output = <Self::Task as TaskDefinition>::Callback> + Send;
 }
 
 pub trait WorkerFactory: Send + Sync {
@@ -117,6 +124,48 @@ pub trait WorkerFactory: Send + Sync {
 
     fn build(&self, worker_id: u64) -> Self::Worker;
 }
+
+#[derive(Debug)]
+pub struct AwaitableTask<T> {
+    task_id: u64,
+    callback_rx: oneshot::Receiver<T>,
+}
+
+impl<T> AwaitableTask<T> {
+    pub(crate) fn new(task_id: u64, callback_rx: oneshot::Receiver<T>) -> Self {
+        Self {
+            task_id,
+            callback_rx,
+        }
+    }
+
+    pub fn task_id(&self) -> u64 {
+        self.task_id
+    }
+
+    pub async fn wait(self) -> Result<T, AwaitTaskError> {
+        self.callback_rx
+            .await
+            .map_err(|_| AwaitTaskError::CallbackLost)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AwaitTaskError {
+    CallbackLost,
+}
+
+impl std::fmt::Display for AwaitTaskError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CallbackLost => {
+                f.write_str("task finished without an observable callback notification")
+            }
+        }
+    }
+}
+
+impl std::error::Error for AwaitTaskError {}
 
 /// Indicates that a task is publishable with payload. Workers start processing the task upon its
 /// publication. This is the most common type of tasks.

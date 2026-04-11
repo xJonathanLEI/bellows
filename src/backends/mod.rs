@@ -9,7 +9,7 @@ use std::{
 
 use tokio::sync::broadcast::Receiver as BroadcastReceiver;
 
-use crate::{PublishActivationStrategy, TaskDefinition};
+use crate::{AwaitableTask, PublishActivationStrategy, TaskDefinition};
 
 #[cfg(feature = "in_memory")]
 pub mod in_memory;
@@ -64,6 +64,15 @@ pub trait Backend: Clone + Send + Sync {
         T: TaskDefinition,
         T::Trigger: PublishActivationStrategy;
 
+    /// Publishes a task and returns a typed handle that can await the worker callback payload.
+    fn publish_awaitable<T>(
+        &self,
+        payload: <<T as TaskDefinition>::Trigger as PublishActivationStrategy>::Payload,
+    ) -> impl Future<Output = Result<AwaitableTask<T::Callback>, PublishTaskError>> + Send
+    where
+        T: TaskDefinition,
+        T::Trigger: PublishActivationStrategy;
+
     /// Claims a published task until a lease expiration time.
     fn claim_published<T>(
         &self,
@@ -102,11 +111,14 @@ pub trait Backend: Clone + Send + Sync {
     /// Backends must only allow completion by the current lease holder. A worker that still owns
     /// the lease may finish the task even if the lease has technically expired, as long as no
     /// other worker has taken ownership in the meantime.
-    fn finish(
+    fn finish<T>(
         &self,
         worker_id: u64,
         task_id: u64,
-    ) -> impl Future<Output = Result<FinishedTask, FinishTaskError>> + Send;
+        callback_payload: T::Callback,
+    ) -> impl Future<Output = Result<FinishedTask, FinishTaskError>> + Send
+    where
+        T: TaskDefinition;
 }
 
 /// Boxed backend-specific error source exposed by the public backend API.
@@ -169,13 +181,15 @@ where
 {
     pub async fn recv(
         &mut self,
-    ) -> Result<BackendSignal, tokio::sync::broadcast::error::RecvError> {
-        self.rx.recv().await
+    ) -> Result<NewTaskAvailableSignalPayload, tokio::sync::broadcast::error::RecvError> {
+        match self.rx.recv().await? {
+            BackendSignal::NewTaskAvailable(signal) => Ok(signal),
+        }
     }
 }
 
 impl<T> BackendSignalSubscription<T> {
-    pub fn new(rx: BroadcastReceiver<BackendSignal>) -> Self {
+    pub(crate) fn new(rx: BroadcastReceiver<BackendSignal>) -> Self {
         Self {
             rx,
             _task: PhantomData,
