@@ -179,4 +179,4 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
-          pnpm --dir bellows-ts publish --no-git-checks --access public
+          pnpm publish --filter @xjonathanlei/bellows --no-git-checks --access public
