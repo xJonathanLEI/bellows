@@ -7,9 +7,10 @@ on:
 name: "Code checks"
 
 jobs:
-  rustfmt:
-    name: "Check code format"
+  format:
+    name: "Check code quality and format"
     runs-on: "ubuntu-latest"
+
     steps:
       - name: "Checkout source code"
         uses: "actions/checkout@v6"
@@ -21,9 +22,76 @@ jobs:
           components: "clippy"
           override: true
 
+      - name: "Setup pnpm"
+        uses: "pnpm/action-setup@v4"
+
+      - name: "Setup Node.js"
+        uses: "actions/setup-node@v4"
+        with:
+          node-version: "22"
+          cache: "pnpm"
+
+      - name: "Install Node dependencies"
+        run: |
+          pnpm install --frozen-lockfile
+
       - name: "Check Rust format"
         run: |
           cargo fmt --all -- --check
+
+      - name: "Check TypeScript code quality"
+        run: |
+          pnpm check
+
+  typecheck:
+    name: "Check TypeScript types"
+    runs-on: "ubuntu-latest"
+
+    steps:
+      - name: "Checkout source code"
+        uses: "actions/checkout@v6"
+
+      - name: "Setup pnpm"
+        uses: "pnpm/action-setup@v4"
+
+      - name: "Setup Node.js"
+        uses: "actions/setup-node@v4"
+        with:
+          node-version: "22"
+          cache: "pnpm"
+
+      - name: "Install Node dependencies"
+        run: |
+          pnpm install --frozen-lockfile
+
+      - name: "Run typecheck"
+        run: |
+          pnpm typecheck
+
+  build:
+    name: "Build Rust"
+    runs-on: "ubuntu-latest"
+
+    steps:
+      - name: "Checkout source code"
+        uses: "actions/checkout@v6"
+
+      - name: "Setup toolchain"
+        uses: "actions-rs/toolchain@v1"
+        with:
+          toolchain: "stable"
+          components: "clippy"
+          override: true
+
+      - name: "Use Rust cache"
+        uses: "Swatinem/rust-cache@v2"
+        with:
+          cache-on-failure: true
+          cache-all-crates: true
+
+      - name: "Build Rust"
+        run: |
+          cargo build --all --all-targets
 
   clippy:
     name: "Run Clippy"
@@ -44,7 +112,72 @@ jobs:
         uses: "Swatinem/rust-cache@v2"
         with:
           cache-on-failure: true
+          cache-all-crates: true
 
       - name: "Run Clippy"
         run: |
           cargo clippy --all --all-targets -- -D warnings
+
+  tests:
+    name: "Run tests"
+    runs-on: "ubuntu-latest"
+
+    services:
+      postgres:
+        image: "postgres:17"
+        env:
+          POSTGRES_USER: "postgres"
+          POSTGRES_PASSWORD: "postgres"
+          POSTGRES_DB: "postgres"
+        ports:
+          - "5432:5432"
+        options: >-
+          --health-cmd "pg_isready -U postgres -d postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: "Checkout source code"
+        uses: "actions/checkout@v6"
+
+      - name: "Setup toolchain"
+        uses: "actions-rs/toolchain@v1"
+        with:
+          toolchain: "stable"
+          components: "clippy"
+          override: true
+
+      - name: "Setup pnpm"
+        uses: "pnpm/action-setup@v4"
+
+      - name: "Setup Node.js"
+        uses: "actions/setup-node@v4"
+        with:
+          node-version: "22"
+          cache: "pnpm"
+
+      - name: "Use Rust cache"
+        uses: "Swatinem/rust-cache@v2"
+        with:
+          cache-on-failure: true
+          cache-all-crates: true
+
+      - name: "Install nexttest"
+        uses: "taiki-e/install-action@nextest"
+
+      - name: "Install Node dependencies"
+        run: |
+          pnpm install --frozen-lockfile
+
+      - name: "Run Rust tests"
+        env:
+          CARGO_TERM_COLOR: "always"
+        run: |
+          cargo nextest run --all-features
+
+      - name: "Run TypeScript tests"
+        env:
+          BELLOWS_TS_TEST_POSTGRES_URL: "postgres://postgres:postgres@localhost:5432/postgres"
+        run: |
+          pnpm test
