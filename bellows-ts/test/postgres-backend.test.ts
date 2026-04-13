@@ -1,10 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { Client } from "pg";
 import { afterEach, expect, test } from "vitest";
+import { PostgresBackend } from "../src/backends/postgres.js";
 import {
   definePublishTask,
   defineSingletonTask,
-  PostgresBackend,
   WorkerDispatcher,
   type WorkerFactory,
 } from "../src/index.js";

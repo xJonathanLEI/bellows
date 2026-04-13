@@ -20,6 +20,18 @@
     ".": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
+    },
+    "./backends/in-memory": {
+      "types": "./dist/backends/in-memory.d.ts",
+      "default": "./dist/backends/in-memory.js"
+    },
+    "./backends/postgres": {
+      "types": "./dist/backends/postgres.d.ts",
+      "default": "./dist/backends/postgres.js"
+    },
+    "./backends/sqlite": {
+      "types": "./dist/backends/sqlite.d.ts",
+      "default": "./dist/backends/sqlite.js"
     }
   },
   "main": "./dist/index.js",

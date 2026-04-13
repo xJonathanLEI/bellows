@@ -1,8 +1,8 @@
 import { afterEach, expect, test } from "vitest";
+import { InMemoryBackend } from "../src/backends/in-memory.js";
 import {
   definePublishTask,
   defineSingletonTask,
-  InMemoryBackend,
   WorkerDispatcher,
   type WorkerFactory,
 } from "../src/index.js";

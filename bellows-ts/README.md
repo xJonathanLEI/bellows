@@ -14,8 +14,8 @@ TypeScript port of `bellows`, a durable task processing framework.
 ## Quick example
 
 ```ts
+import { InMemoryBackend } from "@xjonathanlei/bellows/backends/in-memory";
 import {
-  InMemoryBackend,
   WorkerDispatcher,
   definePublishTask,
   type WorkerFactory,

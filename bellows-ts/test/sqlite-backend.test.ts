@@ -1,8 +1,8 @@
 import { afterEach, expect, test } from "vitest";
+import { SqliteBackend } from "../src/backends/sqlite.js";
 import {
   definePublishTask,
   defineSingletonTask,
-  SqliteBackend,
   WorkerDispatcher,
   type WorkerFactory,
 } from "../src/index.js";
