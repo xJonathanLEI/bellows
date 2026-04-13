@@ -1,7 +1,20 @@
 {
-  "name": "bellows-ts",
-  "version": "0.0.1",
-  "private": true,
+  "name": "@xjonathanlei/bellows",
+  "version": "0.0.5",
+  "description": "TypeScript port of bellows, a durable task processing framework",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xJonathanLEI/bellows.git",
+    "directory": "bellows-ts"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
   "type": "module",
   "exports": {
     ".": {

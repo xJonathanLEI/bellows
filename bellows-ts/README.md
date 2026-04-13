@@ -1,4 +1,4 @@
-# bellows-ts
+# @xjonathanlei/bellows
 
 TypeScript port of `bellows`, a durable task processing framework.
 
@@ -19,7 +19,7 @@ import {
   WorkerDispatcher,
   definePublishTask,
   type WorkerFactory,
-} from "bellows-ts";
+} from "@xjonathanlei/bellows";
 
 const echoTask = definePublishTask<{ name: string }>("echo");
 const backend = new InMemoryBackend();
