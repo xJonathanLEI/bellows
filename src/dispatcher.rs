@@ -1,18 +1,16 @@
-use std::collections::VecDeque;
 use std::error::Error as StdError;
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
+use std::time::Instant;
 
 use tokio::sync::Notify;
 use tokio::sync::mpsc::{UnboundedReceiver as MpscReceiver, UnboundedSender as MpscSender};
 
-use crate::runtime::WorkerRuntime;
+use crate::runtime::{RuntimeUpdate, WorkerRuntime};
 use crate::{
-    ActivationStrategy, Backend, PublishTrigger, SingletonTrigger, TaskDefinition, Worker,
-    WorkerFactory,
-    backends::{
-        BackendSignalSubscription, NewTaskAvailableSignalPayload, SubscribeError, SweepTasksError,
-    },
+    ActivationStrategy, Backend, PublishDispatchToken, PublishTrigger, SingletonTrigger,
+    TaskDefinition, Worker, WorkerFactory,
+    backends::{BackendSignalSubscription, NewTaskAvailableSignalPayload, SubscribeError},
 };
 
 pub struct WorkerDispatcher<B, F> {
@@ -42,17 +40,13 @@ where
     {
         let drain_signal = Arc::new(Notify::const_new());
         let drained_signal = Arc::new(Notify::const_new());
-        let (finished_tx, finished_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let (report_tx, report_rx) = tokio::sync::mpsc::unbounded_channel::<RuntimeReport>();
 
         let subscription = self
             .backend
             .subscribe::<<F::Worker as Worker>::Task>()
             .await
             .map_err(WorkerDispatcherLaunchError::SubscribeFailed)?;
-        let swept_tasks =
-            <<<F::Worker as Worker>::Task as TaskDefinition>::Trigger as ActivationStrategy>::sweep_tasks::<B, <F::Worker as Worker>::Task>(&self.backend)
-                .await
-                .map_err(WorkerDispatcherLaunchError::SweepFailed)?;
 
         let daemon = Daemon {
             context: DaemonContext {
@@ -61,14 +55,15 @@ where
                 subscription,
                 drain_signal: drain_signal.clone(),
                 drained_signal: drained_signal.clone(),
-                finished_tx,
-                finished_rx,
+                report_tx,
+                report_rx,
             },
             state: DaemonState {
                 draining: false,
                 pending_workers: 0,
                 next_worker_id: 0,
-                startup_tasks: swept_tasks.into_iter().collect::<VecDeque<_>>(),
+                earliest_available_from: Some(Instant::now()),
+                earliest_claim_in_flight: false,
             },
         };
 
@@ -84,14 +79,12 @@ where
 #[derive(Debug)]
 pub enum WorkerDispatcherLaunchError {
     SubscribeFailed(SubscribeError),
-    SweepFailed(SweepTasksError),
 }
 
 impl Display for WorkerDispatcherLaunchError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::SubscribeFailed(error) => write!(f, "subscription failed: {error}"),
-            Self::SweepFailed(error) => write!(f, "sweep failed: {error}"),
         }
     }
 }
@@ -100,7 +93,6 @@ impl StdError for WorkerDispatcherLaunchError {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match self {
             Self::SubscribeFailed(error) => Some(error),
-            Self::SweepFailed(error) => Some(error),
         }
     }
 }
@@ -135,7 +127,7 @@ where
     F: WorkerFactory,
 {
     context: DaemonContext<B, F>,
-    state: DaemonState<<F::Worker as Worker>::Task>,
+    state: DaemonState,
 }
 
 impl<B, F> Daemon<B, F>
@@ -154,55 +146,126 @@ where
         self.context.drained_signal.notify_one();
     }
 
-    async fn event_loop(
-        ctx: &mut DaemonContext<B, F>,
-        state: &mut DaemonState<<F::Worker as Worker>::Task>,
-    ) -> EventLoopResult {
+    async fn event_loop(ctx: &mut DaemonContext<B, F>, state: &mut DaemonState) -> EventLoopResult {
         if !state.draining
-            && let Some(dispatch_token) = state.startup_tasks.pop_front()
+            && state.should_dispatch_earliest_now()
+            && !state.earliest_claim_in_flight
         {
-            return Self::dispatch_task(dispatch_token, ctx, state);
+            return Self::dispatch_earliest_claim(ctx, state);
         }
 
-        tokio::select! {
-            biased;
+        if let Some(available_from) = state.earliest_available_from {
+            let sleep = tokio::time::sleep_until(tokio::time::Instant::from_std(available_from));
+            tokio::pin!(sleep);
 
-            _ = ctx.drain_signal.notified() => Self::handle_drain(ctx, state),
-            _ = ctx.finished_rx.recv() => Self::handle_finished(ctx, state),
-            sub = ctx.subscription.recv() => Self::handle_sub(sub, ctx, state),
+            tokio::select! {
+                biased;
+
+                _ = ctx.drain_signal.notified() => Self::handle_drain(state),
+                report = ctx.report_rx.recv() => Self::handle_report(report, state),
+                sub = ctx.subscription.recv() => Self::handle_sub(sub, ctx, state),
+                _ = &mut sleep => {
+                    if !state.draining && !state.earliest_claim_in_flight {
+                        Self::dispatch_earliest_claim(ctx, state)
+                    } else {
+                        EventLoopResult::Continue
+                    }
+                },
+            }
+        } else {
+            tokio::select! {
+                biased;
+
+                _ = ctx.drain_signal.notified() => Self::handle_drain(state),
+                report = ctx.report_rx.recv() => Self::handle_report(report, state),
+                sub = ctx.subscription.recv() => Self::handle_sub(sub, ctx, state),
+            }
         }
     }
 
     fn handle_sub(
         sub: Result<NewTaskAvailableSignalPayload, tokio::sync::broadcast::error::RecvError>,
         ctx: &DaemonContext<B, F>,
-        state: &mut DaemonState<<F::Worker as Worker>::Task>,
+        state: &mut DaemonState,
     ) -> EventLoopResult {
         match sub {
             Ok(signal) => {
-                let dispatch_token =
-                    <<<F::Worker as Worker>::Task as TaskDefinition>::Trigger as SignalDispatch>::from_signal(signal);
-                Self::dispatch_task(dispatch_token, ctx, state)
+                let now = Instant::now();
+
+                if let Some(dispatch_token) =
+                    <<<F::Worker as Worker>::Task as TaskDefinition>::Trigger as SignalDispatch>::try_dispatch_from_signal(signal, now)
+                {
+                    Self::dispatch_task(dispatch_token, ctx, state)
+                } else {
+                    state.note_earliest_available_from(Some(signal.available_from));
+                    EventLoopResult::Continue
+                }
             }
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => EventLoopResult::Continue,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                state.note_earliest_available_from(Some(Instant::now()));
+                EventLoopResult::Continue
+            }
             Err(_) => EventLoopResult::Exit,
         }
+    }
+
+    fn dispatch_earliest_claim(
+        ctx: &DaemonContext<B, F>,
+        state: &mut DaemonState,
+    ) -> EventLoopResult {
+        state.earliest_claim_in_flight = true;
+        state.earliest_available_from = None;
+
+        Self::dispatch_task_with_completion(
+            <<<F::Worker as Worker>::Task as TaskDefinition>::Trigger as SignalDispatch>::next_available_dispatch_token(),
+            ctx,
+            state,
+            true,
+        )
     }
 
     fn dispatch_task(
         dispatch_token: <<<F::Worker as Worker>::Task as TaskDefinition>::Trigger as ActivationStrategy>::DispatchToken,
         ctx: &DaemonContext<B, F>,
-        state: &mut DaemonState<<F::Worker as Worker>::Task>,
+        state: &mut DaemonState,
     ) -> EventLoopResult {
-        // Only start new work if not draining
+        Self::dispatch_task_with_completion(dispatch_token, ctx, state, false)
+    }
+
+    fn dispatch_task_with_completion(
+        dispatch_token: <<<F::Worker as Worker>::Task as TaskDefinition>::Trigger as ActivationStrategy>::DispatchToken,
+        ctx: &DaemonContext<B, F>,
+        state: &mut DaemonState,
+        clears_earliest_claim: bool,
+    ) -> EventLoopResult {
         if !state.draining {
+            let (runtime_update_tx, mut runtime_update_rx) =
+                tokio::sync::mpsc::unbounded_channel::<RuntimeUpdate>();
+
             let runtime = WorkerRuntime {
                 backend: ctx.backend.clone(),
                 factory: ctx.factory.clone(),
                 worker_id: state.next_worker_id,
-                finished_signal: ctx.finished_tx.clone(),
+                update_signal: runtime_update_tx,
             };
             runtime.run(dispatch_token);
+
+            let report_tx = ctx.report_tx.clone();
+            tokio::spawn(async move {
+                let mut clears_earliest_claim = clears_earliest_claim;
+
+                while let Some(update) = runtime_update_rx.recv().await {
+                    let _ = report_tx.send(RuntimeReport::Update {
+                        update,
+                        clears_earliest_claim,
+                    });
+                    clears_earliest_claim = false;
+                }
+
+                let _ = report_tx.send(RuntimeReport::Exited {
+                    clears_earliest_claim,
+                });
+            });
 
             state.pending_workers += 1;
             state.next_worker_id += 1;
@@ -211,11 +274,47 @@ where
         EventLoopResult::Continue
     }
 
-    fn handle_finished(
-        _ctx: &DaemonContext<B, F>,
-        state: &mut DaemonState<<F::Worker as Worker>::Task>,
-    ) -> EventLoopResult {
-        state.pending_workers -= 1;
+    fn handle_report(report: Option<RuntimeReport>, state: &mut DaemonState) -> EventLoopResult {
+        if let Some(report) = report {
+            match report {
+                RuntimeReport::Update {
+                    update,
+                    clears_earliest_claim,
+                } => {
+                    if clears_earliest_claim {
+                        state.earliest_claim_in_flight = false;
+                    }
+
+                    if clears_earliest_claim && update.claimed_task {
+                        state.note_earliest_available_from(Some(Instant::now()));
+                    }
+
+                    if let Some(next_available_from_update) = update.next_available_from_update {
+                        match next_available_from_update {
+                            Some(available_from) => {
+                                state.note_earliest_available_from(Some(available_from));
+                            }
+                            None if state.earliest_available_from.is_none() => {
+                                state.note_earliest_available_from(None);
+                            }
+                            None => {}
+                        }
+                    }
+                }
+                RuntimeReport::Exited {
+                    clears_earliest_claim,
+                } => {
+                    if clears_earliest_claim {
+                        state.earliest_claim_in_flight = false;
+                    }
+
+                    if state.pending_workers > 0 {
+                        state.pending_workers -= 1;
+                    }
+                }
+            }
+        }
+
         if state.draining && state.pending_workers == 0 {
             EventLoopResult::Exit
         } else {
@@ -223,10 +322,7 @@ where
         }
     }
 
-    fn handle_drain(
-        _ctx: &DaemonContext<B, F>,
-        state: &mut DaemonState<<F::Worker as Worker>::Task>,
-    ) -> EventLoopResult {
+    fn handle_drain(state: &mut DaemonState) -> EventLoopResult {
         if state.pending_workers == 0 {
             EventLoopResult::Exit
         } else {
@@ -242,6 +338,16 @@ enum EventLoopResult {
     Exit,
 }
 
+enum RuntimeReport {
+    Update {
+        update: RuntimeUpdate,
+        clears_earliest_claim: bool,
+    },
+    Exited {
+        clears_earliest_claim: bool,
+    },
+}
+
 struct DaemonContext<B, F>
 where
     F: WorkerFactory,
@@ -251,34 +357,73 @@ where
     subscription: BackendSignalSubscription<<F::Worker as Worker>::Task>,
     drain_signal: Arc<Notify>,
     drained_signal: Arc<Notify>,
-    finished_tx: MpscSender<()>,
-    finished_rx: MpscReceiver<()>,
+    report_tx: MpscSender<RuntimeReport>,
+    report_rx: MpscReceiver<RuntimeReport>,
 }
 
-struct DaemonState<T>
-where
-    T: TaskDefinition,
-{
+struct DaemonState {
     draining: bool,
     pending_workers: usize,
     next_worker_id: u64,
-    startup_tasks: VecDeque<<T::Trigger as ActivationStrategy>::DispatchToken>,
+    earliest_available_from: Option<Instant>,
+    earliest_claim_in_flight: bool,
+}
+
+impl DaemonState {
+    fn should_dispatch_earliest_now(&self) -> bool {
+        self.earliest_available_from
+            .is_some_and(|available_from| available_from <= Instant::now())
+    }
+
+    fn note_earliest_available_from(&mut self, available_from: Option<Instant>) {
+        let Some(available_from) = available_from else {
+            self.earliest_available_from = None;
+            return;
+        };
+
+        match self.earliest_available_from {
+            Some(current) if current <= available_from => {}
+            _ => self.earliest_available_from = Some(available_from),
+        }
+    }
 }
 
 #[doc(hidden)]
 pub trait SignalDispatch: ActivationStrategy {
-    fn from_signal(signal: NewTaskAvailableSignalPayload) -> Self::DispatchToken;
+    fn try_dispatch_from_signal(
+        signal: NewTaskAvailableSignalPayload,
+        now: Instant,
+    ) -> Option<Self::DispatchToken>;
+
+    fn next_available_dispatch_token() -> Self::DispatchToken;
 }
 
 impl<Payload> SignalDispatch for PublishTrigger<Payload>
 where
     Payload: serde::Serialize + serde::de::DeserializeOwned + Send + Sync,
 {
-    fn from_signal(signal: NewTaskAvailableSignalPayload) -> Self::DispatchToken {
-        signal.task_id
+    fn try_dispatch_from_signal(
+        signal: NewTaskAvailableSignalPayload,
+        now: Instant,
+    ) -> Option<Self::DispatchToken> {
+        (signal.available_from <= now)
+            .then_some(signal.task_id)
+            .flatten()
+            .map(PublishDispatchToken::Task)
+    }
+
+    fn next_available_dispatch_token() -> Self::DispatchToken {
+        PublishDispatchToken::EarliestAvailable
     }
 }
 
 impl SignalDispatch for SingletonTrigger {
-    fn from_signal(_signal: NewTaskAvailableSignalPayload) -> Self::DispatchToken {}
+    fn try_dispatch_from_signal(
+        _signal: NewTaskAvailableSignalPayload,
+        _now: Instant,
+    ) -> Option<Self::DispatchToken> {
+        None
+    }
+
+    fn next_available_dispatch_token() -> Self::DispatchToken {}
 }

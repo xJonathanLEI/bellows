@@ -1,9 +1,12 @@
 #![cfg(feature = "in_memory")]
 
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 
 use bellows::{
-    Backend, PublishTrigger, SingletonTrigger, TaskDefinition, Worker, WorkerFactory,
+    Backend, PublishTrigger, SingletonTrigger, TaskDefinition, TaskFailure, Worker, WorkerFactory,
     backends::in_memory::InMemoryBackend, dispatcher::WorkerDispatcher,
 };
 use serde::{Deserialize, Serialize};
@@ -71,7 +74,11 @@ struct EchoWorker {
 impl Worker for EchoWorker {
     type Task = EchoTaskSpec;
 
-    async fn process(self, task_id: u64, task_payload: EchoTaskPayload) -> String {
+    async fn process(
+        self,
+        task_id: u64,
+        task_payload: EchoTaskPayload,
+    ) -> Result<String, TaskFailure> {
         self.processed_tx
             .send(ProcessedTask {
                 task_id,
@@ -79,7 +86,7 @@ impl Worker for EchoWorker {
             })
             .expect("processed task collector should remain available during the test");
 
-        task_payload.name
+        Ok(task_payload.name)
     }
 }
 
@@ -104,10 +111,11 @@ struct AckWorker {
 impl Worker for AckWorker {
     type Task = AckTaskSpec;
 
-    async fn process(self, task_id: u64, _task_payload: ()) {
+    async fn process(self, task_id: u64, _task_payload: ()) -> Result<(), TaskFailure> {
         self.processed_tx
             .send(task_id)
             .expect("ack task collector should remain available during the test");
+        Ok(())
     }
 }
 
@@ -135,7 +143,7 @@ struct SingletonWorker {
 impl Worker for SingletonWorker {
     type Task = SingletonTaskSpec;
 
-    async fn process(self, task_id: u64, _task_payload: ()) {
+    async fn process(self, task_id: u64, _task_payload: ()) -> Result<(), TaskFailure> {
         self.processed_tx
             .send(task_id)
             .expect("processed task collector should remain available during the test");
@@ -144,6 +152,101 @@ impl Worker for SingletonWorker {
             .await
             .expect("singleton worker gate semaphore should remain available")
             .forget();
+        Ok(())
+    }
+}
+
+struct BlockingTaskSpec;
+
+impl TaskDefinition for BlockingTaskSpec {
+    const NAME: &str = "blocking";
+
+    type Callback = ();
+    type Trigger = PublishTrigger<()>;
+}
+
+struct BlockingWorkerFactory {
+    started_tx: MpscSender<u64>,
+    release_signal: Arc<Semaphore>,
+}
+
+impl WorkerFactory for BlockingWorkerFactory {
+    type Worker = BlockingWorker;
+
+    fn build(&self, _worker_id: u64) -> Self::Worker {
+        BlockingWorker {
+            started_tx: self.started_tx.clone(),
+            release_signal: self.release_signal.clone(),
+        }
+    }
+}
+
+struct BlockingWorker {
+    started_tx: MpscSender<u64>,
+    release_signal: Arc<Semaphore>,
+}
+
+impl Worker for BlockingWorker {
+    type Task = BlockingTaskSpec;
+
+    async fn process(self, task_id: u64, _task_payload: ()) -> Result<(), TaskFailure> {
+        self.started_tx
+            .send(task_id)
+            .expect("blocking task collector should remain available during the test");
+        self.release_signal
+            .acquire()
+            .await
+            .expect("blocking worker gate semaphore should remain available")
+            .forget();
+        Ok(())
+    }
+}
+
+struct RetryTaskSpec;
+
+impl TaskDefinition for RetryTaskSpec {
+    const NAME: &str = "retry_once";
+
+    type Callback = ();
+    type Trigger = PublishTrigger<()>;
+}
+
+struct RetryWorkerFactory {
+    // Workers should be stateless to avoid context leak but it's for testing here so it's fine.
+    attempts: Arc<AtomicUsize>,
+    processed_tx: MpscSender<u64>,
+}
+
+impl WorkerFactory for RetryWorkerFactory {
+    type Worker = RetryWorker;
+
+    fn build(&self, _worker_id: u64) -> Self::Worker {
+        RetryWorker {
+            attempts: self.attempts.clone(),
+            processed_tx: self.processed_tx.clone(),
+        }
+    }
+}
+
+struct RetryWorker {
+    // Workers should be stateless to avoid context leak but it's for testing here so it's fine.
+    attempts: Arc<AtomicUsize>,
+    processed_tx: MpscSender<u64>,
+}
+
+impl Worker for RetryWorker {
+    type Task = RetryTaskSpec;
+
+    async fn process(self, task_id: u64, _task_payload: ()) -> Result<(), TaskFailure> {
+        let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+        if attempt == 0 {
+            Err(TaskFailure::retry_immediately())
+        } else {
+            self.processed_tx
+                .send(task_id)
+                .expect("retry task collector should remain available during the test");
+            Ok(())
+        }
     }
 }
 
@@ -257,6 +360,42 @@ async fn test_in_memory_singleton_task_dispatch() {
 }
 
 #[tokio::test]
+async fn test_dispatcher_drains_multiple_preexisting_tasks_without_waiting() {
+    let backend = InMemoryBackend::new();
+    let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+    let release_signal = Arc::new(Semaphore::new(0));
+
+    let first = backend.publish::<BlockingTaskSpec>(()).await.unwrap();
+    let second = backend.publish::<BlockingTaskSpec>(()).await.unwrap();
+
+    let dispatcher = WorkerDispatcher::new(
+        backend,
+        BlockingWorkerFactory {
+            started_tx,
+            release_signal: release_signal.clone(),
+        },
+    );
+    let dispatcher_handle = dispatcher.launch().await.unwrap();
+
+    let started_first = tokio::time::timeout(std::time::Duration::from_secs(1), started_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let started_second = tokio::time::timeout(std::time::Duration::from_secs(1), started_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert!(started_first == first.task_id || started_first == second.task_id);
+    assert!(started_second == first.task_id || started_second == second.task_id);
+    assert_ne!(started_first, started_second);
+
+    let drain_handle = tokio::spawn(dispatcher_handle.drain());
+    release_signal.add_permits(2);
+    drain_handle.await.unwrap();
+}
+
+#[tokio::test]
 async fn test_sweeping() {
     let backend = InMemoryBackend::new();
     let (processed_tx, mut processed_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -293,6 +432,29 @@ async fn test_sweeping() {
     dispatcher_handle.drain().await;
 
     assert!(processed_rx.recv().await.is_none());
+}
+
+#[tokio::test]
+async fn test_worker_failure_is_retried() {
+    let backend = InMemoryBackend::new();
+    let (processed_tx, mut processed_rx) = tokio::sync::mpsc::unbounded_channel();
+    let attempts = Arc::new(AtomicUsize::new(0));
+
+    let dispatcher = WorkerDispatcher::new(
+        backend.clone(),
+        RetryWorkerFactory {
+            attempts: attempts.clone(),
+            processed_tx,
+        },
+    );
+    let dispatcher_handle = dispatcher.launch().await.unwrap();
+
+    let published = backend.publish::<RetryTaskSpec>(()).await.unwrap();
+
+    assert_eq!(processed_rx.recv().await.unwrap(), published.task_id);
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+
+    dispatcher_handle.drain().await;
 }
 
 async fn assert_names_echoed(rx: &mut MpscReceiver<ProcessedTask>, names: &[&str]) {

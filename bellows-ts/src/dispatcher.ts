@@ -1,6 +1,14 @@
-import { AsyncQueue } from "./internal/async-queue.js";
-import { WorkerRuntime } from "./runtime.js";
-import type { Backend, TaskDefinition, WorkerFactory } from "./types.js";
+import {
+  type PublishDispatchToken,
+  type RuntimeUpdate,
+  WorkerRuntime,
+} from "./runtime.js";
+import type {
+  Backend,
+  BackendSignal,
+  TaskDefinition,
+  WorkerFactory,
+} from "./types.js";
 
 class Deferred {
   readonly promise: Promise<void>;
@@ -17,11 +25,23 @@ class Deferred {
   }
 }
 
+type RuntimeReport =
+  | {
+      readonly type: "update";
+      readonly update: RuntimeUpdate;
+      readonly clearsEarliestClaim: boolean;
+    }
+  | {
+      readonly type: "exited";
+      readonly clearsEarliestClaim: boolean;
+    };
+
 type DispatcherEvent =
   | { readonly type: "drain" }
-  | { readonly type: "finished" }
-  | { readonly type: "signal"; readonly taskId: number }
-  | { readonly type: "subscription-closed" };
+  | { readonly type: "report"; readonly report: RuntimeReport }
+  | { readonly type: "signal"; readonly signal: BackendSignal }
+  | { readonly type: "subscription-closed" }
+  | { readonly type: "timer" };
 
 export class WorkerDispatcherHandle {
   private drainingStarted = false;
@@ -60,13 +80,8 @@ export class WorkerDispatcher<TTask extends TaskDefinition> {
   async launch(): Promise<WorkerDispatcherHandle> {
     const handle = new WorkerDispatcherHandle();
     const subscription = await this.backend.subscribe(this.factory.task);
-    const startupTasks = await this.backend.sweep(this.factory.task);
 
-    void this.run(
-      handle,
-      subscription,
-      startupTasks.map(({ taskId }) => taskId),
-    );
+    void this.run(handle, subscription);
 
     return handle;
   }
@@ -74,16 +89,10 @@ export class WorkerDispatcher<TTask extends TaskDefinition> {
   private async run(
     handle: WorkerDispatcherHandle,
     subscription: Awaited<ReturnType<Backend["subscribe"]>>,
-    startupTaskIds: number[],
   ): Promise<void> {
-    const startupQueue =
-      this.factory.task.kind === "publish" ? [...startupTaskIds] : [undefined];
-    const events = new AsyncQueue<DispatcherEvent>();
-
-    let drainRequested = false;
+    const events = new EventQueue();
 
     void handle.waitForDrainRequest().then(() => {
-      drainRequested = true;
       events.push({ type: "drain" });
     });
 
@@ -95,109 +104,275 @@ export class WorkerDispatcher<TTask extends TaskDefinition> {
           return;
         }
 
-        events.push({ type: "signal", taskId: signal.taskId });
+        events.push({ type: "signal", signal });
       }
     })();
 
-    let draining = false;
-    let pendingWorkers = 0;
-    let nextWorkerId = 0;
-    let singletonRedispatchQueued = false;
-
-    const dispatchTask = (dispatchToken: number | undefined): void => {
-      if (draining) {
-        return;
-      }
-
-      if (this.factory.task.kind === "singleton" && pendingWorkers > 0) {
-        // Singleton tasks should only have one runtime in flight at a time. Unlike
-        // published tasks, repeated availability signals all point at the same
-        // backend-managed task instance. If a signal arrives before the current runtime
-        // reports its completion back to the dispatcher, remember that signal so the
-        // singleton is re-dispatched after the in-flight runtime finishes.
-        singletonRedispatchQueued = true;
-        return;
-      }
-
-      pendingWorkers += 1;
-      const runtime = new WorkerRuntime(
-        this.backend,
-        this.factory,
-        nextWorkerId,
-        () => {
-          events.push({ type: "finished" });
-        },
-      );
-      nextWorkerId += 1;
-      runtime.run(dispatchToken);
-    };
+    const state = new DaemonState();
 
     while (true) {
-      if (!draining && startupQueue.length > 0) {
-        dispatchTask(startupQueue.shift());
+      if (
+        !state.draining &&
+        state.shouldDispatchEarliestNow() &&
+        !state.earliestClaimInFlight
+      ) {
+        this.dispatchEarliestClaim(events, state);
         continue;
       }
 
-      if (!draining && drainRequested) {
-        if (pendingWorkers === 0) {
-          subscription.close();
-          handle.markDrained();
-          return;
-        }
-
-        draining = true;
-        continue;
-      }
-
-      const event = await events.shift();
-      if (event === null) {
+      const event = await events.shift(state.earliestAvailableFromMs);
+      if (event === null || event.type === "subscription-closed") {
         handle.markDrained();
         return;
       }
 
       if (event.type === "drain") {
-        if (pendingWorkers === 0) {
+        if (state.pendingWorkers === 0) {
           subscription.close();
           handle.markDrained();
           return;
         }
 
-        draining = true;
+        state.draining = true;
         continue;
       }
 
-      if (event.type === "finished") {
-        pendingWorkers -= 1;
-
-        if (
-          !draining &&
-          this.factory.task.kind === "singleton" &&
-          pendingWorkers === 0 &&
-          singletonRedispatchQueued
-        ) {
-          singletonRedispatchQueued = false;
-          dispatchTask(undefined);
-        }
-
-        if (draining && pendingWorkers === 0) {
-          subscription.close();
-          handle.markDrained();
-          return;
-        }
-
+      if (event.type === "timer") {
         continue;
       }
 
-      if (event.type === "subscription-closed") {
-        handle.markDrained();
+      if (event.type === "signal") {
+        this.handleSignal(event.signal, events, state);
+        continue;
+      }
+
+      this.handleReport(event.report, subscription, handle, state);
+      if (state.finished) {
         return;
-      }
-
-      if (this.factory.task.kind === "publish") {
-        dispatchTask(event.taskId);
-      } else {
-        dispatchTask(undefined);
       }
     }
   }
+
+  private handleSignal(
+    signal: BackendSignal,
+    events: EventQueue,
+    state: DaemonState,
+  ): void {
+    const now = Date.now();
+    const dispatchToken =
+      this.factory.task.kind === "publish"
+        ? tryDispatchFromSignal(this.factory.task.kind, signal, now)
+        : tryDispatchFromSignal(this.factory.task.kind, signal, now);
+
+    if (dispatchToken !== null) {
+      this.dispatchTask(dispatchToken, events, state, false);
+      return;
+    }
+
+    state.noteEarliestAvailableFrom(signal.availableFromMs);
+  }
+
+  private dispatchEarliestClaim(events: EventQueue, state: DaemonState): void {
+    state.earliestClaimInFlight = true;
+    state.earliestAvailableFromMs = null;
+    this.dispatchTask(
+      nextAvailableDispatchToken(this.factory.task.kind),
+      events,
+      state,
+      true,
+    );
+  }
+
+  private dispatchTask(
+    dispatchToken: PublishDispatchToken | undefined,
+    events: EventQueue,
+    state: DaemonState,
+    clearsEarliestClaim: boolean,
+  ): void {
+    if (state.draining) {
+      return;
+    }
+
+    const runtime = new WorkerRuntime(
+      this.backend,
+      this.factory,
+      state.nextWorkerId,
+      (update) => {
+        events.push({
+          type: "report",
+          report: {
+            type: "update",
+            update,
+            clearsEarliestClaim,
+          },
+        });
+        clearsEarliestClaim = false;
+      },
+      () => {
+        events.push({
+          type: "report",
+          report: {
+            type: "exited",
+            clearsEarliestClaim,
+          },
+        });
+      },
+    );
+
+    state.pendingWorkers += 1;
+    state.nextWorkerId += 1;
+    runtime.run(dispatchToken);
+  }
+
+  private handleReport(
+    report: RuntimeReport,
+    subscription: Awaited<ReturnType<Backend["subscribe"]>>,
+    handle: WorkerDispatcherHandle,
+    state: DaemonState,
+  ): void {
+    if (report.type === "update") {
+      if (report.clearsEarliestClaim) {
+        state.earliestClaimInFlight = false;
+      }
+
+      if (report.clearsEarliestClaim && report.update.claimedTask) {
+        state.noteEarliestAvailableFrom(Date.now());
+      }
+
+      if (report.update.nextAvailableFromUpdate !== null) {
+        const { availableFromMs } = report.update.nextAvailableFromUpdate;
+        if (
+          availableFromMs !== null ||
+          state.earliestAvailableFromMs === null
+        ) {
+          state.noteEarliestAvailableFrom(availableFromMs);
+        }
+      }
+
+      return;
+    }
+
+    if (report.clearsEarliestClaim) {
+      state.earliestClaimInFlight = false;
+    }
+
+    if (state.pendingWorkers > 0) {
+      state.pendingWorkers -= 1;
+    }
+
+    if (state.draining && state.pendingWorkers === 0) {
+      subscription.close();
+      handle.markDrained();
+      state.finished = true;
+    }
+  }
+}
+
+class DaemonState {
+  draining = false;
+  pendingWorkers = 0;
+  nextWorkerId = 0;
+  earliestAvailableFromMs: number | null = Date.now();
+  earliestClaimInFlight = false;
+  finished = false;
+
+  shouldDispatchEarliestNow(): boolean {
+    return (
+      this.earliestAvailableFromMs !== null &&
+      this.earliestAvailableFromMs <= Date.now()
+    );
+  }
+
+  noteEarliestAvailableFrom(availableFromMs: number | null): void {
+    if (availableFromMs === null) {
+      this.earliestAvailableFromMs = null;
+      return;
+    }
+
+    if (
+      this.earliestAvailableFromMs === null ||
+      availableFromMs < this.earliestAvailableFromMs
+    ) {
+      this.earliestAvailableFromMs = availableFromMs;
+    }
+  }
+}
+
+class EventQueue {
+  private readonly items: DispatcherEvent[] = [];
+  private readonly waiters: Array<(value: DispatcherEvent | null) => void> = [];
+
+  push(event: DispatcherEvent): void {
+    const waiter = this.waiters.shift();
+    if (waiter) {
+      waiter(event);
+      return;
+    }
+
+    this.items.push(event);
+  }
+
+  async shift(availableFromMs: number | null): Promise<DispatcherEvent | null> {
+    const item = this.items.shift();
+    if (item !== undefined) {
+      return item;
+    }
+
+    let resolveEvent: ((value: DispatcherEvent | null) => void) | null = null;
+    const eventPromise = new Promise<DispatcherEvent | null>((resolve) => {
+      resolveEvent = resolve;
+      this.waiters.push(resolve);
+    });
+
+    if (availableFromMs === null) {
+      return await eventPromise;
+    }
+
+    const delayMs = Math.max(availableFromMs - Date.now(), 0);
+    const result = await Promise.race([
+      eventPromise,
+      delay(delayMs).then(() => ({ type: "timer" as const })),
+    ]);
+
+    if (result !== null && result.type === "timer" && resolveEvent !== null) {
+      const waiterIndex = this.waiters.indexOf(resolveEvent);
+      if (waiterIndex !== -1) {
+        this.waiters.splice(waiterIndex, 1);
+      }
+    }
+
+    return result;
+  }
+}
+
+function tryDispatchFromSignal(
+  taskKind: TaskDefinition["kind"],
+  signal: BackendSignal,
+  now: number,
+): PublishDispatchToken | undefined | null {
+  if (taskKind === "singleton") {
+    return null;
+  }
+
+  if (signal.availableFromMs > now || signal.taskId === null) {
+    return null;
+  }
+
+  return { type: "task", taskId: signal.taskId };
+}
+
+function nextAvailableDispatchToken(
+  taskKind: TaskDefinition["kind"],
+): PublishDispatchToken | undefined {
+  if (taskKind === "singleton") {
+    return undefined;
+  }
+
+  return { type: "earliest-available" };
+}
+
+async function delay(durationMs: number): Promise<void> {
+  await new Promise((resolve) => {
+    setTimeout(resolve, durationMs);
+  });
 }

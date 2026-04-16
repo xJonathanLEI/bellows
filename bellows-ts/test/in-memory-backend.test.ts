@@ -3,6 +3,7 @@ import { InMemoryBackend } from "../src/backends/in-memory.js";
 import {
   definePublishTask,
   defineSingletonTask,
+  TaskFailure,
   WorkerDispatcher,
   type WorkerFactory,
 } from "../src/index.js";
@@ -16,6 +17,8 @@ import {
 const echoTask = definePublishTask<{ name: string }, string>("echo");
 const ackTask = definePublishTask<void>("ack");
 const singletonTask = defineSingletonTask("singleton_echo");
+const blockingTask = definePublishTask<void>("blocking");
+const retryTask = definePublishTask<void>("retry_once");
 
 const channelsToClose: Array<AsyncChannel<unknown>> = [];
 
@@ -111,6 +114,33 @@ test("in-memory singleton task dispatch", async () => {
   expect(processed.tryRecv()).toBeNull();
 });
 
+test("dispatcher drains multiple preexisting tasks without waiting", async () => {
+  const backend = new InMemoryBackend();
+  const started = track(new AsyncChannel<number>());
+  const gate = new Gate();
+
+  const first = await backend.publish(blockingTask, undefined);
+  const second = await backend.publish(blockingTask, undefined);
+
+  const dispatcher = new WorkerDispatcher(
+    backend,
+    createBlockingWorkerFactory(started, gate),
+  );
+  const dispatcherHandle = await dispatcher.launch();
+
+  const startedFirst = await recvWithTimeout(started);
+  const startedSecond = await recvWithTimeout(started);
+
+  expect([first.taskId, second.taskId]).toContain(startedFirst);
+  expect([first.taskId, second.taskId]).toContain(startedSecond);
+  expect(startedFirst).not.toBe(startedSecond);
+
+  const drainPromise = dispatcherHandle.drain();
+  gate.release();
+  gate.release();
+  await drainPromise;
+});
+
 test("in-memory sweeping", async () => {
   const backend = new InMemoryBackend();
   const processed = track(new AsyncChannel<ProcessedTask>());
@@ -132,6 +162,25 @@ test("in-memory sweeping", async () => {
   processed.close();
 
   expect(await processed.recv()).toBeNull();
+});
+
+test("worker failure is retried", async () => {
+  const backend = new InMemoryBackend();
+  const processed = track(new AsyncChannel<number>());
+  let attempts = 0;
+
+  const dispatcher = new WorkerDispatcher(
+    backend,
+    createRetryWorkerFactory(processed, () => attempts++),
+  );
+  const dispatcherHandle = await dispatcher.launch();
+
+  const published = await backend.publish(retryTask, undefined);
+
+  expect(await processed.recv()).toBe(published.taskId);
+  expect(attempts).toBe(2);
+
+  await dispatcherHandle.drain();
 });
 
 function createEchoWorkerFactory(
@@ -159,6 +208,7 @@ function createAckWorkerFactory(
       return {
         async process(taskId) {
           processed.send(taskId);
+          return undefined;
         },
       };
     },
@@ -176,10 +226,65 @@ function createSingletonWorkerFactory(
         async process(taskId) {
           processed.send(taskId);
           await gate.wait();
+          return undefined;
         },
       };
     },
   };
+}
+
+function createBlockingWorkerFactory(
+  started: AsyncChannel<number>,
+  gate: Gate,
+): WorkerFactory<typeof blockingTask> {
+  return {
+    task: blockingTask,
+    build() {
+      return {
+        async process(taskId) {
+          started.send(taskId);
+          await gate.wait();
+          return undefined;
+        },
+      };
+    },
+  };
+}
+
+function createRetryWorkerFactory(
+  processed: AsyncChannel<number>,
+  recordAttempt: () => number,
+): WorkerFactory<typeof retryTask> {
+  return {
+    task: retryTask,
+    build() {
+      return {
+        async process(taskId) {
+          const attempt = recordAttempt();
+          if (attempt === 0) {
+            return TaskFailure.retryImmediately();
+          }
+
+          processed.send(taskId);
+          return undefined;
+        },
+      };
+    },
+  };
+}
+
+async function recvWithTimeout<T>(channel: AsyncChannel<T>): Promise<T> {
+  const value = await Promise.race([
+    channel.recv(),
+    new Promise<null>((resolve) => {
+      setTimeout(() => {
+        resolve(null);
+      }, 1_000);
+    }),
+  ]);
+
+  expect(value).not.toBeNull();
+  return value as T;
 }
 
 function track<T>(channel: AsyncChannel<T>): AsyncChannel<T> {

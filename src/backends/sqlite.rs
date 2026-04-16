@@ -20,11 +20,11 @@ use tokio::sync::{
 };
 
 use crate::backends::{
-    BackendSignal, BackendSignalSubscription, ClaimTaskError, ClaimedTask, FinishTaskError,
-    FinishedTask, NewTaskAvailableSignalPayload, PublishTaskError, PublishedTask, RenewTaskError,
-    RenewedTaskLease, SubscribeError, SweepTasksError, SweptTask,
+    Backend, BackendSignal, BackendSignalSubscription, ClaimTaskError, ClaimedTask, FailTaskError,
+    FailedTask, FinishTaskError, FinishedTask, NewTaskAvailableSignalPayload, PublishTaskError,
+    PublishedTask, RenewTaskError, RenewedTaskLease, SubscribeError,
 };
-use crate::{AwaitableTask, Backend, PublishActivationStrategy, TaskDefinition};
+use crate::{AwaitableTask, PublishActivationStrategy, TaskDefinition};
 
 const SIGNAL_CHANNEL_SIZE: usize = 1024;
 const INITIALIZE_SCHEMA_SQL: &str = r#"
@@ -35,15 +35,15 @@ CREATE TABLE IF NOT EXISTS bellows_tasks (
     payload_json TEXT NOT NULL,
     callback_id INTEGER,
     lease_worker_id INTEGER,
-    lease_expiration_unix_ms INTEGER,
-    CHECK ((lease_worker_id IS NULL) = (lease_expiration_unix_ms IS NULL))
+    available_from_unix_ms INTEGER,
+    CHECK (lease_worker_id IS NULL OR available_from_unix_ms IS NOT NULL)
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS bellows_tasks_unique_key_idx
     ON bellows_tasks (task_unique_key);
 
-CREATE INDEX IF NOT EXISTS bellows_tasks_sweep_idx
-    ON bellows_tasks (task_name, lease_expiration_unix_ms, task_id);
+CREATE INDEX IF NOT EXISTS bellows_tasks_available_idx
+    ON bellows_tasks (task_name, task_unique_key, available_from_unix_ms, task_id);
 "#;
 
 #[derive(Debug)]
@@ -96,7 +96,7 @@ impl StdError for SqliteBackendError {
 ///
 /// This backend stores tasks durably in SQLite via `sqlx`, but its signaling layer is in-process
 /// only. That means dispatchers in other processes will not receive new task notifications until
-/// they perform a startup sweep again. This makes the backend suitable for local development,
+/// they reconnect and start draining again. This makes the backend suitable for local development,
 /// testing, and single-process deployments, but not for truly distributed systems.
 #[derive(Clone)]
 pub struct SqliteBackend {
@@ -215,7 +215,7 @@ impl SqliteBackend {
         }
     }
 
-    fn emit_signal(&self, task_name: &'static str, signal: BackendSignal) {
+    fn emit_signal(&self, task_name: &'static str, task_id: u64, available_from: Option<Instant>) {
         if let Some(signal_tx) = self
             .shared
             .signals
@@ -224,7 +224,12 @@ impl SqliteBackend {
             .get(task_name)
             .cloned()
         {
-            let _ = signal_tx.send(signal);
+            let _ = signal_tx.send(BackendSignal::NewTaskAvailable(
+                NewTaskAvailableSignalPayload {
+                    task_id: Some(task_id),
+                    available_from: available_from.unwrap_or_else(Instant::now),
+                },
+            ));
         }
     }
 
@@ -255,8 +260,15 @@ impl SqliteBackend {
 
         let result = sqlx::query(
             r#"
-INSERT INTO bellows_tasks (task_name, task_unique_key, payload_json, callback_id)
-VALUES (?, NULL, ?, ?)
+INSERT INTO bellows_tasks (
+    task_name,
+    task_unique_key,
+    payload_json,
+    callback_id,
+    lease_worker_id,
+    available_from_unix_ms
+)
+VALUES (?, NULL, ?, ?, NULL, NULL)
 "#,
         )
         .bind(T::NAME)
@@ -284,12 +296,62 @@ VALUES (?, NULL, ?, ?)
             PublishTaskError::Backend(Box::new(SqliteBackendError::InvalidTaskId(err)))
         })?;
 
-        self.emit_signal(
-            T::NAME,
-            BackendSignal::NewTaskAvailable(NewTaskAvailableSignalPayload { task_id }),
-        );
+        self.emit_signal(T::NAME, task_id, None);
 
         Ok(PublishedTask { task_id })
+    }
+
+    async fn load_claim_failure(
+        &self,
+        task_id_db: i64,
+        task_name: &'static str,
+        now_system: SystemTime,
+    ) -> ClaimTaskError {
+        let now_unix_ms = unix_timestamp_ms(now_system);
+        let current = match sqlx::query(
+            r#"
+SELECT lease_worker_id, available_from_unix_ms
+FROM bellows_tasks
+WHERE task_id = ?
+  AND task_name = ?
+  AND task_unique_key IS NULL
+"#,
+        )
+        .bind(task_id_db)
+        .bind(task_name)
+        .fetch_optional(&self.pool)
+        .await
+        {
+            Ok(current) => current,
+            Err(err) => {
+                return ClaimTaskError::Backend(Box::new(SqliteBackendError::Sqlx(err)));
+            }
+        };
+
+        let Some(current) = current else {
+            return ClaimTaskError::TaskNotFound;
+        };
+
+        let worker_id = current.get::<Option<i64>, _>("lease_worker_id");
+        let available_from_unix_ms = current.get::<Option<i64>, _>("available_from_unix_ms");
+
+        match available_from_unix_ms {
+            Some(available_from_unix_ms) if available_from_unix_ms > now_unix_ms => {
+                if worker_id.is_some() {
+                    ClaimTaskError::TaskLeased {
+                        expiration: unix_ms_to_instant(available_from_unix_ms, now_system),
+                    }
+                } else {
+                    ClaimTaskError::TaskUnavailable {
+                        available_from: Some(unix_ms_to_instant(
+                            available_from_unix_ms,
+                            now_system,
+                        )),
+                    }
+                }
+            }
+            Some(_) | None => ClaimTaskError::TaskNotFound,
+        }
     }
 }
 
@@ -301,41 +363,6 @@ impl Backend for SqliteBackend {
         Ok(BackendSignalSubscription::new(
             self.signal_for_task(T::NAME).subscribe(),
         ))
-    }
-
-    async fn sweep<T>(&self) -> Result<Vec<SweptTask>, SweepTasksError>
-    where
-        T: TaskDefinition,
-    {
-        let now_unix_ms = unix_timestamp_ms(SystemTime::now());
-        let rows = sqlx::query(
-            r#"
-SELECT task_id
-FROM bellows_tasks
-WHERE task_name = ?
-  AND (
-        lease_worker_id IS NULL
-        OR lease_expiration_unix_ms IS NULL
-        OR lease_expiration_unix_ms <= ?
-      )
-ORDER BY task_id
-"#,
-        )
-        .bind(T::NAME)
-        .bind(now_unix_ms)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|err| SweepTasksError::Backend(Box::new(SqliteBackendError::Sqlx(err))))?;
-
-        rows.into_iter()
-            .map(|row| {
-                let task_id = row.get::<i64, _>("task_id");
-                let task_id = u64::try_from(task_id).map_err(|err| {
-                    SweepTasksError::Backend(Box::new(SqliteBackendError::InvalidTaskId(err)))
-                })?;
-                Ok(SweptTask { task_id })
-            })
-            .collect()
     }
 
     async fn publish<T>(
@@ -388,13 +415,14 @@ ORDER BY task_id
         let claimed_row = sqlx::query(
             r#"
 UPDATE bellows_tasks
-SET lease_worker_id = ?, lease_expiration_unix_ms = ?
+SET lease_worker_id = ?,
+    available_from_unix_ms = ?
 WHERE task_id = ?
   AND task_name = ?
+  AND task_unique_key IS NULL
   AND (
-        lease_worker_id IS NULL
-        OR lease_expiration_unix_ms IS NULL
-        OR lease_expiration_unix_ms <= ?
+        available_from_unix_ms IS NULL
+        OR available_from_unix_ms <= ?
       )
 RETURNING payload_json
 "#,
@@ -417,43 +445,137 @@ RETURNING payload_json
                     )))
                 })?;
 
+                self.emit_signal(T::NAME, task_id, Some(lease_expiration));
+
                 Ok(ClaimedTask {
                     task_id,
                     task_payload,
                     lease_expiration,
                 })
             }
-            None => {
-                let current = sqlx::query(
-                    r#"
-SELECT lease_expiration_unix_ms
-FROM bellows_tasks
-WHERE task_id = ?
-  AND task_name = ?
-"#,
-                )
-                .bind(task_id_db)
-                .bind(T::NAME)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(|err| ClaimTaskError::Backend(Box::new(SqliteBackendError::Sqlx(err))))?;
-
-                let Some(current) = current else {
-                    return Err(ClaimTaskError::TaskNotFound);
-                };
-
-                if let Some(current_expiration_unix_ms) =
-                    current.get::<Option<i64>, _>("lease_expiration_unix_ms")
-                    && current_expiration_unix_ms > now_unix_ms
-                {
-                    return Err(ClaimTaskError::TaskLeased {
-                        expiration: unix_ms_to_instant(current_expiration_unix_ms, now_system),
-                    });
-                }
-
-                Err(ClaimTaskError::TaskNotFound)
-            }
+            None => Err(self
+                .load_claim_failure(task_id_db, T::NAME, now_system)
+                .await),
         }
+    }
+
+    async fn claim_earliest_published<T>(
+        &self,
+        worker_id: u64,
+        lease_expiration: Instant,
+    ) -> Result<
+        ClaimedTask<<<T as TaskDefinition>::Trigger as PublishActivationStrategy>::Payload>,
+        ClaimTaskError,
+    >
+    where
+        T: TaskDefinition,
+        T::Trigger: PublishActivationStrategy,
+    {
+        let worker_id_db = i64::try_from(worker_id).map_err(|err| {
+            ClaimTaskError::Backend(Box::new(SqliteBackendError::InvalidWorkerId(err)))
+        })?;
+        let now_system = SystemTime::now();
+        let now_unix_ms = unix_timestamp_ms(now_system);
+        let lease_expiration_unix_ms = instant_to_unix_ms(lease_expiration, now_system);
+
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|err| ClaimTaskError::Backend(Box::new(SqliteBackendError::Sqlx(err))))?;
+
+        let candidate = sqlx::query(
+            r#"
+SELECT task_id, payload_json
+FROM bellows_tasks
+WHERE task_name = ?
+  AND task_unique_key IS NULL
+  AND (
+        available_from_unix_ms IS NULL
+        OR available_from_unix_ms <= ?
+      )
+ORDER BY available_from_unix_ms IS NOT NULL, available_from_unix_ms, task_id
+LIMIT 1
+"#,
+        )
+        .bind(T::NAME)
+        .bind(now_unix_ms)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|err| ClaimTaskError::Backend(Box::new(SqliteBackendError::Sqlx(err))))?;
+
+        let Some(candidate) = candidate else {
+            let earliest_available_from = sqlx::query(
+                r#"
+SELECT MIN(available_from_unix_ms) AS available_from_unix_ms
+FROM bellows_tasks
+WHERE task_name = ?
+  AND task_unique_key IS NULL
+  AND available_from_unix_ms > ?
+"#,
+            )
+            .bind(T::NAME)
+            .bind(now_unix_ms)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|err| ClaimTaskError::Backend(Box::new(SqliteBackendError::Sqlx(err))))?
+            .get::<Option<i64>, _>("available_from_unix_ms")
+            .map(|unix_ms| unix_ms_to_instant(unix_ms, now_system));
+
+            tx.commit().await.ok();
+            return Err(ClaimTaskError::TaskUnavailable {
+                available_from: earliest_available_from,
+            });
+        };
+
+        let task_id_db = candidate.get::<i64, _>("task_id");
+        let payload_json = candidate.get::<String, _>("payload_json");
+
+        let updated = sqlx::query(
+            r#"
+UPDATE bellows_tasks
+SET lease_worker_id = ?,
+    available_from_unix_ms = ?
+WHERE task_id = ?
+  AND (
+        available_from_unix_ms IS NULL
+        OR available_from_unix_ms <= ?
+      )
+"#,
+        )
+        .bind(worker_id_db)
+        .bind(lease_expiration_unix_ms)
+        .bind(task_id_db)
+        .bind(now_unix_ms)
+        .execute(&mut *tx)
+        .await
+        .map_err(|err| ClaimTaskError::Backend(Box::new(SqliteBackendError::Sqlx(err))))?;
+
+        if updated.rows_affected() == 0 {
+            tx.rollback().await.ok();
+            return Err(ClaimTaskError::TaskUnavailable {
+                available_from: Some(Instant::now()),
+            });
+        }
+
+        tx.commit()
+            .await
+            .map_err(|err| ClaimTaskError::Backend(Box::new(SqliteBackendError::Sqlx(err))))?;
+
+        let task_id = u64::try_from(task_id_db).map_err(|err| {
+            ClaimTaskError::Backend(Box::new(SqliteBackendError::InvalidTaskId(err)))
+        })?;
+        let task_payload = serde_json::from_str(&payload_json).map_err(|err| {
+            ClaimTaskError::Backend(Box::new(SqliteBackendError::PayloadDeserialization(err)))
+        })?;
+
+        self.emit_signal(T::NAME, task_id, Some(lease_expiration));
+
+        Ok(ClaimedTask {
+            task_id,
+            task_payload,
+            lease_expiration,
+        })
     }
 
     async fn claim_singleton<T>(
@@ -479,17 +601,16 @@ INSERT INTO bellows_tasks (
     payload_json,
     callback_id,
     lease_worker_id,
-    lease_expiration_unix_ms
+    available_from_unix_ms
 )
 VALUES (?, ?, 'null', NULL, ?, ?)
 ON CONFLICT(task_unique_key) DO UPDATE
 SET lease_worker_id = excluded.lease_worker_id,
-    lease_expiration_unix_ms = excluded.lease_expiration_unix_ms
+    available_from_unix_ms = excluded.available_from_unix_ms
 WHERE bellows_tasks.task_name = excluded.task_name
   AND (
-        bellows_tasks.lease_worker_id IS NULL
-        OR bellows_tasks.lease_expiration_unix_ms IS NULL
-        OR bellows_tasks.lease_expiration_unix_ms <= ?
+        bellows_tasks.available_from_unix_ms IS NULL
+        OR bellows_tasks.available_from_unix_ms <= ?
       )
 RETURNING task_id
 "#,
@@ -510,6 +631,8 @@ RETURNING task_id
                         ClaimTaskError::Backend(Box::new(SqliteBackendError::InvalidTaskId(err)))
                     })?;
 
+                self.emit_signal(T::NAME, task_id, Some(lease_expiration));
+
                 Ok(ClaimedTask {
                     task_id,
                     task_payload: (),
@@ -519,7 +642,7 @@ RETURNING task_id
             None => {
                 let current = sqlx::query(
                     r#"
-SELECT lease_expiration_unix_ms
+SELECT lease_worker_id, available_from_unix_ms
 FROM bellows_tasks
 WHERE task_name = ?
   AND task_unique_key = ?
@@ -535,16 +658,26 @@ WHERE task_name = ?
                     return Err(ClaimTaskError::TaskNotFound);
                 };
 
-                if let Some(current_expiration_unix_ms) =
-                    current.get::<Option<i64>, _>("lease_expiration_unix_ms")
-                    && current_expiration_unix_ms > now_unix_ms
-                {
-                    return Err(ClaimTaskError::TaskLeased {
-                        expiration: unix_ms_to_instant(current_expiration_unix_ms, now_system),
-                    });
+                let worker_id = current.get::<Option<i64>, _>("lease_worker_id");
+                let available_from_unix_ms =
+                    current.get::<Option<i64>, _>("available_from_unix_ms");
+                match available_from_unix_ms {
+                    Some(available_from_unix_ms) if available_from_unix_ms > now_unix_ms => {
+                        if worker_id.is_some() {
+                            Err(ClaimTaskError::TaskLeased {
+                                expiration: unix_ms_to_instant(available_from_unix_ms, now_system),
+                            })
+                        } else {
+                            Err(ClaimTaskError::TaskUnavailable {
+                                available_from: Some(unix_ms_to_instant(
+                                    available_from_unix_ms,
+                                    now_system,
+                                )),
+                            })
+                        }
+                    }
+                    Some(_) | None => Err(ClaimTaskError::TaskNotFound),
                 }
-
-                Err(ClaimTaskError::TaskNotFound)
             }
         }
     }
@@ -566,7 +699,7 @@ WHERE task_name = ?
         let result = sqlx::query(
             r#"
 UPDATE bellows_tasks
-SET lease_expiration_unix_ms = ?
+SET available_from_unix_ms = ?
 WHERE task_id = ?
   AND lease_worker_id = ?
 "#,
@@ -581,10 +714,85 @@ WHERE task_id = ?
         if result.rows_affected() == 0 {
             Err(RenewTaskError::LeaseLost)
         } else {
+            let task_name = sqlx::query("SELECT task_name FROM bellows_tasks WHERE task_id = ?")
+                .bind(task_id_db)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|err| RenewTaskError::Backend(Box::new(SqliteBackendError::Sqlx(err))))?
+                .get::<String, _>("task_name");
+
+            let registered_task_name = {
+                self.shared
+                    .signals
+                    .lock()
+                    .expect("sqlite backend signal registry mutex should not be poisoned")
+                    .keys()
+                    .copied()
+                    .find(|registered_task_name| **registered_task_name == task_name)
+            };
+
+            if let Some(task_name) = registered_task_name {
+                self.emit_signal(task_name, task_id, Some(lease_expiration));
+            }
+
             Ok(RenewedTaskLease {
                 new_expiration: lease_expiration,
             })
         }
+    }
+
+    async fn fail(
+        &self,
+        worker_id: u64,
+        task_id: u64,
+        available_from: Option<Instant>,
+    ) -> Result<FailedTask, FailTaskError> {
+        let task_id_db = i64::try_from(task_id).map_err(|err| {
+            FailTaskError::Backend(Box::new(SqliteBackendError::InvalidTaskId(err)))
+        })?;
+        let worker_id_db = i64::try_from(worker_id).map_err(|err| {
+            FailTaskError::Backend(Box::new(SqliteBackendError::InvalidWorkerId(err)))
+        })?;
+        let available_from_unix_ms =
+            available_from.map(|instant| instant_to_unix_ms(instant, SystemTime::now()));
+
+        let updated = sqlx::query(
+            r#"
+UPDATE bellows_tasks
+SET lease_worker_id = NULL,
+    available_from_unix_ms = ?
+WHERE task_id = ?
+  AND lease_worker_id = ?
+RETURNING task_name
+"#,
+        )
+        .bind(available_from_unix_ms)
+        .bind(task_id_db)
+        .bind(worker_id_db)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|err| FailTaskError::Backend(Box::new(SqliteBackendError::Sqlx(err))))?;
+
+        let Some(updated) = updated else {
+            return Err(FailTaskError::LeaseLost);
+        };
+
+        let task_name = updated.get::<String, _>("task_name");
+        let registered_task_name = {
+            self.shared
+                .signals
+                .lock()
+                .expect("sqlite backend signal registry mutex should not be poisoned")
+                .keys()
+                .copied()
+                .find(|registered_task_name| **registered_task_name == task_name)
+        };
+
+        if let Some(task_name) = registered_task_name {
+            self.emit_signal(task_name, task_id, available_from);
+        }
+
+        Ok(FailedTask { task_id })
     }
 
     async fn finish<T>(
@@ -610,7 +818,7 @@ WHERE task_id = ?
             r#"
 UPDATE bellows_tasks
 SET lease_worker_id = NULL,
-    lease_expiration_unix_ms = NULL
+    available_from_unix_ms = NULL
 WHERE task_id = ?
   AND lease_worker_id = ?
   AND task_unique_key IS NOT NULL
@@ -627,30 +835,24 @@ RETURNING task_name, callback_id
             let task_name = cleared_singleton_task.get::<String, _>("task_name");
             let callback_id = cleared_singleton_task.get::<Option<i64>, _>("callback_id");
 
-            let registered_task_name = self
-                .shared
-                .signals
-                .lock()
-                .expect("sqlite backend signal registry mutex should not be poisoned")
-                .keys()
-                .copied()
-                .find(|registered_task_name| *registered_task_name == task_name);
-
-            if let Some(task_name) = registered_task_name {
-                if let Some(callback_id) = callback_id
-                    && let Ok(callback_id) = u64::try_from(callback_id)
-                {
-                    self.deliver_callback(callback_id, callback_payload_json.clone());
-                }
-
-                self.emit_signal(
-                    task_name,
-                    BackendSignal::NewTaskAvailable(NewTaskAvailableSignalPayload { task_id }),
-                );
-            } else if let Some(callback_id) = callback_id
+            if let Some(callback_id) = callback_id
                 && let Ok(callback_id) = u64::try_from(callback_id)
             {
                 self.deliver_callback(callback_id, callback_payload_json);
+            }
+
+            let registered_task_name = {
+                self.shared
+                    .signals
+                    .lock()
+                    .expect("sqlite backend signal registry mutex should not be poisoned")
+                    .keys()
+                    .copied()
+                    .find(|registered_task_name| **registered_task_name == task_name)
+            };
+
+            if let Some(task_name) = registered_task_name {
+                self.emit_signal(task_name, task_id, None);
             }
 
             return Ok(FinishedTask { task_id });
@@ -662,7 +864,7 @@ DELETE FROM bellows_tasks
 WHERE task_id = ?
   AND lease_worker_id = ?
   AND task_unique_key IS NULL
-RETURNING task_name, callback_id
+RETURNING callback_id
 "#,
         )
         .bind(task_id_db)
@@ -675,24 +877,7 @@ RETURNING task_name, callback_id
             return Err(FinishTaskError::LeaseLost);
         };
 
-        let task_name = deleted_published_task.get::<String, _>("task_name");
-        let callback_id = deleted_published_task.get::<Option<i64>, _>("callback_id");
-
-        let registered_task_name = self
-            .shared
-            .signals
-            .lock()
-            .expect("sqlite backend signal registry mutex should not be poisoned")
-            .keys()
-            .copied()
-            .find(|registered_task_name| *registered_task_name == task_name);
-
-        if registered_task_name.is_some()
-            && let Some(callback_id) = callback_id
-            && let Ok(callback_id) = u64::try_from(callback_id)
-        {
-            self.deliver_callback(callback_id, callback_payload_json);
-        } else if let Some(callback_id) = callback_id
+        if let Some(callback_id) = deleted_published_task.get::<Option<i64>, _>("callback_id")
             && let Ok(callback_id) = u64::try_from(callback_id)
         {
             self.deliver_callback(callback_id, callback_payload_json);

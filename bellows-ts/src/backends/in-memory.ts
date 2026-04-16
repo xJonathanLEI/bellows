@@ -9,30 +9,47 @@ import {
   type Backend,
   type BackendSignal,
   type ClaimedTask,
+  type FailedTask,
   type FinishedTask,
   LeaseLostError,
   type PublishedTask,
   type PublishTaskDefinition,
   type RenewedTaskLease,
   type SingletonTaskDefinition,
-  type SweptTask,
   type TaskCallback,
   type TaskDefinition,
   TaskLeasedError,
   TaskNotFoundError,
+  TaskUnavailableError,
 } from "../types.js";
 
-interface ClaimEntry {
-  readonly workerId: number;
-  readonly leaseExpirationMs: number;
-}
+class TaskEntry {
+  constructor(
+    readonly taskName: string,
+    readonly payloadJson: string,
+    readonly callbackId: string | null,
+    readonly kind: "publish" | "singleton",
+    readonly workerId: number | null = null,
+    readonly availableFromMs: number | null = null,
+  ) {}
 
-interface TaskEntry {
-  readonly taskName: string;
-  readonly payloadJson: string;
-  readonly callbackId: string | null;
-  claim: ClaimEntry | null;
-  readonly kind: "publish" | "singleton";
+  withState(
+    workerId: number | null,
+    availableFromMs: number | null,
+  ): TaskEntry {
+    return new TaskEntry(
+      this.taskName,
+      this.payloadJson,
+      this.callbackId,
+      this.kind,
+      workerId,
+      availableFromMs,
+    );
+  }
+
+  signal(taskId: number): BackendSignal {
+    return newTaskAvailable(taskId, this.availableFromMs ?? Date.now());
+  }
 }
 
 export class InMemoryBackend implements Backend {
@@ -43,25 +60,6 @@ export class InMemoryBackend implements Backend {
 
   async subscribe(task: TaskDefinition) {
     return this.signalForTask(task.name).subscribe();
-  }
-
-  async sweep(task: TaskDefinition): Promise<SweptTask[]> {
-    const now = Date.now();
-    const tasks: SweptTask[] = [];
-
-    for (const [taskId, entry] of this.tasks) {
-      if (entry.taskName !== task.name) {
-        continue;
-      }
-
-      if (entry.claim && entry.claim.leaseExpirationMs > now) {
-        continue;
-      }
-
-      tasks.push({ taskId });
-    }
-
-    return tasks;
   }
 
   async publish<TPayload, TCallback>(
@@ -98,21 +96,38 @@ export class InMemoryBackend implements Backend {
     taskId: number,
     leaseExpirationMs: number,
   ): Promise<ClaimedTask<TPayload>> {
-    const entry = this.tasks.get(taskId);
-    if (!entry || entry.taskName !== task.name || entry.kind !== "publish") {
-      throw new TaskNotFoundError();
-    }
-
-    if (entry.claim && entry.claim.leaseExpirationMs > Date.now()) {
-      throw new TaskLeasedError(entry.claim.leaseExpirationMs);
-    }
-
-    entry.claim = { workerId, leaseExpirationMs };
+    const claimed = this.claimTask(
+      task.name,
+      "publish",
+      workerId,
+      leaseExpirationMs,
+      taskId,
+    );
 
     return {
-      taskId,
-      taskPayload: task.codec.decode(entry.payloadJson),
+      taskId: claimed.taskId,
+      taskPayload: task.codec.decode(claimed.payloadJson),
+      leaseExpirationMs: claimed.leaseExpirationMs,
+    };
+  }
+
+  async claimEarliestPublished<TPayload, TCallback>(
+    task: PublishTaskDefinition<TPayload, TCallback>,
+    workerId: number,
+    leaseExpirationMs: number,
+  ): Promise<ClaimedTask<TPayload>> {
+    const claimed = this.claimTask(
+      task.name,
+      "publish",
+      workerId,
       leaseExpirationMs,
+      null,
+    );
+
+    return {
+      taskId: claimed.taskId,
+      taskPayload: task.codec.decode(claimed.payloadJson),
+      leaseExpirationMs: claimed.leaseExpirationMs,
     };
   }
 
@@ -121,36 +136,31 @@ export class InMemoryBackend implements Backend {
     workerId: number,
     leaseExpirationMs: number,
   ): Promise<ClaimedTask<undefined>> {
-    const existingTask = [...this.tasks.entries()].find(
+    let taskId = [...this.tasks.entries()].find(
       ([, entry]) => entry.taskName === task.name && entry.kind === "singleton",
-    );
+    )?.[0];
 
-    let taskId = existingTask?.[0];
-    let entry = existingTask?.[1];
-
-    if (taskId === undefined || entry === undefined) {
+    if (taskId === undefined) {
       taskId = this.nextTaskId;
       this.nextTaskId += 1;
-      entry = {
-        taskName: task.name,
-        payloadJson: "null",
-        callbackId: null,
-        claim: null,
-        kind: "singleton",
-      };
-      this.tasks.set(taskId, entry);
+      this.tasks.set(
+        taskId,
+        new TaskEntry(task.name, "null", null, "singleton"),
+      );
     }
 
-    if (entry.claim && entry.claim.leaseExpirationMs > Date.now()) {
-      throw new TaskLeasedError(entry.claim.leaseExpirationMs);
-    }
-
-    entry.claim = { workerId, leaseExpirationMs };
+    const claimed = this.claimTask(
+      task.name,
+      "singleton",
+      workerId,
+      leaseExpirationMs,
+      taskId,
+    );
 
     return {
-      taskId,
+      taskId: claimed.taskId,
       taskPayload: undefined,
-      leaseExpirationMs,
+      leaseExpirationMs: claimed.leaseExpirationMs,
     };
   }
 
@@ -160,12 +170,30 @@ export class InMemoryBackend implements Backend {
     leaseExpirationMs: number,
   ): Promise<RenewedTaskLease> {
     const entry = this.tasks.get(taskId);
-    if (!entry || !entry.claim || entry.claim.workerId !== workerId) {
+    if (!entry || entry.workerId !== workerId) {
       throw new LeaseLostError();
     }
 
-    entry.claim = { workerId, leaseExpirationMs };
+    const nextEntry = entry.withState(workerId, leaseExpirationMs);
+    this.tasks.set(taskId, nextEntry);
+    this.emitSignal(nextEntry.taskName, nextEntry.signal(taskId));
     return { newExpirationMs: leaseExpirationMs };
+  }
+
+  async fail(
+    workerId: number,
+    taskId: number,
+    availableFromMs: number | null,
+  ): Promise<FailedTask> {
+    const entry = this.tasks.get(taskId);
+    if (!entry || entry.workerId !== workerId) {
+      throw new LeaseLostError();
+    }
+
+    const nextEntry = entry.withState(null, availableFromMs);
+    this.tasks.set(taskId, nextEntry);
+    this.emitSignal(nextEntry.taskName, nextEntry.signal(taskId));
+    return { taskId };
   }
 
   async finish<TTask extends TaskDefinition>(
@@ -175,16 +203,17 @@ export class InMemoryBackend implements Backend {
     callbackPayload: TaskCallback<TTask>,
   ): Promise<FinishedTask> {
     const entry = this.tasks.get(taskId);
-    if (!entry || !entry.claim || entry.claim.workerId !== workerId) {
+    if (!entry || entry.workerId !== workerId) {
       throw new LeaseLostError();
     }
 
     const callbackPayloadJson = task.callbackCodec.encode(callbackPayload);
 
     if (entry.kind === "singleton") {
-      entry.claim = null;
-      this.emitSignal(entry.taskName, newTaskAvailable(taskId));
-      this.deliverCallback(entry.callbackId, callbackPayloadJson);
+      const nextEntry = entry.withState(null, null);
+      this.tasks.set(taskId, nextEntry);
+      this.emitSignal(nextEntry.taskName, nextEntry.signal(taskId));
+      this.deliverCallback(nextEntry.callbackId, callbackPayloadJson);
       return { taskId };
     }
 
@@ -200,17 +229,123 @@ export class InMemoryBackend implements Backend {
   ): Promise<PublishedTask> {
     const taskId = this.nextTaskId;
     this.nextTaskId += 1;
-    this.tasks.set(taskId, {
-      taskName: task.name,
-      payloadJson: task.codec.encode(payload),
-      callbackId,
-      claim: null,
-      kind: "publish",
-    });
+    this.tasks.set(
+      taskId,
+      new TaskEntry(
+        task.name,
+        task.codec.encode(payload),
+        callbackId,
+        "publish",
+      ),
+    );
 
-    this.emitSignal(task.name, newTaskAvailable(taskId));
+    this.emitSignal(task.name, newTaskAvailable(taskId, Date.now()));
 
     return { taskId };
+  }
+
+  private claimTask(
+    taskName: string,
+    kind: "publish" | "singleton",
+    workerId: number,
+    leaseExpirationMs: number,
+    taskId: number | null,
+  ): {
+    readonly taskId: number;
+    readonly payloadJson: string;
+    readonly leaseExpirationMs: number;
+  } {
+    const now = Date.now();
+    const selectedTaskId =
+      taskId ?? this.findEarliestClaimableTask(taskName, kind, now);
+
+    if (selectedTaskId === undefined) {
+      throw new TaskUnavailableError(
+        this.findEarliestFutureTask(taskName, kind, now),
+      );
+    }
+
+    const entry = this.tasks.get(selectedTaskId);
+    if (!entry || entry.taskName !== taskName || entry.kind !== kind) {
+      throw new TaskNotFoundError();
+    }
+
+    if (
+      entry.workerId !== null &&
+      entry.availableFromMs !== null &&
+      entry.availableFromMs > now
+    ) {
+      throw new TaskLeasedError(entry.availableFromMs);
+    }
+
+    if (entry.availableFromMs !== null && entry.availableFromMs > now) {
+      throw new TaskUnavailableError(entry.availableFromMs);
+    }
+
+    const nextEntry = entry.withState(workerId, leaseExpirationMs);
+    this.tasks.set(selectedTaskId, nextEntry);
+    this.emitSignal(nextEntry.taskName, nextEntry.signal(selectedTaskId));
+
+    return {
+      taskId: selectedTaskId,
+      payloadJson: nextEntry.payloadJson,
+      leaseExpirationMs,
+    };
+  }
+
+  private findEarliestClaimableTask(
+    taskName: string,
+    kind: "publish" | "singleton",
+    now: number,
+  ): number | undefined {
+    let earliestTaskId: number | undefined;
+    let earliestAvailableFromMs = Number.POSITIVE_INFINITY;
+
+    for (const [taskId, entry] of this.tasks) {
+      if (entry.taskName !== taskName || entry.kind !== kind) {
+        continue;
+      }
+
+      if (entry.availableFromMs !== null && entry.availableFromMs > now) {
+        continue;
+      }
+
+      const availableFromMs = entry.availableFromMs ?? now;
+      if (
+        earliestTaskId === undefined ||
+        availableFromMs < earliestAvailableFromMs ||
+        (availableFromMs === earliestAvailableFromMs && taskId < earliestTaskId)
+      ) {
+        earliestTaskId = taskId;
+        earliestAvailableFromMs = availableFromMs;
+      }
+    }
+
+    return earliestTaskId;
+  }
+
+  private findEarliestFutureTask(
+    taskName: string,
+    kind: "publish" | "singleton",
+    now: number,
+  ): number | null {
+    let earliest: number | null = null;
+
+    for (const entry of this.tasks.values()) {
+      if (entry.taskName !== taskName || entry.kind !== kind) {
+        continue;
+      }
+
+      if (entry.availableFromMs === null || entry.availableFromMs <= now) {
+        continue;
+      }
+
+      if (earliest === null || entry.availableFromMs < earliest) {
+        earliest = entry.availableFromMs;
+      }
+    }
+
+    return earliest;
   }
 
   private deliverCallback(
@@ -254,9 +389,13 @@ export class InMemoryBackend implements Backend {
   }
 }
 
-function newTaskAvailable(taskId: number): BackendSignal {
+function newTaskAvailable(
+  taskId: number | null,
+  availableFromMs: number,
+): BackendSignal {
   return {
     type: "new-task-available",
     taskId,
+    availableFromMs,
   };
 }

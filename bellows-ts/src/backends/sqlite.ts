@@ -10,17 +10,18 @@ import {
   type Backend,
   type BackendSignal,
   type ClaimedTask,
+  type FailedTask,
   type FinishedTask,
   LeaseLostError,
   type PublishedTask,
   type PublishTaskDefinition,
   type RenewedTaskLease,
   type SingletonTaskDefinition,
-  type SweptTask,
   type TaskCallback,
   type TaskDefinition,
   TaskLeasedError,
   TaskNotFoundError,
+  TaskUnavailableError,
 } from "../types.js";
 
 const INITIALIZE_SCHEMA_SQL = `
@@ -31,15 +32,15 @@ CREATE TABLE IF NOT EXISTS bellows_tasks (
     payload_json TEXT NOT NULL,
     callback_id TEXT,
     lease_worker_id INTEGER,
-    lease_expiration_unix_ms INTEGER,
-    CHECK ((lease_worker_id IS NULL) = (lease_expiration_unix_ms IS NULL))
+    available_from_unix_ms INTEGER,
+    CHECK (lease_worker_id IS NULL OR available_from_unix_ms IS NOT NULL)
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS bellows_tasks_unique_key_idx
     ON bellows_tasks (task_unique_key);
 
-CREATE INDEX IF NOT EXISTS bellows_tasks_sweep_idx
-    ON bellows_tasks (task_name, lease_expiration_unix_ms, task_id);
+CREATE INDEX IF NOT EXISTS bellows_tasks_available_idx
+    ON bellows_tasks (task_name, task_unique_key, available_from_unix_ms, task_id);
 `;
 
 export class SqliteBackend implements Backend {
@@ -69,26 +70,6 @@ export class SqliteBackend implements Backend {
 
   async subscribe(task: TaskDefinition) {
     return this.signalForTask(task.name).subscribe();
-  }
-
-  async sweep(task: TaskDefinition): Promise<SweptTask[]> {
-    const rows = this.database
-      .prepare(
-        `
-SELECT task_id
-FROM bellows_tasks
-WHERE task_name = ?
-  AND (
-        lease_worker_id IS NULL
-        OR lease_expiration_unix_ms IS NULL
-        OR lease_expiration_unix_ms <= ?
-      )
-ORDER BY task_id
-        `,
-      )
-      .all(task.name, Date.now()) as Array<{ task_id: number }>;
-
-    return rows.map((row) => ({ taskId: row.task_id }));
   }
 
   async publish<TPayload, TCallback>(
@@ -128,13 +109,14 @@ ORDER BY task_id
       .prepare(
         `
 UPDATE bellows_tasks
-SET lease_worker_id = ?, lease_expiration_unix_ms = ?
+SET lease_worker_id = ?,
+    available_from_unix_ms = ?
 WHERE task_id = ?
   AND task_name = ?
+  AND task_unique_key IS NULL
   AND (
-        lease_worker_id IS NULL
-        OR lease_expiration_unix_ms IS NULL
-        OR lease_expiration_unix_ms <= ?
+        available_from_unix_ms IS NULL
+        OR available_from_unix_ms <= ?
       )
 RETURNING payload_json
         `,
@@ -144,38 +126,98 @@ RETURNING payload_json
       | undefined;
 
     if (!claimedRow) {
-      const currentRow = this.database
-        .prepare(
-          `
-SELECT lease_expiration_unix_ms
-FROM bellows_tasks
-WHERE task_id = ?
-  AND task_name = ?
-          `,
-        )
-        .get(taskId, task.name) as
-        | { lease_expiration_unix_ms: number | null }
-        | undefined;
-
-      if (!currentRow) {
-        throw new TaskNotFoundError();
-      }
-
-      if (
-        currentRow.lease_expiration_unix_ms !== null &&
-        currentRow.lease_expiration_unix_ms > Date.now()
-      ) {
-        throw new TaskLeasedError(currentRow.lease_expiration_unix_ms);
-      }
-
-      throw new TaskNotFoundError();
+      throw this.loadClaimFailure(taskId, task.name);
     }
+
+    this.emitSignal(task.name, taskId, leaseExpirationMs);
 
     return {
       taskId,
       taskPayload: task.codec.decode(claimedRow.payload_json),
       leaseExpirationMs,
     };
+  }
+
+  async claimEarliestPublished<TPayload, TCallback>(
+    task: PublishTaskDefinition<TPayload, TCallback>,
+    workerId: number,
+    leaseExpirationMs: number,
+  ): Promise<ClaimedTask<TPayload>> {
+    this.database.exec("BEGIN IMMEDIATE");
+
+    try {
+      const candidate = this.database
+        .prepare(
+          `
+SELECT task_id, payload_json
+FROM bellows_tasks
+WHERE task_name = ?
+  AND task_unique_key IS NULL
+  AND (
+        available_from_unix_ms IS NULL
+        OR available_from_unix_ms <= ?
+      )
+ORDER BY available_from_unix_ms IS NOT NULL, available_from_unix_ms, task_id
+LIMIT 1
+          `,
+        )
+        .get(task.name, Date.now()) as
+        | { task_id: number; payload_json: string }
+        | undefined;
+
+      if (!candidate) {
+        const nextRow = this.database
+          .prepare(
+            `
+SELECT MIN(available_from_unix_ms) AS available_from_unix_ms
+FROM bellows_tasks
+WHERE task_name = ?
+  AND task_unique_key IS NULL
+  AND available_from_unix_ms > ?
+            `,
+          )
+          .get(task.name, Date.now()) as {
+          available_from_unix_ms: number | null;
+        };
+
+        this.database.exec("COMMIT");
+        throw new TaskUnavailableError(nextRow.available_from_unix_ms);
+      }
+
+      const updated = this.database
+        .prepare(
+          `
+UPDATE bellows_tasks
+SET lease_worker_id = ?,
+    available_from_unix_ms = ?
+WHERE task_id = ?
+  AND (
+        available_from_unix_ms IS NULL
+        OR available_from_unix_ms <= ?
+      )
+        `,
+        )
+        .run(workerId, leaseExpirationMs, candidate.task_id, Date.now());
+
+      if (updated.changes === 0) {
+        this.database.exec("ROLLBACK");
+        throw new TaskUnavailableError(Date.now());
+      }
+
+      this.database.exec("COMMIT");
+      this.emitSignal(task.name, candidate.task_id, leaseExpirationMs);
+
+      return {
+        taskId: candidate.task_id,
+        taskPayload: task.codec.decode(candidate.payload_json),
+        leaseExpirationMs,
+      };
+    } catch (error) {
+      if (this.database.isTransaction) {
+        this.database.exec("ROLLBACK");
+      }
+      throw error;
+    }
   }
 
   async claimSingleton<TCallback>(
@@ -192,17 +234,16 @@ INSERT INTO bellows_tasks (
     payload_json,
     callback_id,
     lease_worker_id,
-    lease_expiration_unix_ms
+    available_from_unix_ms
 )
 VALUES (?, ?, 'null', NULL, ?, ?)
 ON CONFLICT(task_unique_key) DO UPDATE
 SET lease_worker_id = excluded.lease_worker_id,
-    lease_expiration_unix_ms = excluded.lease_expiration_unix_ms
+    available_from_unix_ms = excluded.available_from_unix_ms
 WHERE bellows_tasks.task_name = excluded.task_name
   AND (
-        bellows_tasks.lease_worker_id IS NULL
-        OR bellows_tasks.lease_expiration_unix_ms IS NULL
-        OR bellows_tasks.lease_expiration_unix_ms <= ?
+        bellows_tasks.available_from_unix_ms IS NULL
+        OR bellows_tasks.available_from_unix_ms <= ?
       )
 RETURNING task_id
         `,
@@ -215,14 +256,17 @@ RETURNING task_id
       const currentRow = this.database
         .prepare(
           `
-SELECT lease_expiration_unix_ms
+SELECT lease_worker_id, available_from_unix_ms
 FROM bellows_tasks
 WHERE task_name = ?
   AND task_unique_key = ?
           `,
         )
         .get(task.name, task.name) as
-        | { lease_expiration_unix_ms: number | null }
+        | {
+            lease_worker_id: number | null;
+            available_from_unix_ms: number | null;
+          }
         | undefined;
 
       if (!currentRow) {
@@ -230,14 +274,20 @@ WHERE task_name = ?
       }
 
       if (
-        currentRow.lease_expiration_unix_ms !== null &&
-        currentRow.lease_expiration_unix_ms > Date.now()
+        currentRow.available_from_unix_ms !== null &&
+        currentRow.available_from_unix_ms > Date.now()
       ) {
-        throw new TaskLeasedError(currentRow.lease_expiration_unix_ms);
+        if (currentRow.lease_worker_id !== null) {
+          throw new TaskLeasedError(currentRow.available_from_unix_ms);
+        }
+
+        throw new TaskUnavailableError(currentRow.available_from_unix_ms);
       }
 
       throw new TaskNotFoundError();
     }
+
+    this.emitSignal(task.name, claimedRow.task_id, leaseExpirationMs);
 
     return {
       taskId: claimedRow.task_id,
@@ -255,7 +305,7 @@ WHERE task_name = ?
       .prepare(
         `
 UPDATE bellows_tasks
-SET lease_expiration_unix_ms = ?
+SET available_from_unix_ms = ?
 WHERE task_id = ?
   AND lease_worker_id = ?
         `,
@@ -266,7 +316,40 @@ WHERE task_id = ?
       throw new LeaseLostError();
     }
 
+    const row = this.database
+      .prepare("SELECT task_name FROM bellows_tasks WHERE task_id = ?")
+      .get(taskId) as { task_name: string };
+    this.emitSignalIfRegistered(row.task_name, taskId, leaseExpirationMs);
+
     return { newExpirationMs: leaseExpirationMs };
+  }
+
+  async fail(
+    workerId: number,
+    taskId: number,
+    availableFromMs: number | null,
+  ): Promise<FailedTask> {
+    const updated = this.database
+      .prepare(
+        `
+UPDATE bellows_tasks
+SET lease_worker_id = NULL,
+    available_from_unix_ms = ?
+WHERE task_id = ?
+  AND lease_worker_id = ?
+RETURNING task_name
+        `,
+      )
+      .get(availableFromMs, taskId, workerId) as
+      | { task_name: string }
+      | undefined;
+
+    if (!updated) {
+      throw new LeaseLostError();
+    }
+
+    this.emitSignalIfRegistered(updated.task_name, taskId, availableFromMs);
+    return { taskId };
   }
 
   async finish<TTask extends TaskDefinition>(
@@ -282,7 +365,7 @@ WHERE task_id = ?
         `
 UPDATE bellows_tasks
 SET lease_worker_id = NULL,
-    lease_expiration_unix_ms = NULL
+    available_from_unix_ms = NULL
 WHERE task_id = ?
   AND lease_worker_id = ?
   AND task_unique_key IS NOT NULL
@@ -294,8 +377,11 @@ RETURNING task_name, callback_id
       | undefined;
 
     if (singletonRow) {
-      this.deliverCallback(singletonRow.callback_id, callbackPayloadJson);
-      this.emitSignal(singletonRow.task_name, newTaskAvailable(taskId));
+      if (singletonRow.callback_id !== null) {
+        this.deliverCallback(singletonRow.callback_id, callbackPayloadJson);
+      }
+
+      this.emitSignalIfRegistered(singletonRow.task_name, taskId, null);
       return { taskId };
     }
 
@@ -315,7 +401,10 @@ RETURNING callback_id
       throw new LeaseLostError();
     }
 
-    this.deliverCallback(publishedRow.callback_id, callbackPayloadJson);
+    if (publishedRow.callback_id !== null) {
+      this.deliverCallback(publishedRow.callback_id, callbackPayloadJson);
+    }
+
     return { taskId };
   }
 
@@ -327,15 +416,78 @@ RETURNING callback_id
     const result = this.database
       .prepare(
         `
-INSERT INTO bellows_tasks (task_name, task_unique_key, payload_json, callback_id)
-VALUES (?, NULL, ?, ?)
+INSERT INTO bellows_tasks (
+    task_name,
+    task_unique_key,
+    payload_json,
+    callback_id,
+    lease_worker_id,
+    available_from_unix_ms
+)
+VALUES (?, NULL, ?, ?, NULL, NULL)
         `,
       )
       .run(task.name, task.codec.encode(payload), callbackId);
 
     const taskId = Number(result.lastInsertRowid);
-    this.emitSignal(task.name, newTaskAvailable(taskId));
+    this.emitSignal(task.name, taskId, null);
     return { taskId };
+  }
+
+  private loadClaimFailure(taskId: number, taskName: string): Error {
+    const currentRow = this.database
+      .prepare(
+        `
+SELECT lease_worker_id, available_from_unix_ms
+FROM bellows_tasks
+WHERE task_id = ?
+  AND task_name = ?
+  AND task_unique_key IS NULL
+        `,
+      )
+      .get(taskId, taskName) as
+      | {
+          lease_worker_id: number | null;
+          available_from_unix_ms: number | null;
+        }
+      | undefined;
+
+    if (!currentRow) {
+      return new TaskNotFoundError();
+    }
+
+    if (
+      currentRow.available_from_unix_ms !== null &&
+      currentRow.available_from_unix_ms > Date.now()
+    ) {
+      if (currentRow.lease_worker_id !== null) {
+        return new TaskLeasedError(currentRow.available_from_unix_ms);
+      }
+
+      return new TaskUnavailableError(currentRow.available_from_unix_ms);
+    }
+
+    return new TaskNotFoundError();
+  }
+
+  private emitSignal(
+    taskName: string,
+    taskId: number,
+    availableFromMs: number | null,
+  ): void {
+    this.signals
+      .get(taskName)
+      ?.send(newTaskAvailable(taskId, availableFromMs ?? Date.now()));
+  }
+
+  private emitSignalIfRegistered(
+    taskName: string,
+    taskId: number,
+    availableFromMs: number | null,
+  ): void {
+    if (this.signals.has(taskName)) {
+      this.emitSignal(taskName, taskId, availableFromMs);
+    }
   }
 
   private deliverCallback(
@@ -364,10 +516,6 @@ VALUES (?, NULL, ?, ?)
     }
   }
 
-  private emitSignal(taskName: string, signal: BackendSignal): void {
-    this.signals.get(taskName)?.send(signal);
-  }
-
   private signalForTask(taskName: string): SignalHub {
     let signal = this.signals.get(taskName);
     if (!signal) {
@@ -387,9 +535,13 @@ function sqliteUrlToPath(databaseUrl: string): string {
   return decodeURIComponent(databaseUrl.slice("sqlite://".length));
 }
 
-function newTaskAvailable(taskId: number): BackendSignal {
+function newTaskAvailable(
+  taskId: number | null,
+  availableFromMs: number,
+): BackendSignal {
   return {
     type: "new-task-available",
     taskId,
+    availableFromMs,
   };
 }

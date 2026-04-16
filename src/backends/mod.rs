@@ -41,20 +41,6 @@ pub trait Backend: Clone + Send + Sync {
     where
         T: TaskDefinition;
 
-    /// Lists tasks that are currently pending and should be considered for dispatch for a specific
-    /// task definition.
-    ///
-    /// This is used by dispatchers during startup to sweep for pre-existing work that may not have
-    /// produced an observable signal for the current subscriber. Backends should return only task
-    /// IDs that are currently claimable: tasks that are not durably finished and either have no
-    /// active lease or only have an expired lease.
-    ///
-    /// Backends must ensure sweep results are namespaced by [`TaskDefinition::NAME`] so dispatchers
-    /// only consider tasks for the requested definition.
-    fn sweep<T>(&self) -> impl Future<Output = Result<Vec<SweptTask>, SweepTasksError>> + Send
-    where
-        T: TaskDefinition;
-
     /// Publishes a task to be processed by workers.
     fn publish<T>(
         &self,
@@ -73,11 +59,26 @@ pub trait Backend: Clone + Send + Sync {
         T: TaskDefinition,
         T::Trigger: PublishActivationStrategy;
 
-    /// Claims a published task until a lease expiration time.
+    /// Claims a specific published task until a lease expiration time.
     fn claim_published<T>(
         &self,
         worker_id: u64,
         task_id: u64,
+        lease_expiration: Instant,
+    ) -> impl Future<
+        Output = Result<
+            ClaimedTask<<<T as TaskDefinition>::Trigger as PublishActivationStrategy>::Payload>,
+            ClaimTaskError,
+        >,
+    > + Send
+    where
+        T: TaskDefinition,
+        T::Trigger: PublishActivationStrategy;
+
+    /// Claims the earliest currently-available published task until a lease expiration time.
+    fn claim_earliest_published<T>(
+        &self,
+        worker_id: u64,
         lease_expiration: Instant,
     ) -> impl Future<
         Output = Result<
@@ -105,6 +106,14 @@ pub trait Backend: Clone + Send + Sync {
         task_id: u64,
         lease_expiration: Instant,
     ) -> impl Future<Output = Result<RenewedTaskLease, RenewTaskError>> + Send;
+
+    /// Marks a task as failed and updates when it should become available again.
+    fn fail(
+        &self,
+        worker_id: u64,
+        task_id: u64,
+        available_from: Option<Instant>,
+    ) -> impl Future<Output = Result<FailedTask, FailTaskError>> + Send;
 
     /// Marks a task as successfully finished.
     ///
@@ -149,27 +158,6 @@ impl StdError for SubscribeError {
     }
 }
 
-#[derive(Debug)]
-pub enum SweepTasksError {
-    Backend(BoxBackendError),
-}
-
-impl Display for SweepTasksError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Backend(error) => write!(f, "backend sweep failed: {error}"),
-        }
-    }
-}
-
-impl StdError for SweepTasksError {
-    fn source(&self) -> Option<&(dyn StdError + 'static)> {
-        match self {
-            Self::Backend(error) => Some(error.as_ref()),
-        }
-    }
-}
-
 pub struct BackendSignalSubscription<T> {
     rx: BroadcastReceiver<BackendSignal>,
     _task: PhantomData<fn() -> T>,
@@ -204,12 +192,8 @@ pub enum BackendSignal {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NewTaskAvailableSignalPayload {
-    pub task_id: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SweptTask {
-    pub task_id: u64,
+    pub task_id: Option<u64>,
+    pub available_from: Instant,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -249,6 +233,7 @@ pub struct ClaimedTask<T> {
 pub enum ClaimTaskError {
     Backend(BoxBackendError),
     TaskLeased { expiration: Instant },
+    TaskUnavailable { available_from: Option<Instant> },
     TaskNotFound,
 }
 
@@ -259,7 +244,16 @@ impl Display for ClaimTaskError {
             Self::TaskLeased { expiration } => {
                 write!(f, "task is currently leased until {expiration:?}")
             }
-            Self::TaskNotFound => f.write_str("task not found"),
+            Self::TaskUnavailable { available_from } => match available_from {
+                Some(available_from) => {
+                    write!(
+                        f,
+                        "no task is currently available; next availability is {available_from:?}"
+                    )
+                }
+                None => f.write_str("no task is currently available"),
+            },
+            Self::TaskNotFound => f.write_str("task was not found"),
         }
     }
 }
@@ -268,7 +262,7 @@ impl StdError for ClaimTaskError {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match self {
             Self::Backend(error) => Some(error.as_ref()),
-            Self::TaskLeased { .. } | Self::TaskNotFound => None,
+            Self::TaskLeased { .. } | Self::TaskUnavailable { .. } | Self::TaskNotFound => None,
         }
     }
 }
@@ -287,13 +281,42 @@ pub enum RenewTaskError {
 impl Display for RenewTaskError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Backend(error) => write!(f, "backend lease renewal failed: {error}"),
-            Self::LeaseLost => f.write_str("task lease lost"),
+            Self::Backend(error) => write!(f, "backend renew failed: {error}"),
+            Self::LeaseLost => f.write_str("task lease was lost before renewal"),
         }
     }
 }
 
 impl StdError for RenewTaskError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match self {
+            Self::Backend(error) => Some(error.as_ref()),
+            Self::LeaseLost => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FailedTask {
+    pub task_id: u64,
+}
+
+#[derive(Debug)]
+pub enum FailTaskError {
+    Backend(BoxBackendError),
+    LeaseLost,
+}
+
+impl Display for FailTaskError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Backend(error) => write!(f, "backend fail failed: {error}"),
+            Self::LeaseLost => f.write_str("task lease was lost before failure was recorded"),
+        }
+    }
+}
+
+impl StdError for FailTaskError {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match self {
             Self::Backend(error) => Some(error.as_ref()),
@@ -317,7 +340,7 @@ impl Display for FinishTaskError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Backend(error) => write!(f, "backend finish failed: {error}"),
-            Self::LeaseLost => f.write_str("task lease lost"),
+            Self::LeaseLost => f.write_str("task lease was lost before finishing"),
         }
     }
 }

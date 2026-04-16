@@ -5,7 +5,7 @@ use std::{
 
 use crate::{
     ActivationStrategy, Backend, TaskDefinition, Worker, WorkerFactory,
-    backends::{ClaimTaskError, FinishTaskError, RenewTaskError},
+    backends::{ClaimTaskError, FailTaskError, FinishTaskError, RenewTaskError},
 };
 use tokio::sync::mpsc::UnboundedSender as MpscSender;
 use tracing::{trace, warn};
@@ -13,13 +13,19 @@ use tracing::{trace, warn};
 const LEASE_DURATION: Duration = Duration::from_secs(20);
 const LEASE_RENEWAL_THRESHOLD: Duration = Duration::from_secs(10);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RuntimeUpdate {
+    pub next_available_from_update: Option<Option<Instant>>,
+    pub claimed_task: bool,
+}
+
 /// An internal type that handles worker lifecycle.
 #[derive(Debug)]
 pub(crate) struct WorkerRuntime<B, F> {
     pub backend: B,
     pub factory: Arc<F>,
     pub worker_id: u64,
-    pub finished_signal: MpscSender<()>,
+    pub update_signal: MpscSender<RuntimeUpdate>,
 }
 
 impl<B, F> WorkerRuntime<B, F>
@@ -35,7 +41,7 @@ where
             backend: self.backend,
             factory: self.factory,
             worker_id: self.worker_id,
-            finished_signal: self.finished_signal,
+            update_signal: self.update_signal,
             status: DaemonStatus::WaitingForTask { dispatch_token },
         };
         tokio::spawn(daemon.run());
@@ -49,7 +55,7 @@ where
     backend: B,
     factory: Arc<F>,
     worker_id: u64,
-    finished_signal: MpscSender<()>,
+    update_signal: MpscSender<RuntimeUpdate>,
     status: DaemonStatus<T>,
 }
 
@@ -61,19 +67,21 @@ where
 {
     async fn run(mut self) {
         loop {
-            let (new_self, action) = self.event_loop().await;
+            let (new_self, action, update) = self.event_loop().await;
             self = new_self;
+
+            if let Some(update) = update {
+                let _ = self.update_signal.send(update);
+            }
 
             if matches!(action, EventLoopResult::Exit) {
                 break;
             }
         }
-
-        let _ = self.finished_signal.send(());
     }
 
-    async fn event_loop(mut self) -> (Self, EventLoopResult) {
-        let (status, action) = match self.status {
+    async fn event_loop(mut self) -> (Self, EventLoopResult, Option<RuntimeUpdate>) {
+        let (status, action, update) = match self.status {
             DaemonStatus::WaitingForTask { dispatch_token } => {
                 match <<<F::Worker as Worker>::Task as TaskDefinition>::Trigger as ActivationStrategy>::claim_task::<B, <F::Worker as Worker>::Task>(
                     &self.backend,
@@ -89,18 +97,42 @@ where
                             lease_expiration: task.lease_expiration,
                         },
                         EventLoopResult::Continue,
+                        Some(RuntimeUpdate {
+                            next_available_from_update: None,
+                            claimed_task: true,
+                        }),
                     ),
-                    Err(ClaimTaskError::TaskLeased { .. } | ClaimTaskError::TaskNotFound) => {
-                        // This is fine as it's likely that another worker claimed the task.
+                    Err(ClaimTaskError::TaskLeased { expiration }) => {
                         trace!("Unable to claim task with worker #{}", self.worker_id);
-                        (DaemonStatus::WorkerExited, EventLoopResult::Exit)
+                        (
+                            DaemonStatus::WorkerExited,
+                            EventLoopResult::Exit,
+                            Some(RuntimeUpdate {
+                                next_available_from_update: Some(Some(expiration)),
+                                claimed_task: false,
+                            }),
+                        )
+                    }
+                    Err(ClaimTaskError::TaskUnavailable { available_from }) => {
+                        trace!("No task available for worker #{}", self.worker_id);
+                        (
+                            DaemonStatus::WorkerExited,
+                            EventLoopResult::Exit,
+                            Some(RuntimeUpdate {
+                                next_available_from_update: Some(available_from),
+                                claimed_task: false,
+                            }),
+                        )
+                    }
+                    Err(ClaimTaskError::TaskNotFound) => {
+                        (DaemonStatus::WorkerExited, EventLoopResult::Exit, None)
                     }
                     Err(ClaimTaskError::Backend(err)) => {
                         warn!(
                             "Unable to claim task with worker #{} due to backend error: {}",
                             self.worker_id, err
                         );
-                        (DaemonStatus::WorkerExited, EventLoopResult::Exit)
+                        (DaemonStatus::WorkerExited, EventLoopResult::Exit, None)
                     }
                 }
             }
@@ -120,6 +152,7 @@ where
                         lease_expiration,
                     },
                     EventLoopResult::Continue,
+                    None,
                 )
             }
             DaemonStatus::WorkerStarted {
@@ -154,6 +187,7 @@ where
                                         lease_expiration: new_lease.new_expiration,
                                     },
                                     EventLoopResult::Continue,
+                                    None,
                                 )
                             }
                             Err(RenewTaskError::LeaseLost) => {
@@ -163,7 +197,7 @@ where
                                     self.worker_id
                                 );
                                 worker_handle.abort();
-                                (DaemonStatus::WorkerExited, EventLoopResult::Exit)
+                                (DaemonStatus::WorkerExited, EventLoopResult::Exit, None)
                             }
                             Err(RenewTaskError::Backend(err)) => {
                                 warn!(
@@ -173,34 +207,82 @@ where
                                     err
                                 );
                                 worker_handle.abort();
-                                (DaemonStatus::WorkerExited, EventLoopResult::Exit)
+                                (DaemonStatus::WorkerExited, EventLoopResult::Exit, None)
                             }
                         }
                     },
                     join_result = &mut worker_handle => {
                         match join_result {
-                            Ok(callback_payload) => (
+                            Ok(Ok(callback_payload)) => (
                                 DaemonStatus::WorkerFinishedProcessing {
                                     task_id,
                                     callback_payload,
                                 },
                                 EventLoopResult::Continue,
+                                None,
+                            ),
+                            Ok(Err(task_failure)) => (
+                                DaemonStatus::WorkerFailedProcessing {
+                                    task_id,
+                                    available_from: task_failure.available_from,
+                                },
+                                EventLoopResult::Continue,
+                                None,
                             ),
                             Err(err) => {
-                                // TODO: Handle post-failure state. Potential options:
-                                // - give up lease to allow immediate take over
-                                // - set up retry-after mechanism for retrying with backoff
                                 warn!(
-                                    "Worker #{} for task #{} exited unexpectedly: {}",
+                                    "Worker #{} for task #{} exited unexpectedly: {}; retrying immediately",
                                     self.worker_id,
                                     task_id,
                                     err
                                 );
-                                (DaemonStatus::WorkerExited, EventLoopResult::Exit)
+                                (
+                                    DaemonStatus::WorkerFailedProcessing {
+                                        task_id,
+                                        available_from: None,
+                                    },
+                                    EventLoopResult::Continue,
+                                    None,
+                                )
                             }
                         }
                     },
                 }
+            }
+            DaemonStatus::WorkerFailedProcessing {
+                task_id,
+                available_from,
+            } => {
+                match self
+                    .backend
+                    .fail(self.worker_id, task_id, available_from)
+                    .await
+                {
+                    Ok(_) => {
+                        trace!("Failed task #{} with worker #{}", task_id, self.worker_id);
+                    }
+                    Err(FailTaskError::LeaseLost) => {
+                        warn!(
+                            "Worker #{} failed task #{} but no longer holds its lease; assuming another worker took over",
+                            self.worker_id, task_id
+                        );
+                    }
+                    Err(FailTaskError::Backend(err)) => {
+                        warn!(
+                            "Unable to record failure for task #{} with worker #{} due to backend error: {}",
+                            task_id, self.worker_id, err
+                        );
+                    }
+                }
+
+                (
+                    DaemonStatus::WorkerExited,
+                    EventLoopResult::Exit,
+                    Some(RuntimeUpdate {
+                        next_available_from_update: None,
+                        claimed_task: false,
+                    }),
+                )
             }
             DaemonStatus::WorkerFinishedProcessing {
                 task_id,
@@ -232,7 +314,14 @@ where
                     }
                 }
 
-                (DaemonStatus::WorkerExited, EventLoopResult::Exit)
+                (
+                    DaemonStatus::WorkerExited,
+                    EventLoopResult::Exit,
+                    Some(RuntimeUpdate {
+                        next_available_from_update: None,
+                        claimed_task: false,
+                    }),
+                )
             }
             DaemonStatus::WorkerExited => {
                 unreachable!("Worker runtime event loop should have ended")
@@ -240,7 +329,7 @@ where
         };
 
         self.status = status;
-        (self, action)
+        (self, action, update)
     }
 }
 
@@ -268,8 +357,13 @@ where
     /// The background worker has been spawned.
     WorkerStarted {
         task_id: u64,
-        worker_handle: tokio::task::JoinHandle<T::Callback>,
+        worker_handle: tokio::task::JoinHandle<crate::TaskResult<T::Callback>>,
         lease_expiration: Instant,
+    },
+    /// The worker finished unsuccessfully and the task should be released back to the backend.
+    WorkerFailedProcessing {
+        task_id: u64,
+        available_from: Option<Instant>,
     },
     /// The worker future completed successfully and the task should be finalized in the backend.
     WorkerFinishedProcessing {

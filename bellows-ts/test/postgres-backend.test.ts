@@ -5,6 +5,7 @@ import { PostgresBackend } from "../src/backends/postgres.js";
 import {
   definePublishTask,
   defineSingletonTask,
+  TaskFailure,
   WorkerDispatcher,
   type WorkerFactory,
 } from "../src/index.js";
@@ -18,6 +19,8 @@ import {
 const echoTask = definePublishTask<{ name: string }, string>("echo");
 const ackTask = definePublishTask<void>("ack");
 const singletonTask = defineSingletonTask("singleton_echo");
+const blockingTask = definePublishTask<void>("blocking");
+const retryTask = definePublishTask<void>("retry_once");
 const adminDatabaseUrl =
   process.env.BELLOWS_TS_TEST_POSTGRES_URL ??
   "postgres://postgres:postgres@localhost:5432/postgres";
@@ -125,6 +128,37 @@ test("postgres singleton task dispatch", async () => {
   expect(processed.tryRecv()).toBeNull();
 });
 
+test("dispatcher drains multiple preexisting tasks without waiting", async () => {
+  const database = track(
+    await TestPostgresDatabase.create("drains_multiple_preexisting_tasks"),
+  );
+  const backend = track(await PostgresBackend.connect(database.url));
+  await backend.initialize();
+  const started = track(new AsyncChannel<number>());
+  const gate = new Gate();
+
+  const first = await backend.publish(blockingTask, undefined);
+  const second = await backend.publish(blockingTask, undefined);
+
+  const dispatcher = new WorkerDispatcher(
+    backend,
+    createBlockingWorkerFactory(started, gate),
+  );
+  const dispatcherHandle = await dispatcher.launch();
+
+  const startedFirst = await recvWithTimeout(started);
+  const startedSecond = await recvWithTimeout(started);
+
+  expect([first.taskId, second.taskId]).toContain(startedFirst);
+  expect([first.taskId, second.taskId]).toContain(startedSecond);
+  expect(startedFirst).not.toBe(startedSecond);
+
+  const drainPromise = dispatcherHandle.drain();
+  gate.release();
+  gate.release();
+  await drainPromise;
+});
+
 test("postgres sweeping", async () => {
   const database = track(await TestPostgresDatabase.create("sweeping"));
   const backend = track(await PostgresBackend.connect(database.url));
@@ -148,6 +182,29 @@ test("postgres sweeping", async () => {
   processed.close();
 
   expect(await processed.recv()).toBeNull();
+});
+
+test("worker failure is retried", async () => {
+  const database = track(
+    await TestPostgresDatabase.create("worker_failure_is_retried"),
+  );
+  const backend = track(await PostgresBackend.connect(database.url));
+  await backend.initialize();
+  const processed = track(new AsyncChannel<number>());
+  let attempts = 0;
+
+  const dispatcher = new WorkerDispatcher(
+    backend,
+    createRetryWorkerFactory(processed, () => attempts++),
+  );
+  const dispatcherHandle = await dispatcher.launch();
+
+  const published = await backend.publish(retryTask, undefined);
+
+  expect(await processed.recv()).toBe(published.taskId);
+  expect(attempts).toBe(2);
+
+  await dispatcherHandle.drain();
 });
 
 function createEchoWorkerFactory(
@@ -175,6 +232,7 @@ function createAckWorkerFactory(
       return {
         async process(taskId) {
           processed.send(taskId);
+          return undefined;
         },
       };
     },
@@ -192,6 +250,47 @@ function createSingletonWorkerFactory(
         async process(taskId) {
           processed.send(taskId);
           await gate.wait();
+          return undefined;
+        },
+      };
+    },
+  };
+}
+
+function createBlockingWorkerFactory(
+  started: AsyncChannel<number>,
+  gate: Gate,
+): WorkerFactory<typeof blockingTask> {
+  return {
+    task: blockingTask,
+    build() {
+      return {
+        async process(taskId) {
+          started.send(taskId);
+          await gate.wait();
+          return undefined;
+        },
+      };
+    },
+  };
+}
+
+function createRetryWorkerFactory(
+  processed: AsyncChannel<number>,
+  recordAttempt: () => number,
+): WorkerFactory<typeof retryTask> {
+  return {
+    task: retryTask,
+    build() {
+      return {
+        async process(taskId) {
+          const attempt = recordAttempt();
+          if (attempt === 0) {
+            return TaskFailure.retryImmediately();
+          }
+
+          processed.send(taskId);
+          return undefined;
         },
       };
     },
@@ -232,6 +331,20 @@ WHERE datname = $1
     await admin.query(`DROP DATABASE "${this.databaseName}"`);
     await admin.end();
   }
+}
+
+async function recvWithTimeout<T>(channel: AsyncChannel<T>): Promise<T> {
+  const value = await Promise.race([
+    channel.recv(),
+    new Promise<null>((resolve) => {
+      setTimeout(() => {
+        resolve(null);
+      }, 1_000);
+    }),
+  ]);
+
+  expect(value).not.toBeNull();
+  return value as T;
 }
 
 function track<

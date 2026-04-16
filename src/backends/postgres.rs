@@ -22,11 +22,11 @@ use tokio::sync::{
 use tracing::warn;
 
 use crate::backends::{
-    BackendSignal, BackendSignalSubscription, ClaimTaskError, ClaimedTask, FinishTaskError,
-    FinishedTask, NewTaskAvailableSignalPayload, PublishTaskError, PublishedTask, RenewTaskError,
-    RenewedTaskLease, SubscribeError, SweepTasksError, SweptTask,
+    Backend, BackendSignal, BackendSignalSubscription, ClaimTaskError, ClaimedTask, FailTaskError,
+    FailedTask, FinishTaskError, FinishedTask, NewTaskAvailableSignalPayload, PublishTaskError,
+    PublishedTask, RenewTaskError, RenewedTaskLease, SubscribeError,
 };
-use crate::{AwaitableTask, Backend, PublishActivationStrategy, TaskDefinition};
+use crate::{AwaitableTask, PublishActivationStrategy, TaskDefinition};
 
 const SIGNAL_CHANNEL_SIZE: usize = 1024;
 const NOTIFY_CHANNEL: &str = "bellows_tasks";
@@ -40,46 +40,30 @@ CREATE TABLE IF NOT EXISTS bellows_tasks (
     payload_json TEXT NOT NULL,
     callback_id BIGINT,
     lease_worker_id BIGINT,
-    lease_expiration_unix_ms BIGINT,
-    CHECK ((lease_worker_id IS NULL) = (lease_expiration_unix_ms IS NULL))
+    available_from_unix_ms BIGINT,
+    CHECK (lease_worker_id IS NULL OR available_from_unix_ms IS NOT NULL)
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS bellows_tasks_unique_key_idx
     ON bellows_tasks (task_unique_key);
 
-CREATE INDEX IF NOT EXISTS bellows_tasks_sweep_idx
-    ON bellows_tasks (task_name, lease_expiration_unix_ms, task_id);
+CREATE INDEX IF NOT EXISTS bellows_tasks_available_idx
+    ON bellows_tasks (task_name, task_unique_key, available_from_unix_ms, task_id);
 
 CREATE OR REPLACE FUNCTION bellows_notify_task_available()
 RETURNS trigger
 LANGUAGE plpgsql
 AS $$
 BEGIN
-    IF TG_OP = 'INSERT' THEN
-        PERFORM pg_notify(
-            'bellows_tasks',
-            json_build_object(
-                'kind', 'new_task_available',
-                'task_name', NEW.task_name,
-                'task_id', NEW.task_id
-            )::text
-        );
-    ELSIF NEW.lease_worker_id IS NULL
-        AND NEW.lease_expiration_unix_ms IS NULL
-        AND (
-            OLD.lease_worker_id IS DISTINCT FROM NEW.lease_worker_id
-            OR OLD.lease_expiration_unix_ms IS DISTINCT FROM NEW.lease_expiration_unix_ms
-        )
-    THEN
-        PERFORM pg_notify(
-            'bellows_tasks',
-            json_build_object(
-                'kind', 'new_task_available',
-                'task_name', NEW.task_name,
-                'task_id', NEW.task_id
-            )::text
-        );
-    END IF;
+    PERFORM pg_notify(
+        'bellows_tasks',
+        json_build_object(
+            'kind', 'new_task_available',
+            'task_name', NEW.task_name,
+            'task_id', NEW.task_id,
+            'available_from_unix_ms', NEW.available_from_unix_ms
+        )::text
+    );
 
     RETURN NEW;
 END;
@@ -88,7 +72,7 @@ $$;
 DROP TRIGGER IF EXISTS bellows_tasks_notify_available ON bellows_tasks;
 
 CREATE TRIGGER bellows_tasks_notify_available
-AFTER INSERT OR UPDATE OF lease_worker_id, lease_expiration_unix_ms ON bellows_tasks
+AFTER INSERT OR UPDATE OF lease_worker_id, available_from_unix_ms ON bellows_tasks
 FOR EACH ROW
 EXECUTE FUNCTION bellows_notify_task_available();
 "#;
@@ -275,8 +259,15 @@ impl PostgresBackend {
 
         let row = sqlx::query(
             r#"
-INSERT INTO bellows_tasks (task_name, task_unique_key, payload_json, callback_id)
-VALUES ($1, NULL, $2, $3)
+INSERT INTO bellows_tasks (
+    task_name,
+    task_unique_key,
+    payload_json,
+    callback_id,
+    lease_worker_id,
+    available_from_unix_ms
+)
+VALUES ($1, NULL, $2, $3, NULL, NULL)
 RETURNING task_id
 "#,
         )
@@ -317,41 +308,6 @@ impl Backend for PostgresBackend {
         Ok(BackendSignalSubscription::new(
             self.signal_for_task(T::NAME).subscribe(),
         ))
-    }
-
-    async fn sweep<T>(&self) -> Result<Vec<SweptTask>, SweepTasksError>
-    where
-        T: TaskDefinition,
-    {
-        let now_unix_ms = unix_timestamp_ms(SystemTime::now());
-        let rows = sqlx::query(
-            r#"
-SELECT task_id
-FROM bellows_tasks
-WHERE task_name = $1
-  AND (
-        lease_worker_id IS NULL
-        OR lease_expiration_unix_ms IS NULL
-        OR lease_expiration_unix_ms <= $2
-      )
-ORDER BY task_id
-"#,
-        )
-        .bind(T::NAME)
-        .bind(now_unix_ms)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|err| SweepTasksError::Backend(Box::new(PostgresBackendError::Sqlx(err))))?;
-
-        rows.into_iter()
-            .map(|row| {
-                let task_id = row.get::<i64, _>("task_id");
-                let task_id = u64::try_from(task_id).map_err(|err| {
-                    SweepTasksError::Backend(Box::new(PostgresBackendError::InvalidTaskId(err)))
-                })?;
-                Ok(SweptTask { task_id })
-            })
-            .collect()
     }
 
     async fn publish<T>(
@@ -404,13 +360,14 @@ ORDER BY task_id
         let claimed_row = sqlx::query(
             r#"
 UPDATE bellows_tasks
-SET lease_worker_id = $1, lease_expiration_unix_ms = $2
+SET lease_worker_id = $1,
+    available_from_unix_ms = $2
 WHERE task_id = $3
   AND task_name = $4
+  AND task_unique_key IS NULL
   AND (
-        lease_worker_id IS NULL
-        OR lease_expiration_unix_ms IS NULL
-        OR lease_expiration_unix_ms <= $5
+        available_from_unix_ms IS NULL
+        OR available_from_unix_ms <= $5
       )
 RETURNING payload_json
 "#,
@@ -442,10 +399,11 @@ RETURNING payload_json
             None => {
                 let current = sqlx::query(
                     r#"
-SELECT lease_expiration_unix_ms
+SELECT lease_worker_id, available_from_unix_ms
 FROM bellows_tasks
 WHERE task_id = $1
   AND task_name = $2
+  AND task_unique_key IS NULL
 "#,
                 )
                 .bind(task_id_db)
@@ -460,16 +418,117 @@ WHERE task_id = $1
                     return Err(ClaimTaskError::TaskNotFound);
                 };
 
-                if let Some(current_expiration_unix_ms) =
-                    current.get::<Option<i64>, _>("lease_expiration_unix_ms")
-                    && current_expiration_unix_ms > now_unix_ms
-                {
-                    return Err(ClaimTaskError::TaskLeased {
-                        expiration: unix_ms_to_instant(current_expiration_unix_ms, now_system),
-                    });
+                match current.get::<Option<i64>, _>("available_from_unix_ms") {
+                    Some(available_from_unix_ms) if available_from_unix_ms > now_unix_ms => {
+                        if current.get::<Option<i64>, _>("lease_worker_id").is_some() {
+                            Err(ClaimTaskError::TaskLeased {
+                                expiration: unix_ms_to_instant(available_from_unix_ms, now_system),
+                            })
+                        } else {
+                            Err(ClaimTaskError::TaskUnavailable {
+                                available_from: Some(unix_ms_to_instant(
+                                    available_from_unix_ms,
+                                    now_system,
+                                )),
+                            })
+                        }
+                    }
+                    Some(_) | None => Err(ClaimTaskError::TaskNotFound),
                 }
+            }
+        }
+    }
 
-                Err(ClaimTaskError::TaskNotFound)
+    async fn claim_earliest_published<T>(
+        &self,
+        worker_id: u64,
+        lease_expiration: Instant,
+    ) -> Result<
+        ClaimedTask<<<T as TaskDefinition>::Trigger as PublishActivationStrategy>::Payload>,
+        ClaimTaskError,
+    >
+    where
+        T: TaskDefinition,
+        T::Trigger: PublishActivationStrategy,
+    {
+        let worker_id_db = i64::try_from(worker_id).map_err(|err| {
+            ClaimTaskError::Backend(Box::new(PostgresBackendError::InvalidWorkerId(err)))
+        })?;
+        let now_system = SystemTime::now();
+        let now_unix_ms = unix_timestamp_ms(now_system);
+        let lease_expiration_unix_ms = instant_to_unix_ms(lease_expiration, now_system);
+
+        let claimed_row = sqlx::query(
+            r#"
+WITH next_task AS (
+    SELECT task_id
+    FROM bellows_tasks
+    WHERE task_name = $1
+      AND task_unique_key IS NULL
+      AND (
+            available_from_unix_ms IS NULL
+            OR available_from_unix_ms <= $2
+          )
+    ORDER BY available_from_unix_ms NULLS FIRST, task_id
+    LIMIT 1
+    FOR UPDATE SKIP LOCKED
+)
+UPDATE bellows_tasks
+SET lease_worker_id = $3,
+    available_from_unix_ms = $4
+FROM next_task
+WHERE bellows_tasks.task_id = next_task.task_id
+RETURNING bellows_tasks.task_id, bellows_tasks.payload_json
+"#,
+        )
+        .bind(T::NAME)
+        .bind(now_unix_ms)
+        .bind(worker_id_db)
+        .bind(lease_expiration_unix_ms)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|err| ClaimTaskError::Backend(Box::new(PostgresBackendError::Sqlx(err))))?;
+
+        match claimed_row {
+            Some(claimed_row) => {
+                let task_id =
+                    u64::try_from(claimed_row.get::<i64, _>("task_id")).map_err(|err| {
+                        ClaimTaskError::Backend(Box::new(PostgresBackendError::InvalidTaskId(err)))
+                    })?;
+                let payload_json = claimed_row.get::<String, _>("payload_json");
+                let task_payload = serde_json::from_str(&payload_json).map_err(|err| {
+                    ClaimTaskError::Backend(Box::new(PostgresBackendError::PayloadDeserialization(
+                        err,
+                    )))
+                })?;
+
+                Ok(ClaimedTask {
+                    task_id,
+                    task_payload,
+                    lease_expiration,
+                })
+            }
+            None => {
+                let earliest_available_from = sqlx::query(
+                    r#"
+SELECT MIN(available_from_unix_ms) AS available_from_unix_ms
+FROM bellows_tasks
+WHERE task_name = $1
+  AND task_unique_key IS NULL
+  AND available_from_unix_ms > $2
+"#,
+                )
+                .bind(T::NAME)
+                .bind(now_unix_ms)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|err| ClaimTaskError::Backend(Box::new(PostgresBackendError::Sqlx(err))))?
+                .get::<Option<i64>, _>("available_from_unix_ms")
+                .map(|unix_ms| unix_ms_to_instant(unix_ms, now_system));
+
+                Err(ClaimTaskError::TaskUnavailable {
+                    available_from: earliest_available_from,
+                })
             }
         }
     }
@@ -497,17 +556,16 @@ INSERT INTO bellows_tasks (
     payload_json,
     callback_id,
     lease_worker_id,
-    lease_expiration_unix_ms
+    available_from_unix_ms
 )
 VALUES ($1, $2, 'null', NULL, $3, $4)
 ON CONFLICT (task_unique_key) DO UPDATE
 SET lease_worker_id = EXCLUDED.lease_worker_id,
-    lease_expiration_unix_ms = EXCLUDED.lease_expiration_unix_ms
+    available_from_unix_ms = EXCLUDED.available_from_unix_ms
 WHERE bellows_tasks.task_name = EXCLUDED.task_name
   AND (
-        bellows_tasks.lease_worker_id IS NULL
-        OR bellows_tasks.lease_expiration_unix_ms IS NULL
-        OR bellows_tasks.lease_expiration_unix_ms <= $5
+        bellows_tasks.available_from_unix_ms IS NULL
+        OR bellows_tasks.available_from_unix_ms <= $5
       )
 RETURNING task_id
 "#,
@@ -537,7 +595,7 @@ RETURNING task_id
             None => {
                 let current = sqlx::query(
                     r#"
-SELECT lease_expiration_unix_ms
+SELECT lease_worker_id, available_from_unix_ms
 FROM bellows_tasks
 WHERE task_name = $1
   AND task_unique_key = $2
@@ -555,16 +613,23 @@ WHERE task_name = $1
                     return Err(ClaimTaskError::TaskNotFound);
                 };
 
-                if let Some(current_expiration_unix_ms) =
-                    current.get::<Option<i64>, _>("lease_expiration_unix_ms")
-                    && current_expiration_unix_ms > now_unix_ms
-                {
-                    return Err(ClaimTaskError::TaskLeased {
-                        expiration: unix_ms_to_instant(current_expiration_unix_ms, now_system),
-                    });
+                match current.get::<Option<i64>, _>("available_from_unix_ms") {
+                    Some(available_from_unix_ms) if available_from_unix_ms > now_unix_ms => {
+                        if current.get::<Option<i64>, _>("lease_worker_id").is_some() {
+                            Err(ClaimTaskError::TaskLeased {
+                                expiration: unix_ms_to_instant(available_from_unix_ms, now_system),
+                            })
+                        } else {
+                            Err(ClaimTaskError::TaskUnavailable {
+                                available_from: Some(unix_ms_to_instant(
+                                    available_from_unix_ms,
+                                    now_system,
+                                )),
+                            })
+                        }
+                    }
+                    Some(_) | None => Err(ClaimTaskError::TaskNotFound),
                 }
-
-                Err(ClaimTaskError::TaskNotFound)
             }
         }
     }
@@ -586,7 +651,7 @@ WHERE task_name = $1
         let result = sqlx::query(
             r#"
 UPDATE bellows_tasks
-SET lease_expiration_unix_ms = $1
+SET available_from_unix_ms = $1
 WHERE task_id = $2
   AND lease_worker_id = $3
 "#,
@@ -604,6 +669,44 @@ WHERE task_id = $2
             Ok(RenewedTaskLease {
                 new_expiration: lease_expiration,
             })
+        }
+    }
+
+    async fn fail(
+        &self,
+        worker_id: u64,
+        task_id: u64,
+        available_from: Option<Instant>,
+    ) -> Result<FailedTask, FailTaskError> {
+        let task_id_db = i64::try_from(task_id).map_err(|err| {
+            FailTaskError::Backend(Box::new(PostgresBackendError::InvalidTaskId(err)))
+        })?;
+        let worker_id_db = i64::try_from(worker_id).map_err(|err| {
+            FailTaskError::Backend(Box::new(PostgresBackendError::InvalidWorkerId(err)))
+        })?;
+        let available_from_unix_ms =
+            available_from.map(|instant| instant_to_unix_ms(instant, SystemTime::now()));
+
+        let result = sqlx::query(
+            r#"
+UPDATE bellows_tasks
+SET lease_worker_id = NULL,
+    available_from_unix_ms = $1
+WHERE task_id = $2
+  AND lease_worker_id = $3
+"#,
+        )
+        .bind(available_from_unix_ms)
+        .bind(task_id_db)
+        .bind(worker_id_db)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| FailTaskError::Backend(Box::new(PostgresBackendError::Sqlx(err))))?;
+
+        if result.rows_affected() == 0 {
+            Err(FailTaskError::LeaseLost)
+        } else {
+            Ok(FailedTask { task_id })
         }
     }
 
@@ -635,7 +738,7 @@ WHERE task_id = $2
             r#"
 UPDATE bellows_tasks
 SET lease_worker_id = NULL,
-    lease_expiration_unix_ms = NULL
+    available_from_unix_ms = NULL
 WHERE task_id = $1
   AND lease_worker_id = $2
   AND task_unique_key IS NOT NULL
@@ -765,10 +868,7 @@ impl Daemon {
                 match notification {
                     Ok(notification) => self.handle_notification(notification.payload()),
                     Err(error) => {
-                        warn!(
-                            "postgres notification listener failed and will restart: {}",
-                            error
-                        );
+                        warn!("postgres notification listener failed and will restart: {}", error);
                         self.listener = None;
                         self.wait_for_retry().await
                     }
@@ -794,7 +894,11 @@ impl Daemon {
         };
 
         match payload {
-            NotificationPayload::NewTaskAvailable { task_name, task_id } => {
+            NotificationPayload::NewTaskAvailable {
+                task_name,
+                task_id,
+                available_from_unix_ms,
+            } => {
                 let Ok(task_id) = u64::try_from(task_id) else {
                     warn!(
                         "received postgres notification with out-of-range task ID: {}",
@@ -812,8 +916,14 @@ impl Daemon {
                 };
 
                 if let Some(sender) = sender {
+                    let available_from = available_from_unix_ms
+                        .map(|unix_ms| unix_ms_to_instant(unix_ms, SystemTime::now()))
+                        .unwrap_or_else(Instant::now);
                     let _ = sender.send(BackendSignal::NewTaskAvailable(
-                        NewTaskAvailableSignalPayload { task_id },
+                        NewTaskAvailableSignalPayload {
+                            task_id: Some(task_id),
+                            available_from,
+                        },
                     ));
                 }
             }
@@ -879,6 +989,7 @@ enum NotificationPayload {
     NewTaskAvailable {
         task_name: String,
         task_id: i64,
+        available_from_unix_ms: Option<i64>,
     },
     TaskCallback {
         task_name: String,

@@ -38,7 +38,7 @@ use tokio::sync::oneshot;
 
 pub mod backends;
 pub use backends::Backend;
-use backends::{ClaimTaskError, ClaimedTask, SweepTasksError};
+use backends::ClaimedTask;
 
 pub mod dispatcher;
 
@@ -81,20 +81,12 @@ pub trait ActivationStrategy: private::Sealed {
     type EffectivePayload: Send + Sync;
 
     #[doc(hidden)]
-    fn sweep_tasks<B, T>(
-        backend: &B,
-    ) -> impl Future<Output = Result<Vec<Self::DispatchToken>, SweepTasksError>> + Send
-    where
-        B: Backend,
-        T: TaskDefinition<Trigger = Self>;
-
-    #[doc(hidden)]
     fn claim_task<B, T>(
         backend: &B,
         worker_id: u64,
         dispatch_token: Self::DispatchToken,
         lease_expiration: Instant,
-    ) -> impl Future<Output = Result<ClaimedTask<Self::EffectivePayload>, ClaimTaskError>> + Send
+    ) -> impl Future<Output = Result<ClaimedTask<Self::EffectivePayload>, backends::ClaimTaskError>> + Send
     where
         B: Backend,
         T: TaskDefinition<Trigger = Self>;
@@ -109,6 +101,27 @@ pub trait PublishActivationStrategy: ActivationStrategy {
     type Payload: Serialize + DeserializeOwned + Send + Sync;
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TaskFailure {
+    pub available_from: Option<Instant>,
+}
+
+impl TaskFailure {
+    pub fn retry_immediately() -> Self {
+        Self {
+            available_from: None,
+        }
+    }
+
+    pub fn retry_at(available_from: Instant) -> Self {
+        Self {
+            available_from: Some(available_from),
+        }
+    }
+}
+
+pub type TaskResult<T> = Result<T, TaskFailure>;
+
 pub trait Worker: Send {
     type Task: TaskDefinition;
 
@@ -116,7 +129,7 @@ pub trait Worker: Send {
         self,
         task_id: u64,
         task_payload: <<Self::Task as TaskDefinition>::Trigger as ActivationStrategy>::EffectivePayload,
-    ) -> impl Future<Output = <Self::Task as TaskDefinition>::Callback> + Send;
+    ) -> impl Future<Output = TaskResult<<Self::Task as TaskDefinition>::Callback>> + Send;
 }
 
 pub trait WorkerFactory: Send + Sync {
@@ -181,6 +194,13 @@ where
     payload_type: PhantomData<Payload>,
 }
 
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublishDispatchToken {
+    Task(u64),
+    EarliestAvailable,
+}
+
 impl<Payload> private::Sealed for PublishTrigger<Payload> where
     Payload: Serialize + DeserializeOwned + Send + Sync
 {
@@ -190,29 +210,31 @@ impl<Payload> ActivationStrategy for PublishTrigger<Payload>
 where
     Payload: Serialize + DeserializeOwned + Send + Sync,
 {
-    type DispatchToken = u64;
+    type DispatchToken = PublishDispatchToken;
     type EffectivePayload = Payload;
 
-    async fn sweep_tasks<B, T>(backend: &B) -> Result<Vec<Self::DispatchToken>, SweepTasksError>
-    where
-        B: Backend,
-        T: TaskDefinition<Trigger = Self>,
-    {
-        let swept_tasks = backend.sweep::<T>().await?;
-        Ok(swept_tasks.into_iter().map(|task| task.task_id).collect())
-    }
-
-    fn claim_task<B, T>(
+    async fn claim_task<B, T>(
         backend: &B,
         worker_id: u64,
         dispatch_token: Self::DispatchToken,
         lease_expiration: Instant,
-    ) -> impl Future<Output = Result<ClaimedTask<Self::EffectivePayload>, ClaimTaskError>> + Send
+    ) -> Result<ClaimedTask<Self::EffectivePayload>, backends::ClaimTaskError>
     where
         B: Backend,
         T: TaskDefinition<Trigger = Self>,
     {
-        backend.claim_published::<T>(worker_id, dispatch_token, lease_expiration)
+        match dispatch_token {
+            PublishDispatchToken::Task(task_id) => {
+                backend
+                    .claim_published::<T>(worker_id, task_id, lease_expiration)
+                    .await
+            }
+            PublishDispatchToken::EarliestAvailable => {
+                backend
+                    .claim_earliest_published::<T>(worker_id, lease_expiration)
+                    .await
+            }
+        }
     }
 }
 
@@ -239,20 +261,12 @@ impl ActivationStrategy for SingletonTrigger {
     type DispatchToken = ();
     type EffectivePayload = ();
 
-    async fn sweep_tasks<B, T>(_backend: &B) -> Result<Vec<Self::DispatchToken>, SweepTasksError>
-    where
-        B: Backend,
-        T: TaskDefinition<Trigger = Self>,
-    {
-        Ok(vec![()])
-    }
-
     fn claim_task<B, T>(
         backend: &B,
         worker_id: u64,
         _dispatch_token: Self::DispatchToken,
         lease_expiration: Instant,
-    ) -> impl Future<Output = Result<ClaimedTask<Self::EffectivePayload>, ClaimTaskError>> + Send
+    ) -> impl Future<Output = Result<ClaimedTask<Self::EffectivePayload>, backends::ClaimTaskError>> + Send
     where
         B: Backend,
         T: TaskDefinition<Trigger = Self>,

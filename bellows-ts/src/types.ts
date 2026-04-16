@@ -84,11 +84,8 @@ export function defineSingletonTask<TCallback = undefined>(
 
 export interface BackendSignal {
   readonly type: "new-task-available";
-  readonly taskId: number;
-}
-
-export interface SweptTask {
-  readonly taskId: number;
+  readonly taskId: number | null;
+  readonly availableFromMs: number;
 }
 
 export interface PublishedTask {
@@ -105,6 +102,10 @@ export interface RenewedTaskLease {
   readonly newExpirationMs: number;
 }
 
+export interface FailedTask {
+  readonly taskId: number;
+}
+
 export interface FinishedTask {
   readonly taskId: number;
 }
@@ -118,16 +119,27 @@ export class TaskLeasedError extends Error {
   }
 }
 
+export class TaskUnavailableError extends Error {
+  constructor(readonly availableFromMs: number | null) {
+    super(
+      availableFromMs === null
+        ? "no task is currently available"
+        : `no task is currently available; next availability is ${new Date(availableFromMs).toISOString()}`,
+    );
+    this.name = "TaskUnavailableError";
+  }
+}
+
 export class TaskNotFoundError extends Error {
   constructor() {
-    super("task not found");
+    super("task was not found");
     this.name = "TaskNotFoundError";
   }
 }
 
 export class LeaseLostError extends Error {
   constructor() {
-    super("task lease lost");
+    super("task lease was lost");
     this.name = "LeaseLostError";
   }
 }
@@ -156,9 +168,22 @@ export class AwaitableTask<TCallback> {
   }
 }
 
+export class TaskFailure {
+  constructor(readonly availableFromMs: number | null) {}
+
+  static retryImmediately(): TaskFailure {
+    return new TaskFailure(null);
+  }
+
+  static retryAt(availableFromMs: number): TaskFailure {
+    return new TaskFailure(availableFromMs);
+  }
+}
+
+export type TaskResult<TCallback> = TCallback | TaskFailure;
+
 export interface Backend {
   subscribe(task: TaskDefinition): Promise<BackendSignalSubscription>;
-  sweep(task: TaskDefinition): Promise<SweptTask[]>;
   publish<TPayload, TCallback>(
     task: PublishTaskDefinition<TPayload, TCallback>,
     payload: TPayload,
@@ -173,6 +198,11 @@ export interface Backend {
     taskId: number,
     leaseExpirationMs: number,
   ): Promise<ClaimedTask<TPayload>>;
+  claimEarliestPublished<TPayload, TCallback>(
+    task: PublishTaskDefinition<TPayload, TCallback>,
+    workerId: number,
+    leaseExpirationMs: number,
+  ): Promise<ClaimedTask<TPayload>>;
   claimSingleton<TCallback>(
     task: SingletonTaskDefinition<TCallback>,
     workerId: number,
@@ -183,6 +213,11 @@ export interface Backend {
     taskId: number,
     leaseExpirationMs: number,
   ): Promise<RenewedTaskLease>;
+  fail(
+    workerId: number,
+    taskId: number,
+    availableFromMs: number | null,
+  ): Promise<FailedTask>;
   finish<TTask extends TaskDefinition>(
     task: TTask,
     workerId: number,
@@ -195,7 +230,7 @@ export interface Worker<TTask extends TaskDefinition> {
   process(
     taskId: number,
     taskPayload: TaskPayload<TTask>,
-  ): Promise<TaskCallback<TTask>>;
+  ): Promise<TaskResult<TaskCallback<TTask>>>;
 }
 
 export interface WorkerFactory<TTask extends TaskDefinition> {
