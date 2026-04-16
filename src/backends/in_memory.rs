@@ -135,7 +135,20 @@ impl Backend for InMemoryBackend {
         T: TaskDefinition,
         T::Trigger: PublishActivationStrategy,
     {
-        self.publish_impl::<T>(payload, None).await
+        self.publish_impl::<T>(payload, None, None).await
+    }
+
+    async fn publish_future<T>(
+        &self,
+        payload: <<T as TaskDefinition>::Trigger as PublishActivationStrategy>::Payload,
+        available_from: Instant,
+    ) -> Result<PublishedTask, PublishTaskError>
+    where
+        T: TaskDefinition,
+        T::Trigger: PublishActivationStrategy,
+    {
+        self.publish_impl::<T>(payload, None, Some(available_from))
+            .await
     }
 
     async fn publish_awaitable<T>(
@@ -151,6 +164,7 @@ impl Backend for InMemoryBackend {
             .publish_impl::<T>(
                 payload,
                 Some(Box::new(TypedCallbackSink { tx: callback_tx })),
+                None,
             )
             .await?;
 
@@ -419,6 +433,7 @@ impl InMemoryBackend {
         &self,
         payload: <<T as TaskDefinition>::Trigger as PublishActivationStrategy>::Payload,
         callback_sink: Option<Box<dyn CallbackSink>>,
+        available_from: Option<Instant>,
     ) -> Result<PublishedTask, PublishTaskError>
     where
         T: TaskDefinition,
@@ -435,6 +450,7 @@ impl InMemoryBackend {
                 task_name: T::NAME,
                 payload_json,
                 callback_sink,
+                available_from,
                 callback: callback_tx,
             }))
             .map_err(|_| {
@@ -528,7 +544,7 @@ impl Daemon {
                 payload_json: args.payload_json,
                 callback_id,
                 worker_id: None,
-                available_from: None,
+                available_from: args.available_from,
                 kind: TaskKind::Published,
             },
         );
@@ -537,7 +553,7 @@ impl Daemon {
             args.task_name,
             BackendSignal::NewTaskAvailable(NewTaskAvailableSignalPayload {
                 task_id: Some(task_id),
-                available_from: Instant::now(),
+                available_from: args.available_from.unwrap_or_else(Instant::now),
             }),
         );
 
@@ -863,6 +879,7 @@ struct PublishTaskArgs {
     task_name: &'static str,
     payload_json: String,
     callback_sink: Option<Box<dyn CallbackSink>>,
+    available_from: Option<Instant>,
     callback: OneshotSender<PublishTaskReturn>,
 }
 

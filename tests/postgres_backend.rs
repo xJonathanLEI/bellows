@@ -331,6 +331,43 @@ async fn test_postgres_publish_awaitable_returns_typed_callback() {
 }
 
 #[tokio::test]
+async fn test_postgres_publish_future_delays_task_availability() {
+    let database = TestDatabase::new("future_publish").await;
+    let backend = PostgresBackend::connect(database.url()).await.unwrap();
+    backend.initialize().await.unwrap();
+    let (processed_tx, mut processed_rx) = tokio::sync::mpsc::unbounded_channel();
+    let dispatcher = WorkerDispatcher::new(backend.clone(), EchoWorkerFactory { processed_tx });
+    let dispatcher_handle = dispatcher.launch().await.unwrap();
+
+    let published = backend
+        .publish_future::<EchoTaskSpec>(
+            EchoTaskPayload {
+                name: "Alice".to_string(),
+            },
+            std::time::Instant::now() + std::time::Duration::from_millis(200),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), processed_rx.recv())
+            .await
+            .is_err()
+    );
+
+    let processed = tokio::time::timeout(std::time::Duration::from_secs(1), processed_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(processed.task_id, published.task_id);
+    assert_eq!(processed.name, "Alice");
+
+    dispatcher_handle.drain().await;
+    database.cleanup().await;
+}
+
+#[tokio::test]
 async fn test_postgres_publish_awaitable_supports_unit_callback() {
     let database = TestDatabase::new("awaitable_unit").await;
     let backend = PostgresBackend::connect(database.url()).await.unwrap();

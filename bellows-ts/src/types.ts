@@ -188,6 +188,11 @@ export interface Backend {
     task: PublishTaskDefinition<TPayload, TCallback>,
     payload: TPayload,
   ): Promise<PublishedTask>;
+  publishFuture<TPayload, TCallback>(
+    task: PublishTaskDefinition<TPayload, TCallback>,
+    payload: TPayload,
+    availableFromMs: number,
+  ): Promise<PublishedTask>;
   publishAwaitable<TPayload, TCallback>(
     task: PublishTaskDefinition<TPayload, TCallback>,
     payload: TPayload,

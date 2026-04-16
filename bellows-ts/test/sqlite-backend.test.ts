@@ -95,6 +95,33 @@ test("sqlite publish awaitable supports unit callback", async () => {
   await dispatcherHandle.drain();
 });
 
+test("sqlite publish future delays task availability", async () => {
+  const database = track(new TestSqliteDatabase());
+  const backend = track(await SqliteBackend.connect(database.url));
+  await backend.initialize();
+  const processed = track(new AsyncChannel<ProcessedTask>());
+
+  const dispatcher = new WorkerDispatcher(
+    backend,
+    createEchoWorkerFactory(processed),
+  );
+  const dispatcherHandle = await dispatcher.launch();
+
+  const published = await backend.publishFuture(
+    echoTask,
+    { name: "Alice" },
+    Date.now() + 200,
+  );
+
+  await sleep(50);
+  expect(processed.tryRecv()).toBeNull();
+
+  const received = await recvWithTimeout(processed);
+  expect(received).toEqual({ taskId: published.taskId, name: "Alice" });
+
+  await dispatcherHandle.drain();
+});
+
 test("sqlite singleton task dispatch", async () => {
   const database = track(new TestSqliteDatabase());
   const backend = track(await SqliteBackend.connect(database.url));
@@ -313,4 +340,10 @@ function track<
     },
   });
   return resource;
+}
+
+async function sleep(ms: number): Promise<void> {
+  await new Promise<void>((resolve) => {
+    setTimeout(resolve, ms);
+  });
 }

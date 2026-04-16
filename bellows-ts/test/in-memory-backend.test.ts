@@ -88,6 +88,31 @@ test("in-memory publish awaitable supports unit callback", async () => {
   await dispatcherHandle.drain();
 });
 
+test("in-memory publish future delays task availability", async () => {
+  const backend = new InMemoryBackend();
+  const processed = track(new AsyncChannel<ProcessedTask>());
+
+  const dispatcher = new WorkerDispatcher(
+    backend,
+    createEchoWorkerFactory(processed),
+  );
+  const dispatcherHandle = await dispatcher.launch();
+
+  const published = await backend.publishFuture(
+    echoTask,
+    { name: "Alice" },
+    Date.now() + 200,
+  );
+
+  await sleep(50);
+  expect(processed.tryRecv()).toBeNull();
+
+  const received = await recvWithTimeout(processed);
+  expect(received).toEqual({ taskId: published.taskId, name: "Alice" });
+
+  await dispatcherHandle.drain();
+});
+
 test("in-memory singleton task dispatch", async () => {
   const backend = new InMemoryBackend();
   const processed = track(new AsyncChannel<number>());
@@ -290,4 +315,10 @@ async function recvWithTimeout<T>(channel: AsyncChannel<T>): Promise<T> {
 function track<T>(channel: AsyncChannel<T>): AsyncChannel<T> {
   channelsToClose.push(channel as AsyncChannel<unknown>);
   return channel;
+}
+
+async function sleep(ms: number): Promise<void> {
+  await new Promise<void>((resolve) => {
+    setTimeout(resolve, ms);
+  });
 }

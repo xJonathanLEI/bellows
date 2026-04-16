@@ -135,7 +135,15 @@ export class PostgresBackend implements Backend {
     task: PublishTaskDefinition<TPayload, TCallback>,
     payload: TPayload,
   ): Promise<PublishedTask> {
-    return await this.publishInternal(task, payload, null);
+    return await this.publishInternal(task, payload, null, null);
+  }
+
+  async publishFuture<TPayload, TCallback>(
+    task: PublishTaskDefinition<TPayload, TCallback>,
+    payload: TPayload,
+    availableFromMs: number,
+  ): Promise<PublishedTask> {
+    return await this.publishInternal(task, payload, null, availableFromMs);
   }
 
   async publishAwaitable<TPayload, TCallback>(
@@ -149,7 +157,12 @@ export class PostgresBackend implements Backend {
     this.callbacks.set(callbackId, callbackSink);
 
     try {
-      const published = await this.publishInternal(task, payload, callbackId);
+      const published = await this.publishInternal(
+        task,
+        payload,
+        callbackId,
+        null,
+      );
       return new AwaitableTask(published.taskId, callbackPromise);
     } catch (error) {
       this.callbacks.get(callbackId)?.drop();
@@ -445,6 +458,7 @@ RETURNING callback_id
     task: PublishTaskDefinition<TPayload, TCallback>,
     payload: TPayload,
     callbackId: string | null,
+    availableFromMs: number | null,
   ): Promise<PublishedTask> {
     const result = await this.pool.query<{ task_id: string }>(
       `
@@ -456,10 +470,10 @@ INSERT INTO bellows_tasks (
     lease_worker_id,
     available_from_unix_ms
 )
-VALUES ($1, NULL, $2, $3, NULL, NULL)
+VALUES ($1, NULL, $2, $3, NULL, $4)
 RETURNING task_id::text AS task_id
       `,
-      [task.name, task.codec.encode(payload), callbackId],
+      [task.name, task.codec.encode(payload), callbackId, availableFromMs],
     );
 
     return { taskId: Number(result.rows[0].task_id) };

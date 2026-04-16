@@ -6,6 +6,7 @@
     "test": "pnpm -r test",
     "lint": "biome lint .",
     "check": "biome check .",
+    "check:fix": "biome check . --fix",
     "typecheck": "pnpm -r typecheck"
   },
   "devDependencies": {

@@ -50,6 +50,16 @@ pub trait Backend: Clone + Send + Sync {
         T: TaskDefinition,
         T::Trigger: PublishActivationStrategy;
 
+    /// Publishes a task to become available for processing at a specific time.
+    fn publish_future<T>(
+        &self,
+        payload: <<T as TaskDefinition>::Trigger as PublishActivationStrategy>::Payload,
+        available_from: Instant,
+    ) -> impl Future<Output = Result<PublishedTask, PublishTaskError>> + Send
+    where
+        T: TaskDefinition,
+        T::Trigger: PublishActivationStrategy;
+
     /// Publishes a task and returns a typed handle that can await the worker callback payload.
     fn publish_awaitable<T>(
         &self,

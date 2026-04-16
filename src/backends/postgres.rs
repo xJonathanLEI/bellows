@@ -248,6 +248,7 @@ impl PostgresBackend {
         &self,
         payload: <<T as TaskDefinition>::Trigger as PublishActivationStrategy>::Payload,
         callback_id: Option<i64>,
+        available_from: Option<Instant>,
     ) -> Result<PublishedTask, PublishTaskError>
     where
         T: TaskDefinition,
@@ -256,6 +257,10 @@ impl PostgresBackend {
         let payload_json = serde_json::to_string(&payload).map_err(|err| {
             PublishTaskError::Backend(Box::new(PostgresBackendError::PayloadSerialization(err)))
         })?;
+
+        let now_system = SystemTime::now();
+        let available_from_unix_ms =
+            available_from.map(|available_from| instant_to_unix_ms(available_from, now_system));
 
         let row = sqlx::query(
             r#"
@@ -267,13 +272,14 @@ INSERT INTO bellows_tasks (
     lease_worker_id,
     available_from_unix_ms
 )
-VALUES ($1, NULL, $2, $3, NULL, NULL)
+VALUES ($1, NULL, $2, $3, NULL, $4)
 RETURNING task_id
 "#,
         )
         .bind(T::NAME)
         .bind(payload_json)
         .bind(callback_id)
+        .bind(available_from_unix_ms)
         .fetch_one(&self.pool)
         .await;
 
@@ -318,7 +324,20 @@ impl Backend for PostgresBackend {
         T: TaskDefinition,
         T::Trigger: PublishActivationStrategy,
     {
-        self.publish_impl::<T>(payload, None).await
+        self.publish_impl::<T>(payload, None, None).await
+    }
+
+    async fn publish_future<T>(
+        &self,
+        payload: <<T as TaskDefinition>::Trigger as PublishActivationStrategy>::Payload,
+        available_from: Instant,
+    ) -> Result<PublishedTask, PublishTaskError>
+    where
+        T: TaskDefinition,
+        T::Trigger: PublishActivationStrategy,
+    {
+        self.publish_impl::<T>(payload, None, Some(available_from))
+            .await
     }
 
     async fn publish_awaitable<T>(
@@ -330,7 +349,9 @@ impl Backend for PostgresBackend {
         T::Trigger: PublishActivationStrategy,
     {
         let (callback_id, callback_rx) = self.reserve_callback::<T::Callback>();
-        let published = self.publish_impl::<T>(payload, Some(callback_id)).await?;
+        let published = self
+            .publish_impl::<T>(payload, Some(callback_id), None)
+            .await?;
         Ok(AwaitableTask::new(published.task_id, callback_rx))
     }
 

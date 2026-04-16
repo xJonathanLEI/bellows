@@ -76,7 +76,15 @@ export class SqliteBackend implements Backend {
     task: PublishTaskDefinition<TPayload, TCallback>,
     payload: TPayload,
   ): Promise<PublishedTask> {
-    return await this.publishInternal(task, payload, null);
+    return await this.publishInternal(task, payload, null, null);
+  }
+
+  async publishFuture<TPayload, TCallback>(
+    task: PublishTaskDefinition<TPayload, TCallback>,
+    payload: TPayload,
+    availableFromMs: number,
+  ): Promise<PublishedTask> {
+    return await this.publishInternal(task, payload, null, availableFromMs);
   }
 
   async publishAwaitable<TPayload, TCallback>(
@@ -90,7 +98,12 @@ export class SqliteBackend implements Backend {
     this.callbacks.set(callbackId, callbackSink);
 
     try {
-      const published = await this.publishInternal(task, payload, callbackId);
+      const published = await this.publishInternal(
+        task,
+        payload,
+        callbackId,
+        null,
+      );
       return new AwaitableTask(published.taskId, callbackPromise);
     } catch (error) {
       this.callbacks.get(callbackId)?.drop();
@@ -412,6 +425,7 @@ RETURNING callback_id
     task: PublishTaskDefinition<TPayload, TCallback>,
     payload: TPayload,
     callbackId: string | null,
+    availableFromMs: number | null,
   ): Promise<PublishedTask> {
     const result = this.database
       .prepare(
@@ -424,13 +438,13 @@ INSERT INTO bellows_tasks (
     lease_worker_id,
     available_from_unix_ms
 )
-VALUES (?, NULL, ?, ?, NULL, NULL)
+VALUES (?, NULL, ?, ?, NULL, ?)
         `,
       )
-      .run(task.name, task.codec.encode(payload), callbackId);
+      .run(task.name, task.codec.encode(payload), callbackId, availableFromMs);
 
     const taskId = Number(result.lastInsertRowid);
-    this.emitSignal(task.name, taskId, null);
+    this.emitSignal(task.name, taskId, availableFromMs);
     return { taskId };
   }
 

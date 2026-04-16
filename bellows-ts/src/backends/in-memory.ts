@@ -66,7 +66,15 @@ export class InMemoryBackend implements Backend {
     task: PublishTaskDefinition<TPayload, TCallback>,
     payload: TPayload,
   ): Promise<PublishedTask> {
-    return await this.publishInternal(task, payload, null);
+    return await this.publishInternal(task, payload, null, null);
+  }
+
+  async publishFuture<TPayload, TCallback>(
+    task: PublishTaskDefinition<TPayload, TCallback>,
+    payload: TPayload,
+    availableFromMs: number,
+  ): Promise<PublishedTask> {
+    return await this.publishInternal(task, payload, null, availableFromMs);
   }
 
   async publishAwaitable<TPayload, TCallback>(
@@ -81,7 +89,12 @@ export class InMemoryBackend implements Backend {
     this.callbacks.set(callbackId, callbackSink);
 
     try {
-      const published = await this.publishInternal(task, payload, callbackId);
+      const published = await this.publishInternal(
+        task,
+        payload,
+        callbackId,
+        null,
+      );
       return new AwaitableTask(published.taskId, callbackPromise);
     } catch (error) {
       this.callbacks.get(callbackId)?.drop();
@@ -226,6 +239,7 @@ export class InMemoryBackend implements Backend {
     task: PublishTaskDefinition<TPayload, TCallback>,
     payload: TPayload,
     callbackId: string | null,
+    availableFromMs: number | null,
   ): Promise<PublishedTask> {
     const taskId = this.nextTaskId;
     this.nextTaskId += 1;
@@ -236,10 +250,15 @@ export class InMemoryBackend implements Backend {
         task.codec.encode(payload),
         callbackId,
         "publish",
+        null,
+        availableFromMs,
       ),
     );
 
-    this.emitSignal(task.name, newTaskAvailable(taskId, Date.now()));
+    this.emitSignal(
+      task.name,
+      newTaskAvailable(taskId, availableFromMs ?? Date.now()),
+    );
 
     return { taskId };
   }
