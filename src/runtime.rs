@@ -4,7 +4,7 @@ use std::{
 };
 
 use crate::{
-    ActivationStrategy, Backend, TaskDefinition, Worker, WorkerFactory,
+    ActivationStrategy, Backend, TaskDefinition, TaskSuccess, Worker, WorkerFactory,
     backends::{ClaimTaskError, FailTaskError, FinishTaskError, RenewTaskError},
 };
 use tokio::sync::mpsc::UnboundedSender as MpscSender;
@@ -213,10 +213,10 @@ where
                     },
                     join_result = &mut worker_handle => {
                         match join_result {
-                            Ok(Ok(callback_payload)) => (
+                            Ok(Ok(task_success)) => (
                                 DaemonStatus::WorkerFinishedProcessing {
                                     task_id,
-                                    callback_payload,
+                                    task_success,
                                 },
                                 EventLoopResult::Continue,
                                 None,
@@ -286,14 +286,15 @@ where
             }
             DaemonStatus::WorkerFinishedProcessing {
                 task_id,
-                callback_payload,
+                task_success,
             } => {
                 match self
                     .backend
                     .finish::<<F::Worker as Worker>::Task>(
                         self.worker_id,
                         task_id,
-                        callback_payload,
+                        task_success.callback_payload,
+                        task_success.available_from,
                     )
                     .await
                 {
@@ -368,7 +369,7 @@ where
     /// The worker future completed successfully and the task should be finalized in the backend.
     WorkerFinishedProcessing {
         task_id: u64,
-        callback_payload: T::Callback,
+        task_success: TaskSuccess<T::Callback>,
     },
     /// The worker runtime is done.
     WorkerExited,

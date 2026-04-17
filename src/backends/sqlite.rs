@@ -821,6 +821,7 @@ RETURNING task_name
         worker_id: u64,
         task_id: u64,
         callback_payload: T::Callback,
+        available_from: Option<Instant>,
     ) -> Result<FinishedTask, FinishTaskError>
     where
         T: TaskDefinition,
@@ -834,85 +835,152 @@ RETURNING task_name
         let callback_payload_json = serde_json::to_string(&callback_payload).map_err(|err| {
             FinishTaskError::Backend(Box::new(SqliteBackendError::CallbackSerialization(err)))
         })?;
+        let now_system = SystemTime::now();
+        let available_from_unix_ms =
+            available_from.map(|available_from| instant_to_unix_ms(available_from, now_system));
 
-        match <T::Trigger as crate::ActivationStrategy>::KIND {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|err| FinishTaskError::Backend(Box::new(SqliteBackendError::Sqlx(err))))?;
+
+        let finished_row = match <T::Trigger as crate::ActivationStrategy>::KIND {
             crate::ActivationStrategyKind::Singleton => {
-                let cleared_singleton_task = sqlx::query(
+                let claimed = sqlx::query(
                     r#"
-UPDATE bellows_tasks
-SET lease_worker_id = NULL,
-    available_from_unix_ms = NULL
+SELECT task_name, callback_id
+FROM bellows_tasks
 WHERE task_id = ?
   AND lease_worker_id = ?
   AND task_unique_key IS NOT NULL
-RETURNING task_name, callback_id
 "#,
                 )
                 .bind(task_id_db)
                 .bind(worker_id_db)
-                .fetch_optional(&self.pool)
+                .fetch_optional(&mut *tx)
                 .await
                 .map_err(|err| FinishTaskError::Backend(Box::new(SqliteBackendError::Sqlx(err))))?;
 
-                let Some(cleared_singleton_task) = cleared_singleton_task else {
+                let Some(claimed) = claimed else {
+                    tx.rollback().await.ok();
                     return Err(FinishTaskError::LeaseLost);
                 };
 
-                let task_name = cleared_singleton_task.get::<String, _>("task_name");
-                let callback_id = cleared_singleton_task.get::<Option<i64>, _>("callback_id");
+                sqlx::query(
+                    r#"
+UPDATE bellows_tasks
+SET lease_worker_id = NULL,
+    callback_id = NULL,
+    available_from_unix_ms = ?
+WHERE task_id = ?
+  AND lease_worker_id = ?
+"#,
+                )
+                .bind(available_from_unix_ms)
+                .bind(task_id_db)
+                .bind(worker_id_db)
+                .execute(&mut *tx)
+                .await
+                .map_err(|err| FinishTaskError::Backend(Box::new(SqliteBackendError::Sqlx(err))))?;
 
-                if let Some(callback_id) = callback_id
-                    && let Ok(callback_id) = u64::try_from(callback_id)
-                {
-                    self.deliver_callback(callback_id, callback_payload_json);
-                }
+                Some(claimed)
+            }
+            crate::ActivationStrategyKind::Publish if available_from.is_some() => {
+                let claimed = sqlx::query(
+                    r#"
+SELECT task_name, callback_id
+FROM bellows_tasks
+WHERE task_id = ?
+  AND lease_worker_id = ?
+  AND task_unique_key IS NULL
+"#,
+                )
+                .bind(task_id_db)
+                .bind(worker_id_db)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|err| FinishTaskError::Backend(Box::new(SqliteBackendError::Sqlx(err))))?;
 
-                let registered_task_name = {
-                    self.shared
-                        .signals
-                        .lock()
-                        .expect("sqlite backend signal registry mutex should not be poisoned")
-                        .keys()
-                        .copied()
-                        .find(|registered_task_name| **registered_task_name == task_name)
+                let Some(claimed) = claimed else {
+                    tx.rollback().await.ok();
+                    return Err(FinishTaskError::LeaseLost);
                 };
 
-                if let Some(task_name) = registered_task_name {
-                    self.emit_signal(task_name, task_id, None);
-                }
-
-                Ok(FinishedTask { task_id })
-            }
-            crate::ActivationStrategyKind::Publish => {
-                let deleted_published_task = sqlx::query(
+                sqlx::query(
                     r#"
+UPDATE bellows_tasks
+SET lease_worker_id = NULL,
+    callback_id = NULL,
+    available_from_unix_ms = ?
+WHERE task_id = ?
+  AND lease_worker_id = ?
+"#,
+                )
+                .bind(available_from_unix_ms)
+                .bind(task_id_db)
+                .bind(worker_id_db)
+                .execute(&mut *tx)
+                .await
+                .map_err(|err| FinishTaskError::Backend(Box::new(SqliteBackendError::Sqlx(err))))?;
+
+                Some(claimed)
+            }
+            crate::ActivationStrategyKind::Publish => sqlx::query(
+                r#"
 DELETE FROM bellows_tasks
 WHERE task_id = ?
   AND lease_worker_id = ?
   AND task_unique_key IS NULL
-RETURNING callback_id
+RETURNING task_name, callback_id
 "#,
-                )
-                .bind(task_id_db)
-                .bind(worker_id_db)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(|err| FinishTaskError::Backend(Box::new(SqliteBackendError::Sqlx(err))))?;
+            )
+            .bind(task_id_db)
+            .bind(worker_id_db)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|err| FinishTaskError::Backend(Box::new(SqliteBackendError::Sqlx(err))))?,
+        };
 
-                let Some(deleted_published_task) = deleted_published_task else {
-                    return Err(FinishTaskError::LeaseLost);
-                };
+        let Some(finished_row) = finished_row else {
+            tx.rollback().await.ok();
+            return Err(FinishTaskError::LeaseLost);
+        };
 
-                if let Some(callback_id) =
-                    deleted_published_task.get::<Option<i64>, _>("callback_id")
-                    && let Ok(callback_id) = u64::try_from(callback_id)
-                {
-                    self.deliver_callback(callback_id, callback_payload_json);
-                }
+        tx.commit()
+            .await
+            .map_err(|err| FinishTaskError::Backend(Box::new(SqliteBackendError::Sqlx(err))))?;
 
-                Ok(FinishedTask { task_id })
+        let task_name = finished_row.get::<String, _>("task_name");
+        let callback_id = finished_row.get::<Option<i64>, _>("callback_id");
+
+        if let Some(callback_id) = callback_id
+            && let Ok(callback_id) = u64::try_from(callback_id)
+        {
+            self.deliver_callback(callback_id, callback_payload_json);
+        }
+
+        if matches!(
+            <T::Trigger as crate::ActivationStrategy>::KIND,
+            crate::ActivationStrategyKind::Singleton
+        ) || available_from.is_some()
+        {
+            let registered_task_name = {
+                self.shared
+                    .signals
+                    .lock()
+                    .expect("sqlite backend signal registry mutex should not be poisoned")
+                    .keys()
+                    .copied()
+                    .find(|registered_task_name| **registered_task_name == task_name)
+            };
+
+            if let Some(task_name) = registered_task_name {
+                self.emit_signal(task_name, task_id, available_from);
             }
         }
+
+        Ok(FinishedTask { task_id })
     }
 }
 

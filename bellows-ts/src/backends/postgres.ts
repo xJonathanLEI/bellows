@@ -386,6 +386,7 @@ WHERE task_id = $2
     workerId: number,
     taskId: number,
     callbackPayload: TaskCallback<TTask>,
+    availableFromMs: number | null,
   ): Promise<FinishedTask> {
     const callbackPayloadJson = task.callbackCodec.encode(callbackPayload);
     const client = await this.pool.connect();
@@ -400,31 +401,70 @@ WHERE task_id = $2
                 callback_id: string | null;
               }>(
                 `
-UPDATE bellows_tasks
-SET lease_worker_id = NULL,
-    available_from_unix_ms = NULL
-WHERE task_id = $1
-  AND lease_worker_id = $2
-  AND task_unique_key IS NOT NULL
-RETURNING callback_id
+WITH claimed AS (
+    SELECT task_id, callback_id
+    FROM bellows_tasks
+    WHERE task_id = $1
+      AND lease_worker_id = $2
+      AND task_unique_key IS NOT NULL
+    FOR UPDATE
+), updated AS (
+    UPDATE bellows_tasks
+    SET lease_worker_id = NULL,
+        callback_id = NULL,
+        available_from_unix_ms = $3
+    WHERE task_id IN (SELECT task_id FROM claimed)
+    RETURNING task_id
+)
+SELECT claimed.callback_id
+FROM claimed
+JOIN updated ON updated.task_id = claimed.task_id
                 `,
-                [taskId, workerId],
+                [taskId, workerId, availableFromMs],
               )
             ).rows[0]
-          : (
-              await client.query<{
-                callback_id: string | null;
-              }>(
-                `
+          : availableFromMs !== null
+            ? (
+                await client.query<{
+                  callback_id: string | null;
+                }>(
+                  `
+WITH claimed AS (
+    SELECT task_id, callback_id
+    FROM bellows_tasks
+    WHERE task_id = $1
+      AND lease_worker_id = $2
+      AND task_unique_key IS NULL
+    FOR UPDATE
+), updated AS (
+    UPDATE bellows_tasks
+    SET lease_worker_id = NULL,
+        callback_id = NULL,
+        available_from_unix_ms = $3
+    WHERE task_id IN (SELECT task_id FROM claimed)
+    RETURNING task_id
+)
+SELECT claimed.callback_id
+FROM claimed
+JOIN updated ON updated.task_id = claimed.task_id
+                  `,
+                  [taskId, workerId, availableFromMs],
+                )
+              ).rows[0]
+            : (
+                await client.query<{
+                  callback_id: string | null;
+                }>(
+                  `
 DELETE FROM bellows_tasks
 WHERE task_id = $1
   AND lease_worker_id = $2
   AND task_unique_key IS NULL
 RETURNING callback_id
-                `,
-                [taskId, workerId],
-              )
-            ).rows[0];
+                  `,
+                  [taskId, workerId],
+                )
+              ).rows[0];
 
       if (!finishedRow) {
         await client.query("ROLLBACK");

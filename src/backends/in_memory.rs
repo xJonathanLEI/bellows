@@ -397,6 +397,7 @@ impl Backend for InMemoryBackend {
         worker_id: u64,
         task_id: u64,
         callback_payload: T::Callback,
+        available_from: Option<Instant>,
     ) -> Result<FinishedTask, FinishTaskError>
     where
         T: TaskDefinition,
@@ -411,6 +412,7 @@ impl Backend for InMemoryBackend {
                 worker_id,
                 task_id,
                 callback_payload_json,
+                available_from,
                 callback: callback_tx,
             }))
             .map_err(|_| {
@@ -753,15 +755,17 @@ impl Daemon {
                     .is_some_and(|worker_id| worker_id == args.worker_id);
 
                 if claim_owned_by_worker {
-                    let task = entry.get();
-                    if let Some(callback_id) = task.callback_id {
+                    if let Some(callback_id) = entry.get().callback_id {
                         callback_delivery = Some((callback_id, args.callback_payload_json));
                     }
 
-                    if matches!(entry.get().kind, TaskKind::Singleton) {
+                    if matches!(entry.get().kind, TaskKind::Singleton)
+                        || args.available_from.is_some()
+                    {
                         let task = entry.get_mut();
+                        task.callback_id = None;
                         task.worker_id = None;
-                        task.available_from = None;
+                        task.available_from = args.available_from;
                         signal = Some((task.task_name, task.signal_payload(args.task_id)));
                     } else {
                         entry.remove();
@@ -961,6 +965,7 @@ struct FinishTaskArgs {
     worker_id: u64,
     task_id: u64,
     callback_payload_json: String,
+    available_from: Option<Instant>,
     callback: OneshotSender<FinishTaskReturn>,
 }
 

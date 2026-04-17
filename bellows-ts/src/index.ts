@@ -26,5 +26,6 @@ export {
   TaskFailure,
   TaskLeasedError,
   TaskNotFoundError,
+  TaskSuccess,
   TaskUnavailableError,
 } from "./types.js";

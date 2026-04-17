@@ -130,11 +130,14 @@ pub trait Backend: Clone + Send + Sync {
     /// Backends must only allow completion by the current lease holder. A worker that still owns
     /// the lease may finish the task even if the lease has technically expired, as long as no
     /// other worker has taken ownership in the meantime.
+    ///
+    /// When `available_from` is present, the task is rescheduled instead of being removed.
     fn finish<T>(
         &self,
         worker_id: u64,
         task_id: u64,
         callback_payload: T::Callback,
+        available_from: Option<Instant>,
     ) -> impl Future<Output = Result<FinishedTask, FinishTaskError>> + Send
     where
         T: TaskDefinition;

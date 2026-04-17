@@ -113,6 +113,28 @@ pub trait PublishActivationStrategy: ActivationStrategy {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TaskSuccess<T> {
+    pub callback_payload: T,
+    pub available_from: Option<Instant>,
+}
+
+impl<T> TaskSuccess<T> {
+    pub fn done(callback_payload: T) -> Self {
+        Self {
+            callback_payload,
+            available_from: None,
+        }
+    }
+
+    pub fn schedule_next_run(callback_payload: T, available_from: Instant) -> Self {
+        Self {
+            callback_payload,
+            available_from: Some(available_from),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TaskFailure {
     pub available_from: Option<Instant>,
 }
@@ -131,7 +153,7 @@ impl TaskFailure {
     }
 }
 
-pub type TaskResult<T> = Result<T, TaskFailure>;
+pub type TaskResult<T> = Result<TaskSuccess<T>, TaskFailure>;
 
 pub trait Worker: Send {
     type Task: TaskDefinition;

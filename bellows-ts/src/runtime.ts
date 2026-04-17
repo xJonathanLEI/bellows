@@ -7,6 +7,7 @@ import {
   TaskLeasedError,
   TaskNotFoundError,
   type TaskPayload,
+  type TaskSuccess,
   TaskUnavailableError,
   type WorkerFactory,
 } from "./types.js";
@@ -108,9 +109,7 @@ export class WorkerRuntime<TTask extends TaskDefinition> {
 
     const workerPromise = this.factory
       .build(this.workerId)
-      .process(taskId, taskPayload) as Promise<
-      TaskFailure | TaskCallback<TTask>
-    >;
+      .process(taskId, taskPayload);
 
     const workerResult = await this.waitForWorker(taskId, workerPromise, {
       getLeaseExpirationMs: () => leaseExpirationMs,
@@ -145,7 +144,8 @@ export class WorkerRuntime<TTask extends TaskDefinition> {
         this.factory.task,
         this.workerId,
         taskId,
-        workerResult,
+        workerResult.callbackPayload,
+        workerResult.availableFromMs,
       );
     } catch (error) {
       if (!(error instanceof LeaseLostError)) {
@@ -158,12 +158,12 @@ export class WorkerRuntime<TTask extends TaskDefinition> {
 
   private async waitForWorker(
     taskId: number,
-    workerPromise: Promise<TaskFailure | TaskCallback<TTask>>,
+    workerPromise: Promise<TaskFailure | TaskSuccess<TaskCallback<TTask>>>,
     lease: {
       getLeaseExpirationMs: () => number;
       setLeaseExpirationMs: (leaseExpirationMs: number) => void;
     },
-  ): Promise<TaskFailure | TaskCallback<TTask> | null> {
+  ): Promise<TaskFailure | TaskSuccess<TaskCallback<TTask>> | null> {
     while (true) {
       const renewalDelayMs = Math.max(
         lease.getLeaseExpirationMs() - LEASE_RENEWAL_THRESHOLD_MS - Date.now(),

@@ -4,6 +4,7 @@ import {
   definePublishTask,
   defineSingletonTask,
   TaskFailure,
+  TaskSuccess,
   WorkerDispatcher,
   type WorkerFactory,
 } from "../src/index.js";
@@ -20,6 +21,11 @@ const ackTask = definePublishTask<void>("ack");
 const singletonTask = defineSingletonTask("singleton_echo");
 const blockingTask = definePublishTask<void>("blocking");
 const retryTask = definePublishTask<void>("retry_once");
+
+const reschedulingPublishedTask = definePublishTask<void, number>(
+  "rescheduling_published",
+);
+const scheduledSingletonTask = defineSingletonTask("scheduled_singleton");
 
 const resources: Array<{ close: () => Promise<void> | void }> = [];
 
@@ -226,6 +232,78 @@ test("worker failure is retried", async () => {
   await dispatcherHandle.drain();
 });
 
+test("successful published task can schedule next run", async () => {
+  const database = track(new TestSqliteDatabase());
+  const backend = track(await SqliteBackend.connect(database.url));
+  await backend.initialize();
+  const processed = track(new AsyncChannel<number>());
+  let attempts = 0;
+  const nextRunAtMs = Date.now() + 200;
+
+  const dispatcher = new WorkerDispatcher(
+    backend,
+    createReschedulingPublishedWorkerFactory(
+      processed,
+      () => attempts++,
+      nextRunAtMs,
+    ),
+  );
+  const dispatcherHandle = await dispatcher.launch();
+
+  const awaitableTask = await backend.publishAwaitable(
+    reschedulingPublishedTask,
+    undefined,
+  );
+
+  const firstTaskId = await recvWithTimeout(processed);
+  expect(await awaitableTask.wait()).toBe(firstTaskId);
+
+  await sleep(50);
+  expect(processed.tryRecv()).toBeNull();
+
+  const secondTaskId = await recvWithTimeout(processed);
+  expect(secondTaskId).toBe(firstTaskId);
+  expect(attempts).toBe(2);
+
+  await dispatcherHandle.drain();
+});
+
+test("successful singleton task can schedule next run", async () => {
+  const database = track(new TestSqliteDatabase());
+  const backend = track(await SqliteBackend.connect(database.url));
+  await backend.initialize();
+  const processed = track(new AsyncChannel<number>());
+  const gate = new Gate();
+  let attempts = 0;
+  const nextRunAtMs = Date.now() + 200;
+
+  const dispatcher = new WorkerDispatcher(
+    backend,
+    createScheduledSingletonWorkerFactory(
+      processed,
+      gate,
+      () => attempts++,
+      nextRunAtMs,
+    ),
+  );
+  const dispatcherHandle = await dispatcher.launch();
+
+  const firstTaskId = await recvWithTimeout(processed);
+
+  await sleep(50);
+  expect(processed.tryRecv()).toBeNull();
+
+  const secondTaskId = await recvWithTimeout(processed);
+  expect(secondTaskId).toBe(firstTaskId);
+  expect(attempts).toBe(2);
+
+  const drainPromise = dispatcherHandle.drain();
+  gate.release();
+  await drainPromise;
+
+  expect(processed.tryRecv()).toBeNull();
+});
+
 function createEchoWorkerFactory(
   processed: AsyncChannel<ProcessedTask>,
 ): WorkerFactory<typeof echoTask> {
@@ -235,7 +313,7 @@ function createEchoWorkerFactory(
       return {
         async process(taskId, taskPayload) {
           processed.send({ taskId, name: taskPayload.name });
-          return taskPayload.name;
+          return TaskSuccess.done(taskPayload.name);
         },
       };
     },
@@ -251,7 +329,7 @@ function createAckWorkerFactory(
       return {
         async process(taskId) {
           processed.send(taskId);
-          return undefined;
+          return TaskSuccess.done(undefined);
         },
       };
     },
@@ -269,7 +347,7 @@ function createSingletonWorkerFactory(
         async process(taskId) {
           processed.send(taskId);
           await gate.wait();
-          return undefined;
+          return TaskSuccess.done(undefined);
         },
       };
     },
@@ -287,7 +365,7 @@ function createBlockingWorkerFactory(
         async process(taskId) {
           started.send(taskId);
           await gate.wait();
-          return undefined;
+          return TaskSuccess.done(undefined);
         },
       };
     },
@@ -309,7 +387,55 @@ function createRetryWorkerFactory(
           }
 
           processed.send(taskId);
-          return undefined;
+          return TaskSuccess.done(undefined);
+        },
+      };
+    },
+  };
+}
+
+function createReschedulingPublishedWorkerFactory(
+  processed: AsyncChannel<number>,
+  recordAttempt: () => number,
+  nextRunAtMs: number,
+): WorkerFactory<typeof reschedulingPublishedTask> {
+  return {
+    task: reschedulingPublishedTask,
+    build() {
+      return {
+        async process(taskId) {
+          processed.send(taskId);
+          const attempt = recordAttempt();
+          if (attempt === 0) {
+            return TaskSuccess.scheduleNextRun(taskId, nextRunAtMs);
+          }
+
+          return TaskSuccess.done(taskId);
+        },
+      };
+    },
+  };
+}
+
+function createScheduledSingletonWorkerFactory(
+  processed: AsyncChannel<number>,
+  gate: Gate,
+  recordAttempt: () => number,
+  nextRunAtMs: number,
+): WorkerFactory<typeof scheduledSingletonTask> {
+  return {
+    task: scheduledSingletonTask,
+    build() {
+      return {
+        async process(taskId) {
+          processed.send(taskId);
+          const attempt = recordAttempt();
+          if (attempt === 0) {
+            return TaskSuccess.scheduleNextRun(undefined, nextRunAtMs);
+          }
+
+          await gate.wait();
+          return TaskSuccess.done(undefined);
         },
       };
     },

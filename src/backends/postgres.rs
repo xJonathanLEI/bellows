@@ -736,6 +736,7 @@ WHERE task_id = $2
         worker_id: u64,
         task_id: u64,
         callback_payload: T::Callback,
+        available_from: Option<Instant>,
     ) -> Result<FinishedTask, FinishTaskError>
     where
         T: TaskDefinition,
@@ -749,30 +750,76 @@ WHERE task_id = $2
         let callback_payload_json = serde_json::to_string(&callback_payload).map_err(|err| {
             FinishTaskError::Backend(Box::new(PostgresBackendError::CallbackSerialization(err)))
         })?;
+        let now_system = SystemTime::now();
+        let available_from_unix_ms =
+            available_from.map(|available_from| instant_to_unix_ms(available_from, now_system));
 
         let mut tx =
             self.pool.begin().await.map_err(|err| {
                 FinishTaskError::Backend(Box::new(PostgresBackendError::Sqlx(err)))
             })?;
 
-        let finished_row = match <T::Trigger as crate::ActivationStrategy>::KIND {
-            crate::ActivationStrategyKind::Singleton => sqlx::query(
+        let finished_row = match (
+            <T::Trigger as crate::ActivationStrategy>::KIND,
+            available_from,
+        ) {
+            (crate::ActivationStrategyKind::Singleton, _) => sqlx::query(
                 r#"
-UPDATE bellows_tasks
-SET lease_worker_id = NULL,
-    available_from_unix_ms = NULL
-WHERE task_id = $1
-  AND lease_worker_id = $2
-  AND task_unique_key IS NOT NULL
-RETURNING task_name, callback_id
+WITH claimed AS (
+    SELECT task_id, task_name, callback_id
+    FROM bellows_tasks
+    WHERE task_id = $1
+      AND lease_worker_id = $2
+      AND task_unique_key IS NOT NULL
+    FOR UPDATE
+), updated AS (
+    UPDATE bellows_tasks
+    SET lease_worker_id = NULL,
+        callback_id = NULL,
+        available_from_unix_ms = $3
+    WHERE task_id IN (SELECT task_id FROM claimed)
+    RETURNING task_id
+)
+SELECT claimed.task_name, claimed.callback_id
+FROM claimed
+JOIN updated ON updated.task_id = claimed.task_id
 "#,
             )
             .bind(task_id_db)
             .bind(worker_id_db)
+            .bind(available_from_unix_ms)
             .fetch_optional(&mut *tx)
             .await
             .map_err(|err| FinishTaskError::Backend(Box::new(PostgresBackendError::Sqlx(err))))?,
-            crate::ActivationStrategyKind::Publish => sqlx::query(
+            (crate::ActivationStrategyKind::Publish, Some(_)) => sqlx::query(
+                r#"
+WITH claimed AS (
+    SELECT task_id, task_name, callback_id
+    FROM bellows_tasks
+    WHERE task_id = $1
+      AND lease_worker_id = $2
+      AND task_unique_key IS NULL
+    FOR UPDATE
+), updated AS (
+    UPDATE bellows_tasks
+    SET lease_worker_id = NULL,
+        callback_id = NULL,
+        available_from_unix_ms = $3
+    WHERE task_id IN (SELECT task_id FROM claimed)
+    RETURNING task_id
+)
+SELECT claimed.task_name, claimed.callback_id
+FROM claimed
+JOIN updated ON updated.task_id = claimed.task_id
+"#,
+            )
+            .bind(task_id_db)
+            .bind(worker_id_db)
+            .bind(available_from_unix_ms)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|err| FinishTaskError::Backend(Box::new(PostgresBackendError::Sqlx(err))))?,
+            (crate::ActivationStrategyKind::Publish, None) => sqlx::query(
                 r#"
 DELETE FROM bellows_tasks
 WHERE task_id = $1

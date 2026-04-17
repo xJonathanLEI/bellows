@@ -36,11 +36,12 @@ class TaskEntry {
   withState(
     workerId: number | null,
     availableFromMs: number | null,
+    callbackId: string | null = this.callbackId,
   ): TaskEntry {
     return new TaskEntry(
       this.taskName,
       this.payloadJson,
-      this.callbackId,
+      callbackId,
       this.kind,
       workerId,
       availableFromMs,
@@ -214,6 +215,7 @@ export class InMemoryBackend implements Backend {
     workerId: number,
     taskId: number,
     callbackPayload: TaskCallback<TTask>,
+    availableFromMs: number | null,
   ): Promise<FinishedTask> {
     const entry = this.tasks.get(taskId);
     if (!entry || entry.workerId !== workerId) {
@@ -222,11 +224,11 @@ export class InMemoryBackend implements Backend {
 
     const callbackPayloadJson = task.callbackCodec.encode(callbackPayload);
 
-    if (entry.kind === "singleton") {
-      const nextEntry = entry.withState(null, null);
+    if (entry.kind === "singleton" || availableFromMs !== null) {
+      const nextEntry = entry.withState(null, availableFromMs, null);
       this.tasks.set(taskId, nextEntry);
       this.emitSignal(nextEntry.taskName, nextEntry.signal(taskId));
-      this.deliverCallback(nextEntry.callbackId, callbackPayloadJson);
+      this.deliverCallback(entry.callbackId, callbackPayloadJson);
       return { taskId };
     }
 

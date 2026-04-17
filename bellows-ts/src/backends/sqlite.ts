@@ -370,6 +370,7 @@ RETURNING task_name
     workerId: number,
     taskId: number,
     callbackPayload: TaskCallback<TTask>,
+    availableFromMs: number | null,
   ): Promise<FinishedTask> {
     const callbackPayloadJson = task.callbackCodec.encode(callbackPayload);
 
@@ -377,13 +378,11 @@ RETURNING task_name
       const singletonRow = this.database
         .prepare(
           `
-UPDATE bellows_tasks
-SET lease_worker_id = NULL,
-    available_from_unix_ms = NULL
+SELECT task_name, callback_id
+FROM bellows_tasks
 WHERE task_id = ?
   AND lease_worker_id = ?
   AND task_unique_key IS NOT NULL
-RETURNING task_name, callback_id
           `,
         )
         .get(taskId, workerId) as
@@ -394,11 +393,72 @@ RETURNING task_name, callback_id
         throw new LeaseLostError();
       }
 
+      this.database
+        .prepare(
+          `
+UPDATE bellows_tasks
+SET lease_worker_id = NULL,
+    callback_id = NULL,
+    available_from_unix_ms = ?
+WHERE task_id = ?
+  AND lease_worker_id = ?
+          `,
+        )
+        .run(availableFromMs, taskId, workerId);
+
       if (singletonRow.callback_id !== null) {
         this.deliverCallback(singletonRow.callback_id, callbackPayloadJson);
       }
 
-      this.emitSignalIfRegistered(singletonRow.task_name, taskId, null);
+      this.emitSignalIfRegistered(
+        singletonRow.task_name,
+        taskId,
+        availableFromMs,
+      );
+      return { taskId };
+    }
+
+    if (availableFromMs !== null) {
+      const publishedRow = this.database
+        .prepare(
+          `
+SELECT task_name, callback_id
+FROM bellows_tasks
+WHERE task_id = ?
+  AND lease_worker_id = ?
+  AND task_unique_key IS NULL
+          `,
+        )
+        .get(taskId, workerId) as
+        | { task_name: string; callback_id: string | null }
+        | undefined;
+
+      if (!publishedRow) {
+        throw new LeaseLostError();
+      }
+
+      this.database
+        .prepare(
+          `
+UPDATE bellows_tasks
+SET lease_worker_id = NULL,
+    callback_id = NULL,
+    available_from_unix_ms = ?
+WHERE task_id = ?
+  AND lease_worker_id = ?
+          `,
+        )
+        .run(availableFromMs, taskId, workerId);
+
+      if (publishedRow.callback_id !== null) {
+        this.deliverCallback(publishedRow.callback_id, callbackPayloadJson);
+      }
+
+      this.emitSignalIfRegistered(
+        publishedRow.task_name,
+        taskId,
+        availableFromMs,
+      );
       return { taskId };
     }
 

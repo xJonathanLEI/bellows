@@ -168,6 +168,24 @@ export class AwaitableTask<TCallback> {
   }
 }
 
+export class TaskSuccess<TCallback> {
+  constructor(
+    readonly callbackPayload: TCallback,
+    readonly availableFromMs: number | null,
+  ) {}
+
+  static done<TCallback>(callbackPayload: TCallback): TaskSuccess<TCallback> {
+    return new TaskSuccess(callbackPayload, null);
+  }
+
+  static scheduleNextRun<TCallback>(
+    callbackPayload: TCallback,
+    availableFromMs: number,
+  ): TaskSuccess<TCallback> {
+    return new TaskSuccess(callbackPayload, availableFromMs);
+  }
+}
+
 export class TaskFailure {
   constructor(readonly availableFromMs: number | null) {}
 
@@ -180,7 +198,7 @@ export class TaskFailure {
   }
 }
 
-export type TaskResult<TCallback> = TCallback | TaskFailure;
+export type TaskResult<TCallback> = TaskSuccess<TCallback> | TaskFailure;
 
 export interface Backend {
   subscribe(task: TaskDefinition): Promise<BackendSignalSubscription>;
@@ -228,6 +246,7 @@ export interface Backend {
     workerId: number,
     taskId: number,
     callbackPayload: TaskCallback<TTask>,
+    availableFromMs: number | null,
   ): Promise<FinishedTask>;
 }
 
