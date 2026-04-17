@@ -2,7 +2,14 @@
   <h1 align="center">bellows</h1>
 </p>
 
-**Durable task processing framework in Rust for applications of all sizes**
+<p align="center">
+  <a href="https://crates.io/crates/bellows"><img alt="crates-badge" src="https://img.shields.io/crates/v/bellows.svg"></a>
+  <a href="https://www.npmjs.com/package/@xjonathanlei/bellows"><img alt="crates-badge" src="https://img.shields.io/npm/v/@xjonathanlei/bellows"></a>
+</p>
+
+<p align="center">
+  <strong>Durable task processing framework in Rust and TypeScript for applications of all sizes</strong>
+</p>
 
 ## Built-in backends
 
