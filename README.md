@@ -11,6 +11,53 @@
   <strong>Durable task processing framework in Rust and TypeScript for applications of all sizes</strong>
 </p>
 
+## Usage
+
+```rust
+// Define the task
+
+struct SendWelcomeEmailTask;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SendWelcomeEmailPayload {
+    email: String,
+}
+
+impl TaskDefinition for SendWelcomeEmailTask {
+    const NAME: &str = "send_welcome_email";
+
+    type Callback = String;
+    type Trigger = PublishTrigger<SendWelcomeEmailPayload>;
+}
+
+// Define the processing logic
+
+struct SendWelcomeEmailWorker;
+
+impl Worker for SendWelcomeEmailWorker {
+    type Task = SendWelcomeEmailTask;
+
+    async fn process(
+        self,
+        _task_id: u64,
+        task_payload: SendWelcomeEmailPayload,
+    ) -> TaskResult<String> {
+        // ...
+    }
+}
+
+// Invoke the task from anywhere and optionally wait for the result
+
+let backend = PostgresBackend::connect(DATABASE_URL).await?;
+let awaitable = backend
+    .publish_awaitable::<SendWelcomeEmailTask>(SendWelcomeEmailPayload {
+        email: "alice@example.com".to_owned(),
+    })
+    .await?;
+let result = awaitable.wait().await?;
+println!("{result}");
+```
+
 ## Built-in backends
 
 `bellows` currently ships with:
