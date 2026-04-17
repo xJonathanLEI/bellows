@@ -393,25 +393,24 @@ WHERE task_id = $2
     try {
       await client.query("BEGIN");
 
-      const singletonResult = await client.query<{
-        task_name: string;
-        callback_id: string | null;
-      }>(
-        `
+      const finishedRow =
+        task.kind === "singleton"
+          ? (
+              await client.query<{
+                callback_id: string | null;
+              }>(
+                `
 UPDATE bellows_tasks
 SET lease_worker_id = NULL,
     available_from_unix_ms = NULL
 WHERE task_id = $1
   AND lease_worker_id = $2
   AND task_unique_key IS NOT NULL
-RETURNING task_name, callback_id
-        `,
-        [taskId, workerId],
-      );
-
-      const finishedRow =
-        singletonResult.rowCount !== 0
-          ? singletonResult.rows[0]
+RETURNING callback_id
+                `,
+                [taskId, workerId],
+              )
+            ).rows[0]
           : (
               await client.query<{
                 callback_id: string | null;

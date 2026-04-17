@@ -755,8 +755,9 @@ WHERE task_id = $2
                 FinishTaskError::Backend(Box::new(PostgresBackendError::Sqlx(err)))
             })?;
 
-        let singleton_row = sqlx::query(
-            r#"
+        let finished_row = match <T::Trigger as crate::ActivationStrategy>::KIND {
+            crate::ActivationStrategyKind::Singleton => sqlx::query(
+                r#"
 UPDATE bellows_tasks
 SET lease_worker_id = NULL,
     available_from_unix_ms = NULL
@@ -765,17 +766,13 @@ WHERE task_id = $1
   AND task_unique_key IS NOT NULL
 RETURNING task_name, callback_id
 "#,
-        )
-        .bind(task_id_db)
-        .bind(worker_id_db)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|err| FinishTaskError::Backend(Box::new(PostgresBackendError::Sqlx(err))))?;
-
-        let finished_row = if let Some(row) = singleton_row {
-            Some(row)
-        } else {
-            sqlx::query(
+            )
+            .bind(task_id_db)
+            .bind(worker_id_db)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|err| FinishTaskError::Backend(Box::new(PostgresBackendError::Sqlx(err))))?,
+            crate::ActivationStrategyKind::Publish => sqlx::query(
                 r#"
 DELETE FROM bellows_tasks
 WHERE task_id = $1
@@ -788,7 +785,7 @@ RETURNING task_name, callback_id
             .bind(worker_id_db)
             .fetch_optional(&mut *tx)
             .await
-            .map_err(|err| FinishTaskError::Backend(Box::new(PostgresBackendError::Sqlx(err))))?
+            .map_err(|err| FinishTaskError::Backend(Box::new(PostgresBackendError::Sqlx(err))))?,
         };
 
         let Some(finished_row) = finished_row else {

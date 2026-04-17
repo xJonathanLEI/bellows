@@ -75,6 +75,9 @@ pub trait TaskDefinition: Send {
 /// - [`SingletonTrigger`]
 pub trait ActivationStrategy: private::Sealed {
     #[doc(hidden)]
+    const KIND: ActivationStrategyKind;
+
+    #[doc(hidden)]
     type DispatchToken: Send;
 
     #[doc(hidden)]
@@ -90,6 +93,14 @@ pub trait ActivationStrategy: private::Sealed {
     where
         B: Backend,
         T: TaskDefinition<Trigger = Self>;
+}
+
+/// Marker describing which backend lifecycle semantics apply to a task activation strategy.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivationStrategyKind {
+    Publish,
+    Singleton,
 }
 
 /// Marker trait for activation strategies that support publishing and backend-managed payload
@@ -210,6 +221,8 @@ impl<Payload> ActivationStrategy for PublishTrigger<Payload>
 where
     Payload: Serialize + DeserializeOwned + Send + Sync,
 {
+    const KIND: ActivationStrategyKind = ActivationStrategyKind::Publish;
+
     type DispatchToken = PublishDispatchToken;
     type EffectivePayload = Payload;
 
@@ -258,6 +271,8 @@ pub struct SingletonTrigger;
 impl private::Sealed for SingletonTrigger {}
 
 impl ActivationStrategy for SingletonTrigger {
+    const KIND: ActivationStrategyKind = ActivationStrategyKind::Singleton;
+
     type DispatchToken = ();
     type EffectivePayload = ();
 

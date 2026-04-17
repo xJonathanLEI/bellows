@@ -373,9 +373,10 @@ RETURNING task_name
   ): Promise<FinishedTask> {
     const callbackPayloadJson = task.callbackCodec.encode(callbackPayload);
 
-    const singletonRow = this.database
-      .prepare(
-        `
+    if (task.kind === "singleton") {
+      const singletonRow = this.database
+        .prepare(
+          `
 UPDATE bellows_tasks
 SET lease_worker_id = NULL,
     available_from_unix_ms = NULL
@@ -383,13 +384,16 @@ WHERE task_id = ?
   AND lease_worker_id = ?
   AND task_unique_key IS NOT NULL
 RETURNING task_name, callback_id
-        `,
-      )
-      .get(taskId, workerId) as
-      | { task_name: string; callback_id: string | null }
-      | undefined;
+          `,
+        )
+        .get(taskId, workerId) as
+        | { task_name: string; callback_id: string | null }
+        | undefined;
 
-    if (singletonRow) {
+      if (!singletonRow) {
+        throw new LeaseLostError();
+      }
+
       if (singletonRow.callback_id !== null) {
         this.deliverCallback(singletonRow.callback_id, callbackPayloadJson);
       }
