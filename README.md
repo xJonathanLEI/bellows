@@ -11,6 +11,10 @@
   <strong>Durable task processing framework in Rust and TypeScript for applications of all sizes</strong>
 </p>
 
+## Introduction
+
+`bellows` is a durable task processing framework with fully compatible implementations in Rust and TypeScript for building heterogeneous systems.
+
 ## Usage
 
 ```rust
