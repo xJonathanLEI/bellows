@@ -13,8 +13,17 @@ fn main() {
         .parent()
         .expect("interop-tests manifest directory should have a workspace parent");
 
-    let status = Command::new("pnpm")
-        .args(["--filter", "@xjonathanlei/bellows", "build"])
+    let mut command = if cfg!(windows) {
+        let mut command = Command::new("pnpm.cmd");
+        command.args(["--filter", "@xjonathanlei/bellows", "build"]);
+        command
+    } else {
+        let mut command = Command::new("pnpm");
+        command.args(["--filter", "@xjonathanlei/bellows", "build"]);
+        command
+    };
+
+    let status = command
         .current_dir(workspace_root)
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
