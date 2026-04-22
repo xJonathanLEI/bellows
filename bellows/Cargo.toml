@@ -1,0 +1,29 @@
+[package]
+name = "bellows"
+version = "0.0.9"
+authors = ["Jonathan LEI <me@xjonathan.dev>"]
+license = "MIT OR Apache-2.0"
+edition = "2024"
+readme = "README.md"
+documentation = "https://docs.rs/bellows"
+repository = "https://github.com/xJonathanLEI/bellows"
+description = "Durable task processing framework in Rust for applications of all sizes"
+
+[features]
+default = ["in_memory", "sqlite", "postgres"]
+in_memory = ["serde_json"]
+sqlite = ["sqlx", "serde_json"]
+postgres = ["sqlx", "serde_json"]
+
+[dependencies]
+rand.workspace = true
+serde.workspace = true
+serde_json = { workspace = true, optional = true }
+sqlx = { workspace = true, optional = true }
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+serde = { workspace = true, features = ["std", "derive"] }
+tempfile.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread"] }

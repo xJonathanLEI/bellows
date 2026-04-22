@@ -141,7 +141,7 @@ jobs:
 
       - name: "Publish crate"
         run: |
-          cargo publish
+          cargo publish --package bellows
 
   npm-release:
     name: "Release to npm"
