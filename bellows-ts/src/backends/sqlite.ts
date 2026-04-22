@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { randomBytes } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import {
   type CallbackSink,
@@ -30,7 +30,7 @@ CREATE TABLE IF NOT EXISTS bellows_tasks (
     task_name TEXT NOT NULL,
     task_unique_key TEXT,
     payload_json TEXT NOT NULL,
-    callback_id TEXT,
+    callback_id INTEGER,
     lease_worker_id INTEGER,
     available_from_unix_ms INTEGER,
     CHECK (lease_worker_id IS NULL OR available_from_unix_ms IS NOT NULL)
@@ -43,9 +43,11 @@ CREATE INDEX IF NOT EXISTS bellows_tasks_available_idx
     ON bellows_tasks (task_name, task_unique_key, available_from_unix_ms, task_id);
 `;
 
+const MAX_CALLBACK_ID = BigInt(Number.MAX_SAFE_INTEGER);
+
 export class SqliteBackend implements Backend {
   private readonly signals = new Map<string, SignalHub>();
-  private readonly callbacks = new Map<string, CallbackSink>();
+  private readonly callbacks = new Map<number, CallbackSink>();
 
   private constructor(private readonly database: DatabaseSync) {}
 
@@ -386,7 +388,7 @@ WHERE task_id = ?
           `,
         )
         .get(taskId, workerId) as
-        | { task_name: string; callback_id: string | null }
+        | { task_name: string; callback_id: number | null }
         | undefined;
 
       if (!singletonRow) {
@@ -430,7 +432,7 @@ WHERE task_id = ?
           `,
         )
         .get(taskId, workerId) as
-        | { task_name: string; callback_id: string | null }
+        | { task_name: string; callback_id: number | null }
         | undefined;
 
       if (!publishedRow) {
@@ -472,7 +474,7 @@ WHERE task_id = ?
 RETURNING callback_id
         `,
       )
-      .get(taskId, workerId) as { callback_id: string | null } | undefined;
+      .get(taskId, workerId) as { callback_id: number | null } | undefined;
 
     if (!publishedRow) {
       throw new LeaseLostError();
@@ -488,7 +490,7 @@ RETURNING callback_id
   private async publishInternal<TPayload, TCallback>(
     task: PublishTaskDefinition<TPayload, TCallback>,
     payload: TPayload,
-    callbackId: string | null,
+    callbackId: number | null,
     availableFromMs: number | null,
   ): Promise<PublishedTask> {
     const result = this.database
@@ -569,10 +571,10 @@ WHERE task_id = ?
   }
 
   private deliverCallback(
-    callbackId: string | null,
+    callbackId: number | null,
     callbackPayloadJson: string,
   ): void {
-    if (!callbackId) {
+    if (callbackId === null) {
       return;
     }
 
@@ -585,9 +587,11 @@ WHERE task_id = ?
     callback.deliver(callbackPayloadJson);
   }
 
-  private reserveCallbackId(): string {
+  private reserveCallbackId(): number {
     while (true) {
-      const callbackId = randomUUID();
+      const callbackId = Number(
+        randomBytes(8).readBigUInt64BE(0) % (MAX_CALLBACK_ID + 1n),
+      );
       if (!this.callbacks.has(callbackId)) {
         return callbackId;
       }

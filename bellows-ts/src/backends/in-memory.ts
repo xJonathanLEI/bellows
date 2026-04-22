@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { randomBytes } from "node:crypto";
 import {
   type CallbackSink,
   createCallbackChannel,
@@ -23,11 +23,13 @@ import {
   TaskUnavailableError,
 } from "../types.js";
 
+const MAX_CALLBACK_ID = BigInt(Number.MAX_SAFE_INTEGER);
+
 class TaskEntry {
   constructor(
     readonly taskName: string,
     readonly payloadJson: string,
-    readonly callbackId: string | null,
+    readonly callbackId: number | null,
     readonly kind: "publish" | "singleton",
     readonly workerId: number | null = null,
     readonly availableFromMs: number | null = null,
@@ -36,7 +38,7 @@ class TaskEntry {
   withState(
     workerId: number | null,
     availableFromMs: number | null,
-    callbackId: string | null = this.callbackId,
+    callbackId: number | null = this.callbackId,
   ): TaskEntry {
     return new TaskEntry(
       this.taskName,
@@ -56,7 +58,7 @@ class TaskEntry {
 export class InMemoryBackend implements Backend {
   private nextTaskId = 0;
   private readonly signals = new Map<string, SignalHub>();
-  private readonly callbacks = new Map<string, CallbackSink>();
+  private readonly callbacks = new Map<number, CallbackSink>();
   private readonly tasks = new Map<number, TaskEntry>();
 
   async subscribe(task: TaskDefinition) {
@@ -240,7 +242,7 @@ export class InMemoryBackend implements Backend {
   private async publishInternal<TPayload, TCallback>(
     task: PublishTaskDefinition<TPayload, TCallback>,
     payload: TPayload,
-    callbackId: string | null,
+    callbackId: number | null,
     availableFromMs: number | null,
   ): Promise<PublishedTask> {
     const taskId = this.nextTaskId;
@@ -370,10 +372,10 @@ export class InMemoryBackend implements Backend {
   }
 
   private deliverCallback(
-    callbackId: string | null,
+    callbackId: number | null,
     callbackPayloadJson: string,
   ): void {
-    if (!callbackId) {
+    if (callbackId === null) {
       return;
     }
 
@@ -386,9 +388,11 @@ export class InMemoryBackend implements Backend {
     callback.deliver(callbackPayloadJson);
   }
 
-  private reserveCallbackId(): string {
+  private reserveCallbackId(): number {
     while (true) {
-      const callbackId = randomUUID();
+      const callbackId = Number(
+        randomBytes(8).readBigUInt64BE(0) % (MAX_CALLBACK_ID + 1n),
+      );
       if (!this.callbacks.has(callbackId)) {
         return callbackId;
       }

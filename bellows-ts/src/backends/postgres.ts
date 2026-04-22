@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { randomBytes } from "node:crypto";
 import { Client, Pool, type PoolClient } from "pg";
 import {
   type CallbackSink,
@@ -31,7 +31,7 @@ CREATE TABLE IF NOT EXISTS bellows_tasks (
     task_name TEXT NOT NULL,
     task_unique_key TEXT,
     payload_json TEXT NOT NULL,
-    callback_id TEXT,
+    callback_id BIGINT,
     lease_worker_id BIGINT,
     available_from_unix_ms BIGINT,
     CHECK (lease_worker_id IS NULL OR available_from_unix_ms IS NOT NULL)
@@ -80,13 +80,15 @@ type NotificationPayload =
   | {
       readonly kind: "task_callback";
       readonly task_name: string;
-      readonly callback_id: string;
+      readonly callback_id: number;
       readonly callback_payload_json: string;
     };
 
+const MAX_CALLBACK_ID = BigInt(Number.MAX_SAFE_INTEGER);
+
 export class PostgresBackend implements Backend {
   private readonly signals = new Map<string, SignalHub>();
-  private readonly callbacks = new Map<string, CallbackSink>();
+  private readonly callbacks = new Map<number, CallbackSink>();
 
   private constructor(
     private readonly pool: Pool,
@@ -398,7 +400,7 @@ WHERE task_id = $2
         task.kind === "singleton"
           ? (
               await client.query<{
-                callback_id: string | null;
+                callback_id: number | null;
               }>(
                 `
 WITH claimed AS (
@@ -426,7 +428,7 @@ JOIN updated ON updated.task_id = claimed.task_id
           : availableFromMs !== null
             ? (
                 await client.query<{
-                  callback_id: string | null;
+                  callback_id: number | null;
                 }>(
                   `
 WITH claimed AS (
@@ -453,7 +455,7 @@ JOIN updated ON updated.task_id = claimed.task_id
               ).rows[0]
             : (
                 await client.query<{
-                  callback_id: string | null;
+                  callback_id: number | null;
                 }>(
                   `
 DELETE FROM bellows_tasks
@@ -472,15 +474,29 @@ RETURNING callback_id
       }
 
       if (finishedRow.callback_id !== null) {
-        await client.query("SELECT pg_notify($1, $2)", [
-          NOTIFY_CHANNEL,
-          JSON.stringify({
-            kind: "task_callback",
-            task_name: task.name,
-            callback_id: finishedRow.callback_id,
-            callback_payload_json: callbackPayloadJson,
-          } satisfies NotificationPayload),
-        ]);
+        await client.query(
+          `
+SELECT pg_notify(
+    $1,
+    json_build_object(
+      'kind',
+      'task_callback',
+      'task_name',
+      $2::text,
+      'callback_id',
+      $3::bigint,
+      'callback_payload_json',
+      $4::text
+    )::text
+)
+          `,
+          [
+            NOTIFY_CHANNEL,
+            task.name,
+            finishedRow.callback_id,
+            callbackPayloadJson,
+          ],
+        );
       }
 
       await client.query("COMMIT");
@@ -496,7 +512,7 @@ RETURNING callback_id
   private async publishInternal<TPayload, TCallback>(
     task: PublishTaskDefinition<TPayload, TCallback>,
     payload: TPayload,
-    callbackId: string | null,
+    callbackId: number | null,
     availableFromMs: number | null,
   ): Promise<PublishedTask> {
     const result = await this.pool.query<{ task_id: string }>(
@@ -585,10 +601,10 @@ WHERE task_id = $1
   }
 
   private deliverCallback(
-    callbackId: string | null,
+    callbackId: number | null,
     callbackPayloadJson: string,
   ): void {
-    if (!callbackId) {
+    if (callbackId === null) {
       return;
     }
 
@@ -601,9 +617,11 @@ WHERE task_id = $1
     callback.deliver(callbackPayloadJson);
   }
 
-  private reserveCallbackId(): string {
+  private reserveCallbackId(): number {
     while (true) {
-      const callbackId = randomUUID();
+      const callbackId = Number(
+        randomBytes(8).readBigUInt64BE(0) % (MAX_CALLBACK_ID + 1n),
+      );
       if (!this.callbacks.has(callbackId)) {
         return callbackId;
       }
