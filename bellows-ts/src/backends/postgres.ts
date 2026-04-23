@@ -62,10 +62,21 @@ BEGIN
 END;
 $$;
 
-CREATE OR REPLACE TRIGGER bellows_tasks_notify_available
-AFTER INSERT OR UPDATE OF lease_worker_id, available_from_unix_ms ON bellows_tasks
-FOR EACH ROW
-EXECUTE FUNCTION bellows_notify_task_available();
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_trigger
+        WHERE tgname = 'bellows_tasks_notify_available'
+          AND tgrelid = 'bellows_tasks'::regclass
+    ) THEN
+        CREATE TRIGGER bellows_tasks_notify_available
+        AFTER INSERT OR UPDATE OF lease_worker_id, available_from_unix_ms ON bellows_tasks
+        FOR EACH ROW
+        EXECUTE FUNCTION bellows_notify_task_available();
+    END IF;
+END;
+$$;
 `;
 
 type NotificationPayload =
@@ -112,7 +123,19 @@ export class PostgresBackend implements Backend {
   }
 
   async initialize(): Promise<void> {
-    await this.pool.query(INITIALIZE_SCHEMA_SQL);
+    const client = await this.pool.connect();
+
+    try {
+      await client.query("BEGIN");
+      await client.query("SELECT pg_advisory_xact_lock(5024011519)");
+      await client.query(INITIALIZE_SCHEMA_SQL);
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
   }
 
   async close(): Promise<void> {

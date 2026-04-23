@@ -69,10 +69,21 @@ BEGIN
 END;
 $$;
 
-CREATE OR REPLACE TRIGGER bellows_tasks_notify_available
-AFTER INSERT OR UPDATE OF lease_worker_id, available_from_unix_ms ON bellows_tasks
-FOR EACH ROW
-EXECUTE FUNCTION bellows_notify_task_available();
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_trigger
+        WHERE tgname = 'bellows_tasks_notify_available'
+          AND tgrelid = 'bellows_tasks'::regclass
+    ) THEN
+        CREATE TRIGGER bellows_tasks_notify_available
+        AFTER INSERT OR UPDATE OF lease_worker_id, available_from_unix_ms ON bellows_tasks
+        FOR EACH ROW
+        EXECUTE FUNCTION bellows_notify_task_available();
+    END IF;
+END;
+$$;
 "#;
 
 #[derive(Debug)]
@@ -187,9 +198,18 @@ impl PostgresBackend {
     ///
     /// This operation is idempotent and can be safely called multiple times.
     pub async fn initialize(&self) -> Result<(), sqlx::Error> {
-        sqlx::raw_sql(INITIALIZE_SCHEMA_SQL)
-            .execute(&self.pool)
+        let mut transaction = self.pool.begin().await?;
+
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(5_024_011_519_i64)
+            .execute(&mut *transaction)
             .await?;
+
+        sqlx::raw_sql(INITIALIZE_SCHEMA_SQL)
+            .execute(&mut *transaction)
+            .await?;
+
+        transaction.commit().await?;
 
         Ok(())
     }
