@@ -62,9 +62,7 @@ BEGIN
 END;
 $$;
 
-DROP TRIGGER IF EXISTS bellows_tasks_notify_available ON bellows_tasks;
-
-CREATE TRIGGER bellows_tasks_notify_available
+CREATE OR REPLACE TRIGGER bellows_tasks_notify_available
 AFTER INSERT OR UPDATE OF lease_worker_id, available_from_unix_ms ON bellows_tasks
 FOR EACH ROW
 EXECUTE FUNCTION bellows_notify_task_available();
