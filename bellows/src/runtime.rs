@@ -4,7 +4,7 @@ use std::{
 };
 
 use crate::{
-    ActivationStrategy, Backend, TaskDefinition, TaskSuccess, Worker, WorkerFactory,
+    ActivationStrategy, TaskDefinition, TaskExecutionBackend, TaskSuccess, Worker, WorkerFactory,
     backends::{ClaimTaskError, FailTaskError, FinishTaskError, RenewTaskError},
 };
 use tokio::sync::mpsc::UnboundedSender as MpscSender;
@@ -12,6 +12,42 @@ use tracing::{trace, warn};
 
 const LEASE_DURATION: Duration = Duration::from_secs(20);
 const LEASE_RENEWAL_THRESHOLD: Duration = Duration::from_secs(10);
+
+/// Executes and awaits one task attempt without starting a dispatcher.
+///
+/// Published tasks accept [`crate::PublishDispatchToken::Task`] or
+/// [`crate::PublishDispatchToken::EarliestAvailable`]; singleton tasks accept `()`.
+/// Both full [`crate::Backend`] implementations and execution-only backends can be used.
+///
+/// Claims the task before building a worker, renews its lease while processing, and awaits the
+/// failure or completion recording attempt before returning. A normal unit return is **not** a
+/// success status: missing, leased, or unavailable tasks do not start a worker, and backend
+/// claim/finalization errors are logged by the runtime rather than returned.
+/// Do not map this unit return directly to an HTTP success response. Renewal failure aborts the
+/// Rust worker and exits without recording completion.
+///
+/// This does not discover work or retry internally. Retries and successful rescheduling require
+/// another external trigger. The host must drive/await this future to execute it; dropping it
+/// does not provide a cancellation guarantee.
+pub async fn run_task_once<B, F>(
+    backend: B,
+    factory: F,
+    worker_id: u64,
+    dispatch_token: <<<F::Worker as Worker>::Task as TaskDefinition>::Trigger as ActivationStrategy>::DispatchToken,
+) where
+    B: TaskExecutionBackend + 'static,
+    F: WorkerFactory + 'static,
+{
+    let (update_signal, _) = tokio::sync::mpsc::unbounded_channel();
+    WorkerRuntime {
+        backend,
+        factory: Arc::new(factory),
+        worker_id,
+        update_signal,
+    }
+    .run_and_wait(dispatch_token)
+    .await;
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RuntimeUpdate {
@@ -30,10 +66,17 @@ pub(crate) struct WorkerRuntime<B, F> {
 
 impl<B, F> WorkerRuntime<B, F>
 where
-    B: Backend + 'static,
+    B: TaskExecutionBackend + 'static,
     F: WorkerFactory + 'static,
 {
     pub fn run(
+        self,
+        dispatch_token: <<<F::Worker as Worker>::Task as TaskDefinition>::Trigger as ActivationStrategy>::DispatchToken,
+    ) {
+        tokio::spawn(self.run_and_wait(dispatch_token));
+    }
+
+    pub async fn run_and_wait(
         self,
         dispatch_token: <<<F::Worker as Worker>::Task as TaskDefinition>::Trigger as ActivationStrategy>::DispatchToken,
     ) {
@@ -44,7 +87,7 @@ where
             update_signal: self.update_signal,
             status: DaemonStatus::WaitingForTask { dispatch_token },
         };
-        tokio::spawn(daemon.run());
+        daemon.run().await;
     }
 }
 
@@ -61,7 +104,7 @@ where
 
 impl<B, F> Daemon<B, F, <F::Worker as Worker>::Task>
 where
-    B: Backend,
+    B: TaskExecutionBackend,
     F: WorkerFactory,
     F::Worker: 'static,
 {

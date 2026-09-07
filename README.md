@@ -62,6 +62,60 @@ let result = awaitable.wait().await?;
 println!("{result}");
 ```
 
+## Request-driven execution
+
+When an external host already knows which task to attempt, use `run_task_once` without launching a `WorkerDispatcher`. It accepts any `TaskExecutionBackend`, including all existing full backends:
+
+```rust
+use bellows::{
+    Backend, PublishDispatchToken, PublishTrigger, TaskDefinition, TaskResult, TaskSuccess,
+    Worker, WorkerFactory, backends::in_memory::InMemoryBackend, run_task_once,
+};
+
+struct EchoTask;
+
+impl TaskDefinition for EchoTask {
+    const NAME: &str = "echo";
+    type Callback = ();
+    type Trigger = PublishTrigger<String>;
+}
+
+struct EchoWorker;
+
+impl Worker for EchoWorker {
+    type Task = EchoTask;
+
+    async fn process(self, task_id: u64, payload: String) -> TaskResult<()> {
+        println!("{task_id}: {payload}");
+        Ok(TaskSuccess::done(()))
+    }
+}
+
+struct EchoFactory;
+
+impl WorkerFactory for EchoFactory {
+    type Worker = EchoWorker;
+
+    fn build(&self, _worker_id: u64) -> EchoWorker {
+        EchoWorker
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let backend = InMemoryBackend::new();
+    let task = backend.publish::<EchoTask>("Alice".to_owned()).await?;
+    run_task_once(
+        backend,
+        EchoFactory,
+        17,
+        PublishDispatchToken::Task(task.task_id),
+    )
+    .await;
+    Ok(())
+}
+```
+
 ## Built-in backends
 
 `bellows` currently ships with:

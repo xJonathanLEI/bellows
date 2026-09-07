@@ -16,6 +16,7 @@ TypeScript port of `bellows`, a durable task processing framework.
 ```ts
 import { InMemoryBackend } from "@xjonathanlei/bellows/backends/in-memory";
 import {
+  TaskSuccess,
   WorkerDispatcher,
   definePublishTask,
   type WorkerFactory,
@@ -30,6 +31,7 @@ const factory: WorkerFactory<typeof echoTask> = {
     return {
       async process(taskId, payload) {
         console.log(taskId, payload.name);
+        return TaskSuccess.done(undefined);
       },
     };
   },
@@ -40,6 +42,39 @@ const handle = await dispatcher.launch();
 
 await backend.publish(echoTask, { name: "Alice" });
 await handle.drain();
+```
+
+## Request-driven execution
+
+Use `runTaskOnce()` when an external host triggers a task attempt instead of launching a `WorkerDispatcher`. It accepts the smaller `TaskExecutionBackend` contract; all existing full backends work too.
+
+```ts
+import { InMemoryBackend } from "@xjonathanlei/bellows/backends/in-memory";
+import {
+  definePublishTask,
+  runTaskOnce,
+  TaskSuccess,
+  type PublishDispatchToken,
+  type WorkerFactory,
+} from "@xjonathanlei/bellows";
+
+const echoTask = definePublishTask<{ name: string }>("echo");
+const backend = new InMemoryBackend();
+const factory: WorkerFactory<typeof echoTask> = {
+  task: echoTask,
+  build(workerId) {
+    return {
+      async process(taskId, payload) {
+        console.log(workerId, taskId, payload.name);
+        return TaskSuccess.done(undefined);
+      },
+    };
+  },
+};
+
+const task = await backend.publish(echoTask, { name: "Alice" });
+const token: PublishDispatchToken = { type: "task", taskId: task.taskId };
+await runTaskOnce(backend, factory, 17, token);
 ```
 
 ## Tasks
@@ -73,7 +108,7 @@ await backend.initialize();
 
 ### `PostgresBackend`
 
-Durable storage with `LISTEN` / `NOTIFY` signaling.
+Durable storage with `LISTEN` / `NOTIFY` signaling for normal `WorkerDispatcher` daemon processing.
 
 ```ts
 const backend = await PostgresBackend.connect(

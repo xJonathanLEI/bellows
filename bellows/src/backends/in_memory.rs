@@ -18,7 +18,7 @@ use crate::PublishActivationStrategy;
 use crate::backends::{
     Backend, BackendSignal, BackendSignalSubscription, ClaimTaskError, ClaimedTask, FailTaskError,
     FailedTask, FinishTaskError, FinishedTask, NewTaskAvailableSignalPayload, PublishTaskError,
-    PublishedTask, RenewTaskError, RenewedTaskLease, SubscribeError,
+    PublishedTask, RenewTaskError, RenewedTaskLease, SubscribeError, TaskExecutionBackend,
 };
 use crate::{AwaitableTask, TaskDefinition};
 
@@ -170,7 +170,9 @@ impl Backend for InMemoryBackend {
 
         Ok(AwaitableTask::new(published.task_id, callback_rx))
     }
+}
 
+impl TaskExecutionBackend for InMemoryBackend {
     async fn claim_published<T>(
         &self,
         worker_id: u64,

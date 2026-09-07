@@ -15,13 +15,18 @@ use crate::{AwaitableTask, PublishActivationStrategy, TaskDefinition};
 pub mod in_memory;
 #[cfg(feature = "postgres")]
 pub mod postgres;
+#[cfg(feature = "postgres")]
+pub mod postgres_execution;
+#[cfg(feature = "postgres")]
+mod postgres_operations;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 
-/// A [`Backend`] is a means to connect to and interact the underlying task registry and its
-/// associated signal channel.
+/// Publishing and subscription capabilities in addition to [`TaskExecutionBackend`].
 ///
-/// [`Backend`] types must implement [`Clone`] and cheaply cloned.
+/// A full backend connects to the underlying task registry and its associated signal channel.
+/// [`crate::dispatcher::WorkerDispatcher`] requires this trait; [`crate::run_task_once`] only
+/// requires the execution trait. Implementations must be cheaply cloneable.
 ///
 /// Some [`Backend`] implementations would have "intrinsic" connection between its task registry
 /// and the signal channel, such as Postgres where inserting a task row would trigger a `NOTIFY`
@@ -29,7 +34,7 @@ pub mod sqlite;
 ///
 /// Other implementations may not have those and might use a two-step register-trigger process
 /// where dispatchers handle signaling on the side.
-pub trait Backend: Clone + Send + Sync {
+pub trait Backend: TaskExecutionBackend {
     /// Subscribes for signals for important task updates for a specific task definition.
     ///
     /// This is usually used by worker dispatchers to react to task availability. Backends must
@@ -68,7 +73,17 @@ pub trait Backend: Clone + Send + Sync {
     where
         T: TaskDefinition,
         T::Trigger: PublishActivationStrategy;
+}
 
+/// The task execution operations required by [`crate::run_task_once`].
+///
+/// Implementations must be cheaply cloneable. This capability does not require publishing or
+/// subscriptions; full [`Backend`] implementations provide those capabilities in addition to these
+/// execution methods.
+///
+/// Custom backends implement these six methods here and publishing/subscription methods separately
+/// in [`Backend`]. Import this trait when calling execution methods on concrete backend types.
+pub trait TaskExecutionBackend: Clone + Send + Sync {
     /// Claims a specific published task until a lease expiration time.
     fn claim_published<T>(
         &self,
@@ -146,7 +161,7 @@ pub trait Backend: Clone + Send + Sync {
 /// Boxed backend-specific error source exposed by the public backend API.
 ///
 /// This keeps `bellows` open to arbitrary external backend implementations without forcing an
-/// associated error type into the `Backend` trait, while still preserving the original error's
+/// associated error type into the backend traits, while still preserving the original error's
 /// `Display`, `Debug`, and `source` chain for downstream inspection and logging.
 pub type BoxBackendError = Box<dyn StdError + Send + Sync + 'static>;
 

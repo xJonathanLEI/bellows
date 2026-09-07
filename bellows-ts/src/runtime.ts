@@ -1,8 +1,8 @@
 import {
-  type Backend,
   LeaseLostError,
   type TaskCallback,
   type TaskDefinition,
+  type TaskExecutionBackend,
   TaskFailure,
   TaskLeasedError,
   TaskNotFoundError,
@@ -28,7 +28,7 @@ export type PublishDispatchToken =
 
 export class WorkerRuntime<TTask extends TaskDefinition> {
   constructor(
-    private readonly backend: Backend,
+    private readonly backend: TaskExecutionBackend,
     private readonly factory: WorkerFactory<TTask>,
     private readonly workerId: number,
     private readonly onUpdate: (update: RuntimeUpdate) => void,
@@ -36,7 +36,13 @@ export class WorkerRuntime<TTask extends TaskDefinition> {
   ) {}
 
   run(dispatchToken: PublishDispatchToken | undefined): void {
-    void this.runInternal(dispatchToken).finally(() => {
+    void this.runAndWait(dispatchToken);
+  }
+
+  async runAndWait(
+    dispatchToken: PublishDispatchToken | undefined,
+  ): Promise<void> {
+    await this.runInternal(dispatchToken).finally(() => {
       this.onExit();
     });
   }
@@ -203,6 +209,23 @@ export class WorkerRuntime<TTask extends TaskDefinition> {
       }
     }
   }
+}
+
+export async function runTaskOnce<TTask extends TaskDefinition>(
+  backend: TaskExecutionBackend,
+  factory: WorkerFactory<TTask>,
+  workerId: number,
+  dispatchToken: PublishDispatchToken,
+): Promise<void> {
+  const runtime = new WorkerRuntime(
+    backend,
+    factory,
+    workerId,
+    () => {},
+    () => {},
+  );
+
+  await runtime.runAndWait(dispatchToken);
 }
 
 async function delay(durationMs: number): Promise<void> {

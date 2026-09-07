@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { Client, Pool, type PoolClient } from "pg";
+import { Client, Pool } from "pg";
 import {
   type CallbackSink,
   createCallbackChannel,
@@ -12,72 +12,22 @@ import {
   type ClaimedTask,
   type FailedTask,
   type FinishedTask,
-  LeaseLostError,
   type PublishedTask,
   type PublishTaskDefinition,
   type RenewedTaskLease,
   type SingletonTaskDefinition,
   type TaskCallback,
   type TaskDefinition,
-  TaskLeasedError,
-  TaskNotFoundError,
-  TaskUnavailableError,
 } from "../types.js";
+import {
+  initializePostgresPool,
+  POSTGRES_NOTIFY_CHANNEL,
+  type PostgresBackendOptions,
+  PostgresTaskOperations,
+} from "./postgres-operations.js";
 
-const NOTIFY_CHANNEL = "bellows_tasks";
-const INITIALIZE_SCHEMA_SQL = `
-CREATE TABLE IF NOT EXISTS bellows_tasks (
-    task_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    task_name TEXT NOT NULL,
-    task_unique_key TEXT,
-    payload_json TEXT NOT NULL,
-    callback_id BIGINT,
-    lease_worker_id BIGINT,
-    available_from_unix_ms BIGINT,
-    CHECK (lease_worker_id IS NULL OR available_from_unix_ms IS NOT NULL)
-);
-
-CREATE UNIQUE INDEX IF NOT EXISTS bellows_tasks_unique_key_idx
-    ON bellows_tasks (task_unique_key);
-
-CREATE INDEX IF NOT EXISTS bellows_tasks_available_idx
-    ON bellows_tasks (task_name, task_unique_key, available_from_unix_ms, task_id);
-
-CREATE OR REPLACE FUNCTION bellows_notify_task_available()
-RETURNS trigger
-LANGUAGE plpgsql
-AS $$
-BEGIN
-    PERFORM pg_notify(
-        'bellows_tasks',
-        json_build_object(
-            'kind', 'new_task_available',
-            'task_name', NEW.task_name,
-            'task_id', NEW.task_id,
-            'available_from_unix_ms', NEW.available_from_unix_ms
-        )::text
-    );
-
-    RETURN NEW;
-END;
-$$;
-
-DO $$
-BEGIN
-    IF NOT EXISTS (
-        SELECT 1
-        FROM pg_trigger
-        WHERE tgname = 'bellows_tasks_notify_available'
-          AND tgrelid = 'bellows_tasks'::regclass
-    ) THEN
-        CREATE TRIGGER bellows_tasks_notify_available
-        AFTER INSERT OR UPDATE OF lease_worker_id, available_from_unix_ms ON bellows_tasks
-        FOR EACH ROW
-        EXECUTE FUNCTION bellows_notify_task_available();
-    END IF;
-END;
-$$;
-`;
+export type { PostgresBackendOptions } from "./postgres-operations.js";
+export { initializePostgresSchema } from "./postgres-operations.js";
 
 type NotificationPayload =
   | {
@@ -102,40 +52,45 @@ export class PostgresBackend implements Backend {
   private constructor(
     private readonly pool: Pool,
     private readonly listener: Client,
+    private readonly operations: PostgresTaskOperations,
+    private readonly options: PostgresBackendOptions,
   ) {}
 
-  static async connect(databaseUrl: string): Promise<PostgresBackend> {
+  static async connect(
+    databaseUrl: string,
+    options: PostgresBackendOptions = {},
+  ): Promise<PostgresBackend> {
     const pool = new Pool({ connectionString: databaseUrl });
-    const listener = new Client({ connectionString: databaseUrl });
-    await listener.connect();
-    await listener.query(`LISTEN ${NOTIFY_CHANNEL}`);
+    let listener: Client | undefined;
 
-    const backend = new PostgresBackend(pool, listener);
-    listener.on("notification", (message: { payload?: string | null }) => {
-      if (!message.payload) {
-        return;
-      }
+    try {
+      const operations = new PostgresTaskOperations(pool, options);
+      listener = new Client({ connectionString: databaseUrl });
+      await listener.connect();
+      await listener.query(`LISTEN ${POSTGRES_NOTIFY_CHANNEL}`);
 
-      backend.handleNotification(message.payload);
-    });
+      const backend = new PostgresBackend(pool, listener, operations, options);
+      listener.on(
+        "notification",
+        (message: { payload?: string | null | undefined }) => {
+          if (!message.payload) {
+            return;
+          }
 
-    return backend;
+          backend.handleNotification(message.payload);
+        },
+      );
+
+      return backend;
+    } catch (error) {
+      await listener?.end().catch(() => undefined);
+      await pool.end().catch(() => undefined);
+      throw error;
+    }
   }
 
   async initialize(): Promise<void> {
-    const client = await this.pool.connect();
-
-    try {
-      await client.query("BEGIN");
-      await client.query("SELECT pg_advisory_xact_lock(5024011519)");
-      await client.query(INITIALIZE_SCHEMA_SQL);
-      await client.query("COMMIT");
-    } catch (error) {
-      await client.query("ROLLBACK").catch(() => undefined);
-      throw error;
-    } finally {
-      client.release();
-    }
+    await initializePostgresPool(this.pool, this.options);
   }
 
   async close(): Promise<void> {
@@ -200,32 +155,12 @@ export class PostgresBackend implements Backend {
     taskId: number,
     leaseExpirationMs: number,
   ): Promise<ClaimedTask<TPayload>> {
-    const claimedResult = await this.pool.query<{ payload_json: string }>(
-      `
-UPDATE bellows_tasks
-SET lease_worker_id = $1,
-    available_from_unix_ms = $2
-WHERE task_id = $3
-  AND task_name = $4
-  AND task_unique_key IS NULL
-  AND (
-        available_from_unix_ms IS NULL
-        OR available_from_unix_ms <= $5
-      )
-RETURNING payload_json
-      `,
-      [workerId, leaseExpirationMs, taskId, task.name, Date.now()],
-    );
-
-    if (claimedResult.rowCount === 0) {
-      throw await this.loadClaimFailure(this.pool, taskId, task.name);
-    }
-
-    return {
+    return await this.operations.claimPublished(
+      task,
+      workerId,
       taskId,
-      taskPayload: task.codec.decode(claimedResult.rows[0].payload_json),
       leaseExpirationMs,
-    };
+    );
   }
 
   async claimEarliestPublished<TPayload, TCallback>(
@@ -233,60 +168,11 @@ RETURNING payload_json
     workerId: number,
     leaseExpirationMs: number,
   ): Promise<ClaimedTask<TPayload>> {
-    const claimedResult = await this.pool.query<{
-      task_id: string;
-      payload_json: string;
-    }>(
-      `
-WITH next_task AS (
-    SELECT task_id
-    FROM bellows_tasks
-    WHERE task_name = $1
-      AND task_unique_key IS NULL
-      AND (
-            available_from_unix_ms IS NULL
-            OR available_from_unix_ms <= $2
-          )
-    ORDER BY available_from_unix_ms NULLS FIRST, task_id
-    LIMIT 1
-    FOR UPDATE SKIP LOCKED
-)
-UPDATE bellows_tasks
-SET lease_worker_id = $3,
-    available_from_unix_ms = $4
-FROM next_task
-WHERE bellows_tasks.task_id = next_task.task_id
-RETURNING bellows_tasks.task_id::text AS task_id, bellows_tasks.payload_json
-      `,
-      [task.name, Date.now(), workerId, leaseExpirationMs],
-    );
-
-    if (claimedResult.rowCount === 0) {
-      const availableFromResult = await this.pool.query<{
-        available_from_unix_ms: string | null;
-      }>(
-        `
-SELECT MIN(available_from_unix_ms)::text AS available_from_unix_ms
-FROM bellows_tasks
-WHERE task_name = $1
-  AND task_unique_key IS NULL
-  AND available_from_unix_ms > $2
-        `,
-        [task.name, Date.now()],
-      );
-
-      throw new TaskUnavailableError(
-        availableFromResult.rows[0]?.available_from_unix_ms === null
-          ? null
-          : Number(availableFromResult.rows[0]?.available_from_unix_ms ?? null),
-      );
-    }
-
-    return {
-      taskId: Number(claimedResult.rows[0].task_id),
-      taskPayload: task.codec.decode(claimedResult.rows[0].payload_json),
+    return await this.operations.claimEarliestPublished(
+      task,
+      workerId,
       leaseExpirationMs,
-    };
+    );
   }
 
   async claimSingleton<TCallback>(
@@ -294,69 +180,11 @@ WHERE task_name = $1
     workerId: number,
     leaseExpirationMs: number,
   ): Promise<ClaimedTask<undefined>> {
-    const claimedResult = await this.pool.query<{ task_id: string }>(
-      `
-INSERT INTO bellows_tasks (
-    task_name,
-    task_unique_key,
-    payload_json,
-    callback_id,
-    lease_worker_id,
-    available_from_unix_ms
-)
-VALUES ($1, $2, 'null', NULL, $3, $4)
-ON CONFLICT (task_unique_key) DO UPDATE
-SET lease_worker_id = EXCLUDED.lease_worker_id,
-    available_from_unix_ms = EXCLUDED.available_from_unix_ms
-WHERE bellows_tasks.task_name = EXCLUDED.task_name
-  AND (
-        bellows_tasks.available_from_unix_ms IS NULL
-        OR bellows_tasks.available_from_unix_ms <= $5
-      )
-RETURNING task_id::text AS task_id
-      `,
-      [task.name, task.name, workerId, leaseExpirationMs, Date.now()],
-    );
-
-    if (claimedResult.rowCount === 0) {
-      const currentResult = await this.pool.query<{
-        lease_worker_id: string | null;
-        available_from_unix_ms: string | null;
-      }>(
-        `
-SELECT lease_worker_id::text AS lease_worker_id,
-       available_from_unix_ms::text AS available_from_unix_ms
-FROM bellows_tasks
-WHERE task_name = $1
-  AND task_unique_key = $2
-        `,
-        [task.name, task.name],
-      );
-
-      if (currentResult.rowCount === 0) {
-        throw new TaskNotFoundError();
-      }
-
-      const current = currentResult.rows[0];
-      if (
-        current.available_from_unix_ms !== null &&
-        Number(current.available_from_unix_ms) > Date.now()
-      ) {
-        if (current.lease_worker_id !== null) {
-          throw new TaskLeasedError(Number(current.available_from_unix_ms));
-        }
-
-        throw new TaskUnavailableError(Number(current.available_from_unix_ms));
-      }
-
-      throw new TaskNotFoundError();
-    }
-
-    return {
-      taskId: Number(claimedResult.rows[0].task_id),
-      taskPayload: undefined,
+    return await this.operations.claimSingleton(
+      task,
+      workerId,
       leaseExpirationMs,
-    };
+    );
   }
 
   async renew(
@@ -364,21 +192,7 @@ WHERE task_name = $1
     taskId: number,
     leaseExpirationMs: number,
   ): Promise<RenewedTaskLease> {
-    const result = await this.pool.query(
-      `
-UPDATE bellows_tasks
-SET available_from_unix_ms = $1
-WHERE task_id = $2
-  AND lease_worker_id = $3
-      `,
-      [leaseExpirationMs, taskId, workerId],
-    );
-
-    if (result.rowCount === 0) {
-      throw new LeaseLostError();
-    }
-
-    return { newExpirationMs: leaseExpirationMs };
+    return await this.operations.renew(workerId, taskId, leaseExpirationMs);
   }
 
   async fail(
@@ -386,22 +200,7 @@ WHERE task_id = $2
     taskId: number,
     availableFromMs: number | null,
   ): Promise<FailedTask> {
-    const result = await this.pool.query(
-      `
-UPDATE bellows_tasks
-SET lease_worker_id = NULL,
-    available_from_unix_ms = $1
-WHERE task_id = $2
-  AND lease_worker_id = $3
-      `,
-      [availableFromMs, taskId, workerId],
-    );
-
-    if (result.rowCount === 0) {
-      throw new LeaseLostError();
-    }
-
-    return { taskId };
+    return await this.operations.fail(workerId, taskId, availableFromMs);
   }
 
   async finish<TTask extends TaskDefinition>(
@@ -411,123 +210,13 @@ WHERE task_id = $2
     callbackPayload: TaskCallback<TTask>,
     availableFromMs: number | null,
   ): Promise<FinishedTask> {
-    const callbackPayloadJson = task.callbackCodec.encode(callbackPayload);
-    const client = await this.pool.connect();
-
-    try {
-      await client.query("BEGIN");
-
-      const finishedRow =
-        task.kind === "singleton"
-          ? (
-              await client.query<{
-                callback_id: number | null;
-              }>(
-                `
-WITH claimed AS (
-    SELECT task_id, callback_id
-    FROM bellows_tasks
-    WHERE task_id = $1
-      AND lease_worker_id = $2
-      AND task_unique_key IS NOT NULL
-    FOR UPDATE
-), updated AS (
-    UPDATE bellows_tasks
-    SET lease_worker_id = NULL,
-        callback_id = NULL,
-        available_from_unix_ms = $3
-    WHERE task_id IN (SELECT task_id FROM claimed)
-    RETURNING task_id
-)
-SELECT claimed.callback_id
-FROM claimed
-JOIN updated ON updated.task_id = claimed.task_id
-                `,
-                [taskId, workerId, availableFromMs],
-              )
-            ).rows[0]
-          : availableFromMs !== null
-            ? (
-                await client.query<{
-                  callback_id: number | null;
-                }>(
-                  `
-WITH claimed AS (
-    SELECT task_id, callback_id
-    FROM bellows_tasks
-    WHERE task_id = $1
-      AND lease_worker_id = $2
-      AND task_unique_key IS NULL
-    FOR UPDATE
-), updated AS (
-    UPDATE bellows_tasks
-    SET lease_worker_id = NULL,
-        callback_id = NULL,
-        available_from_unix_ms = $3
-    WHERE task_id IN (SELECT task_id FROM claimed)
-    RETURNING task_id
-)
-SELECT claimed.callback_id
-FROM claimed
-JOIN updated ON updated.task_id = claimed.task_id
-                  `,
-                  [taskId, workerId, availableFromMs],
-                )
-              ).rows[0]
-            : (
-                await client.query<{
-                  callback_id: number | null;
-                }>(
-                  `
-DELETE FROM bellows_tasks
-WHERE task_id = $1
-  AND lease_worker_id = $2
-  AND task_unique_key IS NULL
-RETURNING callback_id
-                  `,
-                  [taskId, workerId],
-                )
-              ).rows[0];
-
-      if (!finishedRow) {
-        await client.query("ROLLBACK");
-        throw new LeaseLostError();
-      }
-
-      if (finishedRow.callback_id !== null) {
-        await client.query(
-          `
-SELECT pg_notify(
-    $1,
-    json_build_object(
-      'kind',
-      'task_callback',
-      'task_name',
-      $2::text,
-      'callback_id',
-      $3::bigint,
-      'callback_payload_json',
-      $4::text
-    )::text
-)
-          `,
-          [
-            NOTIFY_CHANNEL,
-            task.name,
-            finishedRow.callback_id,
-            callbackPayloadJson,
-          ],
-        );
-      }
-
-      await client.query("COMMIT");
-      return { taskId };
-    } catch (error) {
-      await client.query("ROLLBACK").catch(() => undefined);
-      throw error;
-    } finally {
-      client.release();
-    }
+    return await this.operations.finish(
+      task,
+      workerId,
+      taskId,
+      callbackPayload,
+      availableFromMs,
+    );
   }
 
   private async publishInternal<TPayload, TCallback>(
@@ -536,62 +225,12 @@ SELECT pg_notify(
     callbackId: number | null,
     availableFromMs: number | null,
   ): Promise<PublishedTask> {
-    const result = await this.pool.query<{ task_id: string }>(
-      `
-INSERT INTO bellows_tasks (
-    task_name,
-    task_unique_key,
-    payload_json,
-    callback_id,
-    lease_worker_id,
-    available_from_unix_ms
-)
-VALUES ($1, NULL, $2, $3, NULL, $4)
-RETURNING task_id::text AS task_id
-      `,
-      [task.name, task.codec.encode(payload), callbackId, availableFromMs],
+    return await this.operations.publish(
+      task,
+      payload,
+      callbackId,
+      availableFromMs,
     );
-
-    return { taskId: Number(result.rows[0].task_id) };
-  }
-
-  private async loadClaimFailure(
-    client: Pool | PoolClient,
-    taskId: number,
-    taskName: string,
-  ): Promise<TaskLeasedError | TaskUnavailableError | TaskNotFoundError> {
-    const currentResult = await client.query<{
-      lease_worker_id: string | null;
-      available_from_unix_ms: string | null;
-    }>(
-      `
-SELECT lease_worker_id::text AS lease_worker_id,
-       available_from_unix_ms::text AS available_from_unix_ms
-FROM bellows_tasks
-WHERE task_id = $1
-  AND task_name = $2
-  AND task_unique_key IS NULL
-      `,
-      [taskId, taskName],
-    );
-
-    if (currentResult.rowCount === 0) {
-      return new TaskNotFoundError();
-    }
-
-    const current = currentResult.rows[0];
-    if (
-      current.available_from_unix_ms !== null &&
-      Number(current.available_from_unix_ms) > Date.now()
-    ) {
-      if (current.lease_worker_id !== null) {
-        return new TaskLeasedError(Number(current.available_from_unix_ms));
-      }
-
-      return new TaskUnavailableError(Number(current.available_from_unix_ms));
-    }
-
-    return new TaskNotFoundError();
   }
 
   private handleNotification(payload: string): void {

@@ -1,4 +1,6 @@
 export { WorkerDispatcher, WorkerDispatcherHandle } from "./dispatcher.js";
+export type { PublishDispatchToken } from "./runtime.js";
+export { runTaskOnce } from "./runtime.js";
 export type {
   Backend,
   BackendSignal,
@@ -12,6 +14,7 @@ export type {
   TaskCallback,
   TaskCodec,
   TaskDefinition,
+  TaskExecutionBackend,
   TaskPayload,
   TaskResult,
   Worker,

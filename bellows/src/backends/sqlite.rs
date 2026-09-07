@@ -22,7 +22,7 @@ use tokio::sync::{
 use crate::backends::{
     Backend, BackendSignal, BackendSignalSubscription, ClaimTaskError, ClaimedTask, FailTaskError,
     FailedTask, FinishTaskError, FinishedTask, NewTaskAvailableSignalPayload, PublishTaskError,
-    PublishedTask, RenewTaskError, RenewedTaskLease, SubscribeError,
+    PublishedTask, RenewTaskError, RenewedTaskLease, SubscribeError, TaskExecutionBackend,
 };
 use crate::{AwaitableTask, PublishActivationStrategy, TaskDefinition};
 
@@ -409,7 +409,9 @@ impl Backend for SqliteBackend {
             .await?;
         Ok(AwaitableTask::new(published.task_id, callback_rx))
     }
+}
 
+impl TaskExecutionBackend for SqliteBackend {
     async fn claim_published<T>(
         &self,
         worker_id: u64,

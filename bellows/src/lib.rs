@@ -26,10 +26,14 @@
 //!
 //! ## Architecture
 //!
-//! `bellows` is backend-agnostic and extensible. Each backend contains two main parts:
+//! `bellows` is backend-agnostic and extensible. A full [`Backend`] contains two main parts:
 //!
 //! - a persistent assignment registry; and
 //! - a low-bandwidth, low-latency, and high-throughput signal channel.
+//!
+//! [`dispatcher::WorkerDispatcher`] uses both capabilities for discovery and processing. An external
+//! host can instead await [`run_task_once`] with only a [`TaskExecutionBackend`], without launching a
+//! dispatcher. Each call attempts one task; its unit return is not an execution-success status.
 
 use std::{marker::PhantomData, time::Instant};
 
@@ -37,12 +41,13 @@ use serde::{Serialize, de::DeserializeOwned};
 use tokio::sync::oneshot;
 
 pub mod backends;
-pub use backends::Backend;
 use backends::ClaimedTask;
+pub use backends::{Backend, TaskExecutionBackend};
 
 pub mod dispatcher;
 
 pub(crate) mod runtime;
+pub use runtime::run_task_once;
 
 pub trait TaskDefinition: Send {
     /// A globally stable backend namespace for this task definition.
@@ -91,7 +96,7 @@ pub trait ActivationStrategy: private::Sealed {
         lease_expiration: Instant,
     ) -> impl Future<Output = Result<ClaimedTask<Self::EffectivePayload>, backends::ClaimTaskError>> + Send
     where
-        B: Backend,
+        B: TaskExecutionBackend,
         T: TaskDefinition<Trigger = Self>;
 }
 
@@ -227,10 +232,14 @@ where
     payload_type: PhantomData<Payload>,
 }
 
-#[doc(hidden)]
+/// Selects the published task to attempt with [`run_task_once`].
+///
+/// Singleton tasks use `()` instead of this token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PublishDispatchToken {
+    /// Attempt to claim this specific task ID.
     Task(u64),
+    /// Attempt to claim one currently available task, ordered by availability.
     EarliestAvailable,
 }
 
@@ -255,7 +264,7 @@ where
         lease_expiration: Instant,
     ) -> Result<ClaimedTask<Self::EffectivePayload>, backends::ClaimTaskError>
     where
-        B: Backend,
+        B: TaskExecutionBackend,
         T: TaskDefinition<Trigger = Self>,
     {
         match dispatch_token {
@@ -305,7 +314,7 @@ impl ActivationStrategy for SingletonTrigger {
         lease_expiration: Instant,
     ) -> impl Future<Output = Result<ClaimedTask<Self::EffectivePayload>, backends::ClaimTaskError>> + Send
     where
-        B: Backend,
+        B: TaskExecutionBackend,
         T: TaskDefinition<Trigger = Self>,
     {
         backend.claim_singleton::<T>(worker_id, lease_expiration)

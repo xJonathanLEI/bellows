@@ -29,6 +29,10 @@
       "types": "./dist/backends/postgres.d.ts",
       "default": "./dist/backends/postgres.js"
     },
+    "./backends/postgres-execution": {
+      "types": "./dist/backends/postgres-execution.d.ts",
+      "default": "./dist/backends/postgres-execution.js"
+    },
     "./backends/sqlite": {
       "types": "./dist/backends/sqlite.d.ts",
       "default": "./dist/backends/sqlite.js"

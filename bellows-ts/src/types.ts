@@ -200,21 +200,7 @@ export class TaskFailure {
 
 export type TaskResult<TCallback> = TaskSuccess<TCallback> | TaskFailure;
 
-export interface Backend {
-  subscribe(task: TaskDefinition): Promise<BackendSignalSubscription>;
-  publish<TPayload, TCallback>(
-    task: PublishTaskDefinition<TPayload, TCallback>,
-    payload: TPayload,
-  ): Promise<PublishedTask>;
-  publishFuture<TPayload, TCallback>(
-    task: PublishTaskDefinition<TPayload, TCallback>,
-    payload: TPayload,
-    availableFromMs: number,
-  ): Promise<PublishedTask>;
-  publishAwaitable<TPayload, TCallback>(
-    task: PublishTaskDefinition<TPayload, TCallback>,
-    payload: TPayload,
-  ): Promise<AwaitableTask<TCallback>>;
+export interface TaskExecutionBackend {
   claimPublished<TPayload, TCallback>(
     task: PublishTaskDefinition<TPayload, TCallback>,
     workerId: number,
@@ -248,6 +234,23 @@ export interface Backend {
     callbackPayload: TaskCallback<TTask>,
     availableFromMs: number | null,
   ): Promise<FinishedTask>;
+}
+
+export interface Backend extends TaskExecutionBackend {
+  subscribe(task: TaskDefinition): Promise<BackendSignalSubscription>;
+  publish<TPayload, TCallback>(
+    task: PublishTaskDefinition<TPayload, TCallback>,
+    payload: TPayload,
+  ): Promise<PublishedTask>;
+  publishFuture<TPayload, TCallback>(
+    task: PublishTaskDefinition<TPayload, TCallback>,
+    payload: TPayload,
+    availableFromMs: number,
+  ): Promise<PublishedTask>;
+  publishAwaitable<TPayload, TCallback>(
+    task: PublishTaskDefinition<TPayload, TCallback>,
+    payload: TPayload,
+  ): Promise<AwaitableTask<TCallback>>;
 }
 
 export interface Worker<TTask extends TaskDefinition> {

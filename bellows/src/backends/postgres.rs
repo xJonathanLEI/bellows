@@ -2,18 +2,13 @@
 
 use std::{
     collections::{HashMap, hash_map::Entry as HashMapEntry},
-    error::Error as StdError,
-    fmt::{Display, Formatter},
+    fmt::Formatter,
     sync::{Arc, Mutex, Weak},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime},
 };
 
 use rand::RngExt;
-use serde::{Deserialize, Serialize};
-use sqlx::{
-    Row,
-    postgres::{PgListener, PgPool, PgPoolOptions},
-};
+use sqlx::postgres::PgListener;
 use tokio::sync::{
     broadcast::{self, Sender as BroadcastSender},
     oneshot::Sender as OneshotSender,
@@ -24,113 +19,19 @@ use tracing::warn;
 use crate::backends::{
     Backend, BackendSignal, BackendSignalSubscription, ClaimTaskError, ClaimedTask, FailTaskError,
     FailedTask, FinishTaskError, FinishedTask, NewTaskAvailableSignalPayload, PublishTaskError,
-    PublishedTask, RenewTaskError, RenewedTaskLease, SubscribeError,
+    PublishedTask, RenewTaskError, RenewedTaskLease, SubscribeError, TaskExecutionBackend,
 };
 use crate::{AwaitableTask, PublishActivationStrategy, TaskDefinition};
 
+use super::postgres_operations::{
+    NOTIFY_CHANNEL, NotificationPayload, PostgresTaskOperations, unix_ms_to_instant,
+};
+pub use super::postgres_operations::{
+    PostgresBackendError, PostgresBackendOptions, initialize_postgres_schema,
+};
+
 const SIGNAL_CHANNEL_SIZE: usize = 1024;
-const NOTIFY_CHANNEL: &str = "bellows_tasks";
 const LISTENER_RETRY_DELAY: Duration = Duration::from_secs(1);
-
-const INITIALIZE_SCHEMA_SQL: &str = r#"
-CREATE TABLE IF NOT EXISTS bellows_tasks (
-    task_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    task_name TEXT NOT NULL,
-    task_unique_key TEXT,
-    payload_json TEXT NOT NULL,
-    callback_id BIGINT,
-    lease_worker_id BIGINT,
-    available_from_unix_ms BIGINT,
-    CHECK (lease_worker_id IS NULL OR available_from_unix_ms IS NOT NULL)
-);
-
-CREATE UNIQUE INDEX IF NOT EXISTS bellows_tasks_unique_key_idx
-    ON bellows_tasks (task_unique_key);
-
-CREATE INDEX IF NOT EXISTS bellows_tasks_available_idx
-    ON bellows_tasks (task_name, task_unique_key, available_from_unix_ms, task_id);
-
-CREATE OR REPLACE FUNCTION bellows_notify_task_available()
-RETURNS trigger
-LANGUAGE plpgsql
-AS $$
-BEGIN
-    PERFORM pg_notify(
-        'bellows_tasks',
-        json_build_object(
-            'kind', 'new_task_available',
-            'task_name', NEW.task_name,
-            'task_id', NEW.task_id,
-            'available_from_unix_ms', NEW.available_from_unix_ms
-        )::text
-    );
-
-    RETURN NEW;
-END;
-$$;
-
-DO $$
-BEGIN
-    IF NOT EXISTS (
-        SELECT 1
-        FROM pg_trigger
-        WHERE tgname = 'bellows_tasks_notify_available'
-          AND tgrelid = 'bellows_tasks'::regclass
-    ) THEN
-        CREATE TRIGGER bellows_tasks_notify_available
-        AFTER INSERT OR UPDATE OF lease_worker_id, available_from_unix_ms ON bellows_tasks
-        FOR EACH ROW
-        EXECUTE FUNCTION bellows_notify_task_available();
-    END IF;
-END;
-$$;
-"#;
-
-#[derive(Debug)]
-pub enum PostgresBackendError {
-    Sqlx(sqlx::Error),
-    InvalidTaskId(std::num::TryFromIntError),
-    InvalidWorkerId(std::num::TryFromIntError),
-    PayloadSerialization(serde_json::Error),
-    PayloadDeserialization(serde_json::Error),
-    CallbackSerialization(serde_json::Error),
-}
-
-impl Display for PostgresBackendError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Sqlx(error) => write!(f, "postgres operation failed: {error}"),
-            Self::InvalidTaskId(error) => {
-                write!(f, "task ID could not be represented in Postgres: {error}")
-            }
-            Self::InvalidWorkerId(error) => {
-                write!(f, "worker ID could not be represented in Postgres: {error}")
-            }
-            Self::PayloadSerialization(error) => {
-                write!(f, "task payload serialization failed: {error}")
-            }
-            Self::PayloadDeserialization(error) => {
-                write!(f, "task payload deserialization failed: {error}")
-            }
-            Self::CallbackSerialization(error) => {
-                write!(f, "task callback serialization failed: {error}")
-            }
-        }
-    }
-}
-
-impl StdError for PostgresBackendError {
-    fn source(&self) -> Option<&(dyn StdError + 'static)> {
-        match self {
-            Self::Sqlx(error) => Some(error),
-            Self::InvalidTaskId(error) => Some(error),
-            Self::InvalidWorkerId(error) => Some(error),
-            Self::PayloadSerialization(error) => Some(error),
-            Self::PayloadDeserialization(error) => Some(error),
-            Self::CallbackSerialization(error) => Some(error),
-        }
-    }
-}
 
 /// Postgres-backed task registry with native `LISTEN`/`NOTIFY` signaling.
 ///
@@ -139,9 +40,13 @@ impl StdError for PostgresBackendError {
 /// Unlike the SQLite backend, task availability signals are emitted directly by Postgres via a
 /// trigger on the task table, making this backend suitable for multi-process and distributed
 /// deployments as long as all participants can reach the same database.
+///
+/// This full backend supports both [`crate::dispatcher::WorkerDispatcher`] and
+/// [`crate::run_task_once`]. For execution without a dedicated listener or publishing/subscription
+/// capabilities, use [`super::postgres_execution::PostgresExecutionBackend`] instead.
 #[derive(Clone)]
 pub struct PostgresBackend {
-    pool: PgPool,
+    operations: PostgresTaskOperations,
     shared: Arc<Shared>,
 }
 
@@ -160,7 +65,7 @@ impl Drop for Shared {
 impl std::fmt::Debug for PostgresBackend {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PostgresBackend")
-            .field("pool", &self.pool)
+            .field("operations", &self.operations)
             .finish_non_exhaustive()
     }
 }
@@ -169,10 +74,20 @@ impl PostgresBackend {
     /// Connects to a Postgres database URL.
     ///
     /// This only establishes the connection pool and starts the background notification listener.
-    /// Call [`Self::initialize`] separately if you want the backend to create its schema and
-    /// triggers automatically.
+    /// Call [`Self::initialize`] separately to create the required tables, indexes, and triggers.
     pub async fn connect(database_url: &str) -> Result<Self, sqlx::Error> {
-        let pool = PgPoolOptions::new().connect(database_url).await?;
+        Self::connect_with_options(database_url, PostgresBackendOptions::default()).await
+    }
+
+    /// Connects with an optional, existing PostgreSQL schema.
+    ///
+    /// Schema names are validated before connecting; invalid names return
+    /// [`sqlx::Error::Configuration`]. This does not create schemas or initialize any tables.
+    pub async fn connect_with_options(
+        database_url: &str,
+        options: PostgresBackendOptions,
+    ) -> Result<Self, sqlx::Error> {
+        let operations = PostgresTaskOperations::connect(database_url, options).await?;
         let listener = connect_listener(database_url).await?;
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -191,27 +106,15 @@ impl PostgresBackend {
 
         tokio::spawn(daemon.run());
 
-        Ok(Self { pool, shared })
+        Ok(Self { operations, shared })
     }
 
     /// Initializes the Postgres schema required by the backend.
     ///
-    /// This operation is idempotent and can be safely called multiple times.
+    /// This operation is transactional and idempotent. A configured schema must already exist.
+    /// The connection's search path is not changed outside the initialization transaction.
     pub async fn initialize(&self) -> Result<(), sqlx::Error> {
-        let mut transaction = self.pool.begin().await?;
-
-        sqlx::query("SELECT pg_advisory_xact_lock($1)")
-            .bind(5_024_011_519_i64)
-            .execute(&mut *transaction)
-            .await?;
-
-        sqlx::raw_sql(INITIALIZE_SCHEMA_SQL)
-            .execute(&mut *transaction)
-            .await?;
-
-        transaction.commit().await?;
-
-        Ok(())
+        self.operations.initialize().await
     }
 
     fn signal_for_task(&self, task_name: &'static str) -> BroadcastSender<BackendSignal> {
@@ -272,55 +175,16 @@ impl PostgresBackend {
         T: TaskDefinition,
         T::Trigger: PublishActivationStrategy,
     {
-        let payload_json = serde_json::to_string(&payload).map_err(|err| {
-            PublishTaskError::Backend(Box::new(PostgresBackendError::PayloadSerialization(err)))
-        })?;
-
-        let now_system = SystemTime::now();
-        let available_from_unix_ms =
-            available_from.map(|available_from| instant_to_unix_ms(available_from, now_system));
-
-        let row = sqlx::query(
-            r#"
-INSERT INTO bellows_tasks (
-    task_name,
-    task_unique_key,
-    payload_json,
-    callback_id,
-    lease_worker_id,
-    available_from_unix_ms
-)
-VALUES ($1, NULL, $2, $3, NULL, $4)
-RETURNING task_id
-"#,
-        )
-        .bind(T::NAME)
-        .bind(payload_json)
-        .bind(callback_id)
-        .bind(available_from_unix_ms)
-        .fetch_one(&self.pool)
-        .await;
-
-        let row = match row {
-            Ok(row) => row,
-            Err(err) => {
-                if let Some(callback_id) = callback_id {
-                    self.drop_reserved_callback(callback_id);
-                }
-                return Err(PublishTaskError::Backend(Box::new(
-                    PostgresBackendError::Sqlx(err),
-                )));
-            }
-        };
-
-        let task_id = u64::try_from(row.get::<i64, _>("task_id")).map_err(|err| {
-            if let Some(callback_id) = callback_id {
-                self.drop_reserved_callback(callback_id);
-            }
-            PublishTaskError::Backend(Box::new(PostgresBackendError::InvalidTaskId(err)))
-        })?;
-
-        Ok(PublishedTask { task_id })
+        let result = self
+            .operations
+            .publish::<T>(payload, callback_id, available_from)
+            .await;
+        if result.is_err()
+            && let Some(callback_id) = callback_id
+        {
+            self.drop_reserved_callback(callback_id);
+        }
+        result
     }
 }
 
@@ -372,7 +236,9 @@ impl Backend for PostgresBackend {
             .await?;
         Ok(AwaitableTask::new(published.task_id, callback_rx))
     }
+}
 
+impl TaskExecutionBackend for PostgresBackend {
     async fn claim_published<T>(
         &self,
         worker_id: u64,
@@ -386,96 +252,9 @@ impl Backend for PostgresBackend {
         T: TaskDefinition,
         T::Trigger: PublishActivationStrategy,
     {
-        let task_id_db = i64::try_from(task_id).map_err(|err| {
-            ClaimTaskError::Backend(Box::new(PostgresBackendError::InvalidTaskId(err)))
-        })?;
-        let worker_id_db = i64::try_from(worker_id).map_err(|err| {
-            ClaimTaskError::Backend(Box::new(PostgresBackendError::InvalidWorkerId(err)))
-        })?;
-        let now_system = SystemTime::now();
-        let now_unix_ms = unix_timestamp_ms(now_system);
-        let lease_expiration_unix_ms = instant_to_unix_ms(lease_expiration, now_system);
-
-        let claimed_row = sqlx::query(
-            r#"
-UPDATE bellows_tasks
-SET lease_worker_id = $1,
-    available_from_unix_ms = $2
-WHERE task_id = $3
-  AND task_name = $4
-  AND task_unique_key IS NULL
-  AND (
-        available_from_unix_ms IS NULL
-        OR available_from_unix_ms <= $5
-      )
-RETURNING payload_json
-"#,
-        )
-        .bind(worker_id_db)
-        .bind(lease_expiration_unix_ms)
-        .bind(task_id_db)
-        .bind(T::NAME)
-        .bind(now_unix_ms)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|err| ClaimTaskError::Backend(Box::new(PostgresBackendError::Sqlx(err))))?;
-
-        match claimed_row {
-            Some(claimed_row) => {
-                let payload_json = claimed_row.get::<String, _>("payload_json");
-                let task_payload = serde_json::from_str(&payload_json).map_err(|err| {
-                    ClaimTaskError::Backend(Box::new(PostgresBackendError::PayloadDeserialization(
-                        err,
-                    )))
-                })?;
-
-                Ok(ClaimedTask {
-                    task_id,
-                    task_payload,
-                    lease_expiration,
-                })
-            }
-            None => {
-                let current = sqlx::query(
-                    r#"
-SELECT lease_worker_id, available_from_unix_ms
-FROM bellows_tasks
-WHERE task_id = $1
-  AND task_name = $2
-  AND task_unique_key IS NULL
-"#,
-                )
-                .bind(task_id_db)
-                .bind(T::NAME)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(|err| {
-                    ClaimTaskError::Backend(Box::new(PostgresBackendError::Sqlx(err)))
-                })?;
-
-                let Some(current) = current else {
-                    return Err(ClaimTaskError::TaskNotFound);
-                };
-
-                match current.get::<Option<i64>, _>("available_from_unix_ms") {
-                    Some(available_from_unix_ms) if available_from_unix_ms > now_unix_ms => {
-                        if current.get::<Option<i64>, _>("lease_worker_id").is_some() {
-                            Err(ClaimTaskError::TaskLeased {
-                                expiration: unix_ms_to_instant(available_from_unix_ms, now_system),
-                            })
-                        } else {
-                            Err(ClaimTaskError::TaskUnavailable {
-                                available_from: Some(unix_ms_to_instant(
-                                    available_from_unix_ms,
-                                    now_system,
-                                )),
-                            })
-                        }
-                    }
-                    Some(_) | None => Err(ClaimTaskError::TaskNotFound),
-                }
-            }
-        }
+        self.operations
+            .claim_published::<T>(worker_id, task_id, lease_expiration)
+            .await
     }
 
     async fn claim_earliest_published<T>(
@@ -490,86 +269,9 @@ WHERE task_id = $1
         T: TaskDefinition,
         T::Trigger: PublishActivationStrategy,
     {
-        let worker_id_db = i64::try_from(worker_id).map_err(|err| {
-            ClaimTaskError::Backend(Box::new(PostgresBackendError::InvalidWorkerId(err)))
-        })?;
-        let now_system = SystemTime::now();
-        let now_unix_ms = unix_timestamp_ms(now_system);
-        let lease_expiration_unix_ms = instant_to_unix_ms(lease_expiration, now_system);
-
-        let claimed_row = sqlx::query(
-            r#"
-WITH next_task AS (
-    SELECT task_id
-    FROM bellows_tasks
-    WHERE task_name = $1
-      AND task_unique_key IS NULL
-      AND (
-            available_from_unix_ms IS NULL
-            OR available_from_unix_ms <= $2
-          )
-    ORDER BY available_from_unix_ms NULLS FIRST, task_id
-    LIMIT 1
-    FOR UPDATE SKIP LOCKED
-)
-UPDATE bellows_tasks
-SET lease_worker_id = $3,
-    available_from_unix_ms = $4
-FROM next_task
-WHERE bellows_tasks.task_id = next_task.task_id
-RETURNING bellows_tasks.task_id, bellows_tasks.payload_json
-"#,
-        )
-        .bind(T::NAME)
-        .bind(now_unix_ms)
-        .bind(worker_id_db)
-        .bind(lease_expiration_unix_ms)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|err| ClaimTaskError::Backend(Box::new(PostgresBackendError::Sqlx(err))))?;
-
-        match claimed_row {
-            Some(claimed_row) => {
-                let task_id =
-                    u64::try_from(claimed_row.get::<i64, _>("task_id")).map_err(|err| {
-                        ClaimTaskError::Backend(Box::new(PostgresBackendError::InvalidTaskId(err)))
-                    })?;
-                let payload_json = claimed_row.get::<String, _>("payload_json");
-                let task_payload = serde_json::from_str(&payload_json).map_err(|err| {
-                    ClaimTaskError::Backend(Box::new(PostgresBackendError::PayloadDeserialization(
-                        err,
-                    )))
-                })?;
-
-                Ok(ClaimedTask {
-                    task_id,
-                    task_payload,
-                    lease_expiration,
-                })
-            }
-            None => {
-                let earliest_available_from = sqlx::query(
-                    r#"
-SELECT MIN(available_from_unix_ms) AS available_from_unix_ms
-FROM bellows_tasks
-WHERE task_name = $1
-  AND task_unique_key IS NULL
-  AND available_from_unix_ms > $2
-"#,
-                )
-                .bind(T::NAME)
-                .bind(now_unix_ms)
-                .fetch_one(&self.pool)
-                .await
-                .map_err(|err| ClaimTaskError::Backend(Box::new(PostgresBackendError::Sqlx(err))))?
-                .get::<Option<i64>, _>("available_from_unix_ms")
-                .map(|unix_ms| unix_ms_to_instant(unix_ms, now_system));
-
-                Err(ClaimTaskError::TaskUnavailable {
-                    available_from: earliest_available_from,
-                })
-            }
-        }
+        self.operations
+            .claim_earliest_published::<T>(worker_id, lease_expiration)
+            .await
     }
 
     async fn claim_singleton<T>(
@@ -580,97 +282,9 @@ WHERE task_name = $1
     where
         T: TaskDefinition,
     {
-        let worker_id_db = i64::try_from(worker_id).map_err(|err| {
-            ClaimTaskError::Backend(Box::new(PostgresBackendError::InvalidWorkerId(err)))
-        })?;
-        let now_system = SystemTime::now();
-        let now_unix_ms = unix_timestamp_ms(now_system);
-        let lease_expiration_unix_ms = instant_to_unix_ms(lease_expiration, now_system);
-
-        let claimed_row = sqlx::query(
-            r#"
-INSERT INTO bellows_tasks (
-    task_name,
-    task_unique_key,
-    payload_json,
-    callback_id,
-    lease_worker_id,
-    available_from_unix_ms
-)
-VALUES ($1, $2, 'null', NULL, $3, $4)
-ON CONFLICT (task_unique_key) DO UPDATE
-SET lease_worker_id = EXCLUDED.lease_worker_id,
-    available_from_unix_ms = EXCLUDED.available_from_unix_ms
-WHERE bellows_tasks.task_name = EXCLUDED.task_name
-  AND (
-        bellows_tasks.available_from_unix_ms IS NULL
-        OR bellows_tasks.available_from_unix_ms <= $5
-      )
-RETURNING task_id
-"#,
-        )
-        .bind(T::NAME)
-        .bind(T::NAME)
-        .bind(worker_id_db)
-        .bind(lease_expiration_unix_ms)
-        .bind(now_unix_ms)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|err| ClaimTaskError::Backend(Box::new(PostgresBackendError::Sqlx(err))))?;
-
-        match claimed_row {
-            Some(claimed_row) => {
-                let task_id =
-                    u64::try_from(claimed_row.get::<i64, _>("task_id")).map_err(|err| {
-                        ClaimTaskError::Backend(Box::new(PostgresBackendError::InvalidTaskId(err)))
-                    })?;
-
-                Ok(ClaimedTask {
-                    task_id,
-                    task_payload: (),
-                    lease_expiration,
-                })
-            }
-            None => {
-                let current = sqlx::query(
-                    r#"
-SELECT lease_worker_id, available_from_unix_ms
-FROM bellows_tasks
-WHERE task_name = $1
-  AND task_unique_key = $2
-"#,
-                )
-                .bind(T::NAME)
-                .bind(T::NAME)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(|err| {
-                    ClaimTaskError::Backend(Box::new(PostgresBackendError::Sqlx(err)))
-                })?;
-
-                let Some(current) = current else {
-                    return Err(ClaimTaskError::TaskNotFound);
-                };
-
-                match current.get::<Option<i64>, _>("available_from_unix_ms") {
-                    Some(available_from_unix_ms) if available_from_unix_ms > now_unix_ms => {
-                        if current.get::<Option<i64>, _>("lease_worker_id").is_some() {
-                            Err(ClaimTaskError::TaskLeased {
-                                expiration: unix_ms_to_instant(available_from_unix_ms, now_system),
-                            })
-                        } else {
-                            Err(ClaimTaskError::TaskUnavailable {
-                                available_from: Some(unix_ms_to_instant(
-                                    available_from_unix_ms,
-                                    now_system,
-                                )),
-                            })
-                        }
-                    }
-                    Some(_) | None => Err(ClaimTaskError::TaskNotFound),
-                }
-            }
-        }
+        self.operations
+            .claim_singleton::<T>(worker_id, lease_expiration)
+            .await
     }
 
     async fn renew(
@@ -679,36 +293,9 @@ WHERE task_name = $1
         task_id: u64,
         lease_expiration: Instant,
     ) -> Result<RenewedTaskLease, RenewTaskError> {
-        let task_id_db = i64::try_from(task_id).map_err(|err| {
-            RenewTaskError::Backend(Box::new(PostgresBackendError::InvalidTaskId(err)))
-        })?;
-        let worker_id_db = i64::try_from(worker_id).map_err(|err| {
-            RenewTaskError::Backend(Box::new(PostgresBackendError::InvalidWorkerId(err)))
-        })?;
-        let lease_expiration_unix_ms = instant_to_unix_ms(lease_expiration, SystemTime::now());
-
-        let result = sqlx::query(
-            r#"
-UPDATE bellows_tasks
-SET available_from_unix_ms = $1
-WHERE task_id = $2
-  AND lease_worker_id = $3
-"#,
-        )
-        .bind(lease_expiration_unix_ms)
-        .bind(task_id_db)
-        .bind(worker_id_db)
-        .execute(&self.pool)
-        .await
-        .map_err(|err| RenewTaskError::Backend(Box::new(PostgresBackendError::Sqlx(err))))?;
-
-        if result.rows_affected() == 0 {
-            Err(RenewTaskError::LeaseLost)
-        } else {
-            Ok(RenewedTaskLease {
-                new_expiration: lease_expiration,
-            })
-        }
+        self.operations
+            .renew(worker_id, task_id, lease_expiration)
+            .await
     }
 
     async fn fail(
@@ -717,36 +304,9 @@ WHERE task_id = $2
         task_id: u64,
         available_from: Option<Instant>,
     ) -> Result<FailedTask, FailTaskError> {
-        let task_id_db = i64::try_from(task_id).map_err(|err| {
-            FailTaskError::Backend(Box::new(PostgresBackendError::InvalidTaskId(err)))
-        })?;
-        let worker_id_db = i64::try_from(worker_id).map_err(|err| {
-            FailTaskError::Backend(Box::new(PostgresBackendError::InvalidWorkerId(err)))
-        })?;
-        let available_from_unix_ms =
-            available_from.map(|instant| instant_to_unix_ms(instant, SystemTime::now()));
-
-        let result = sqlx::query(
-            r#"
-UPDATE bellows_tasks
-SET lease_worker_id = NULL,
-    available_from_unix_ms = $1
-WHERE task_id = $2
-  AND lease_worker_id = $3
-"#,
-        )
-        .bind(available_from_unix_ms)
-        .bind(task_id_db)
-        .bind(worker_id_db)
-        .execute(&self.pool)
-        .await
-        .map_err(|err| FailTaskError::Backend(Box::new(PostgresBackendError::Sqlx(err))))?;
-
-        if result.rows_affected() == 0 {
-            Err(FailTaskError::LeaseLost)
-        } else {
-            Ok(FailedTask { task_id })
-        }
+        self.operations
+            .fail(worker_id, task_id, available_from)
+            .await
     }
 
     async fn finish<T>(
@@ -759,131 +319,9 @@ WHERE task_id = $2
     where
         T: TaskDefinition,
     {
-        let task_id_db = i64::try_from(task_id).map_err(|err| {
-            FinishTaskError::Backend(Box::new(PostgresBackendError::InvalidTaskId(err)))
-        })?;
-        let worker_id_db = i64::try_from(worker_id).map_err(|err| {
-            FinishTaskError::Backend(Box::new(PostgresBackendError::InvalidWorkerId(err)))
-        })?;
-        let callback_payload_json = serde_json::to_string(&callback_payload).map_err(|err| {
-            FinishTaskError::Backend(Box::new(PostgresBackendError::CallbackSerialization(err)))
-        })?;
-        let now_system = SystemTime::now();
-        let available_from_unix_ms =
-            available_from.map(|available_from| instant_to_unix_ms(available_from, now_system));
-
-        let mut tx =
-            self.pool.begin().await.map_err(|err| {
-                FinishTaskError::Backend(Box::new(PostgresBackendError::Sqlx(err)))
-            })?;
-
-        let finished_row = match (
-            <T::Trigger as crate::ActivationStrategy>::KIND,
-            available_from,
-        ) {
-            (crate::ActivationStrategyKind::Singleton, _) => sqlx::query(
-                r#"
-WITH claimed AS (
-    SELECT task_id, task_name, callback_id
-    FROM bellows_tasks
-    WHERE task_id = $1
-      AND lease_worker_id = $2
-      AND task_unique_key IS NOT NULL
-    FOR UPDATE
-), updated AS (
-    UPDATE bellows_tasks
-    SET lease_worker_id = NULL,
-        callback_id = NULL,
-        available_from_unix_ms = $3
-    WHERE task_id IN (SELECT task_id FROM claimed)
-    RETURNING task_id
-)
-SELECT claimed.task_name, claimed.callback_id
-FROM claimed
-JOIN updated ON updated.task_id = claimed.task_id
-"#,
-            )
-            .bind(task_id_db)
-            .bind(worker_id_db)
-            .bind(available_from_unix_ms)
-            .fetch_optional(&mut *tx)
+        self.operations
+            .finish::<T>(worker_id, task_id, callback_payload, available_from)
             .await
-            .map_err(|err| FinishTaskError::Backend(Box::new(PostgresBackendError::Sqlx(err))))?,
-            (crate::ActivationStrategyKind::Publish, Some(_)) => sqlx::query(
-                r#"
-WITH claimed AS (
-    SELECT task_id, task_name, callback_id
-    FROM bellows_tasks
-    WHERE task_id = $1
-      AND lease_worker_id = $2
-      AND task_unique_key IS NULL
-    FOR UPDATE
-), updated AS (
-    UPDATE bellows_tasks
-    SET lease_worker_id = NULL,
-        callback_id = NULL,
-        available_from_unix_ms = $3
-    WHERE task_id IN (SELECT task_id FROM claimed)
-    RETURNING task_id
-)
-SELECT claimed.task_name, claimed.callback_id
-FROM claimed
-JOIN updated ON updated.task_id = claimed.task_id
-"#,
-            )
-            .bind(task_id_db)
-            .bind(worker_id_db)
-            .bind(available_from_unix_ms)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|err| FinishTaskError::Backend(Box::new(PostgresBackendError::Sqlx(err))))?,
-            (crate::ActivationStrategyKind::Publish, None) => sqlx::query(
-                r#"
-DELETE FROM bellows_tasks
-WHERE task_id = $1
-  AND lease_worker_id = $2
-  AND task_unique_key IS NULL
-RETURNING task_name, callback_id
-"#,
-            )
-            .bind(task_id_db)
-            .bind(worker_id_db)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|err| FinishTaskError::Backend(Box::new(PostgresBackendError::Sqlx(err))))?,
-        };
-
-        let Some(finished_row) = finished_row else {
-            tx.rollback().await.ok();
-            return Err(FinishTaskError::LeaseLost);
-        };
-
-        let task_name = finished_row.get::<String, _>("task_name");
-        let callback_id = finished_row.get::<Option<i64>, _>("callback_id");
-
-        if let Some(callback_id) = callback_id {
-            let payload_json = serde_json::to_string(&NotificationPayload::TaskCallback {
-                task_name,
-                callback_id,
-                callback_payload_json,
-            })
-            .expect("postgres callback notification payload should serialize");
-
-            sqlx::query("SELECT pg_notify($1, $2)")
-                .bind(NOTIFY_CHANNEL)
-                .bind(payload_json)
-                .execute(&mut *tx)
-                .await
-                .map_err(|err| {
-                    FinishTaskError::Backend(Box::new(PostgresBackendError::Sqlx(err)))
-                })?;
-        }
-
-        tx.commit()
-            .await
-            .map_err(|err| FinishTaskError::Backend(Box::new(PostgresBackendError::Sqlx(err))))?;
-
-        Ok(FinishedTask { task_id })
     }
 }
 
@@ -1064,50 +502,4 @@ async fn connect_listener(database_url: &str) -> Result<PgListener, sqlx::Error>
     let mut listener = PgListener::connect(database_url).await?;
     listener.listen(NOTIFY_CHANNEL).await?;
     Ok(listener)
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-enum NotificationPayload {
-    NewTaskAvailable {
-        task_name: String,
-        task_id: i64,
-        available_from_unix_ms: Option<i64>,
-    },
-    TaskCallback {
-        task_name: String,
-        callback_id: i64,
-        callback_payload_json: String,
-    },
-}
-
-fn unix_timestamp_ms(time: SystemTime) -> i64 {
-    let duration = time.duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO);
-
-    i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
-}
-
-fn instant_to_unix_ms(instant: Instant, now_system: SystemTime) -> i64 {
-    let now_instant = Instant::now();
-    let system_deadline = if instant >= now_instant {
-        now_system + instant.duration_since(now_instant)
-    } else {
-        now_system
-            .checked_sub(now_instant.duration_since(instant))
-            .unwrap_or(UNIX_EPOCH)
-    };
-
-    unix_timestamp_ms(system_deadline)
-}
-
-fn unix_ms_to_instant(unix_ms: i64, now_system: SystemTime) -> Instant {
-    let now_instant = Instant::now();
-    let now_unix_ms = unix_timestamp_ms(now_system);
-
-    if unix_ms <= now_unix_ms {
-        now_instant
-    } else {
-        let delta_ms = u64::try_from(unix_ms - now_unix_ms).unwrap_or(u64::MAX);
-        now_instant + Duration::from_millis(delta_ms)
-    }
 }
