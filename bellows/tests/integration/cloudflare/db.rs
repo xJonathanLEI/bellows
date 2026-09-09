@@ -1,4 +1,4 @@
-//! Application glue for callback-free INSERTs, not a Bellows publishing backend.
+//! Application-side connections for processor business SQL and cancellation contracts.
 //! Own and await the driver: returning from a request must not abandon socket I/O.
 
 use tokio::sync::oneshot;

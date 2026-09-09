@@ -1,0 +1,20 @@
+{
+  "$schema": "../../../node_modules/wrangler/config-schema.json",
+  "name": "bellows-cloudflare-publisher-contracts",
+  "main": "workers/publisher.ts",
+  "compatibility_date": "2026-07-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": false,
+  "preview_urls": false,
+  "vars": { "BELLOWS_SCHEMA": "bellows_cloudflare" },
+  "hyperdrive": [
+    {
+      "binding": "HYPERDRIVE",
+      "id": "00000000000000000000000000000000"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [{ "name": "DISPATCHER", "class_name": "PublisherReceiver" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["PublisherReceiver"] }]
+}

@@ -27,7 +27,10 @@ import {
 } from "./postgres-operations.js";
 
 export type { PostgresBackendOptions } from "./postgres-operations.js";
-export { initializePostgresSchema } from "./postgres-operations.js";
+export {
+  initializePostgresSchema,
+  PostgresPublishedTaskIdError,
+} from "./postgres-operations.js";
 
 type NotificationPayload =
   | {
@@ -49,6 +52,8 @@ const MAX_CALLBACK_ID = BigInt(Number.MAX_SAFE_INTEGER);
  * Full PostgreSQL backend with listener-backed signaling and callback delivery.
  * For plain publication without a listener, use `PostgresPublishingBackend` from
  * `@xjonathanlei/bellows/backends/postgres-publishing`, including for callback-bearing definitions.
+ * Publication returns safe numeric IDs or throws `PostgresPublishedTaskIdError` with the exact
+ * committed ID as a string. Other publication errors do not establish whether the insert committed.
  */
 export class PostgresBackend implements Backend {
   private readonly signals = new Map<string, SignalHub>();

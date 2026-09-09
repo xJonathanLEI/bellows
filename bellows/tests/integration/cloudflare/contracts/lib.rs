@@ -1,7 +1,10 @@
 #![cfg(target_arch = "wasm32")]
 
 mod postgres;
+mod publisher;
 mod runtime;
+
+pub use publisher::PublisherReceiver;
 
 use std::sync::{
     Arc,
@@ -17,6 +20,9 @@ use worker::*;
 #[event(fetch)]
 pub async fn fetch(request: Request, env: Env, _ctx: Context) -> Result<Response> {
     let path = request.path();
+    if path.starts_with("/publisher/") {
+        return publisher::fetch(request, &env).await;
+    }
     if path == "/postgres/close" {
         return postgres::run(&env).await;
     }

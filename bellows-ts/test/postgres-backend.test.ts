@@ -1,13 +1,17 @@
 import { randomUUID } from "node:crypto";
-import { Client } from "pg";
-import { afterEach, expect, expectTypeOf, test } from "vitest";
+import { Client, Pool } from "pg";
+import { afterEach, expect, expectTypeOf, test, vi } from "vitest";
 import {
+  PostgresPublishedTaskIdError as FullBackendPublishedTaskIdError,
   initializePostgresSchema,
   PostgresBackend,
 } from "../src/backends/postgres.js";
 import { PostgresExecutionBackend } from "../src/backends/postgres-execution.js";
 import { validatePostgresSchemaName } from "../src/backends/postgres-operations.js";
-import { PostgresPublishingBackend } from "../src/backends/postgres-publishing.js";
+import {
+  PostgresPublishedTaskIdError,
+  PostgresPublishingBackend,
+} from "../src/backends/postgres-publishing.js";
 import {
   definePublishTask,
   defineSingletonTask,
@@ -501,6 +505,97 @@ test("postgres publishing backend exposes only publication and lifecycle methods
   >();
 });
 
+test("postgres publication ID errors are shared by both public backends", () => {
+  expect(FullBackendPublishedTaskIdError).toBe(PostgresPublishedTaskIdError);
+  expectTypeOf<
+    PostgresPublishedTaskIdError["taskId"]
+  >().toEqualTypeOf<string>();
+});
+
+test.each([
+  ["full", "immediate"],
+  ["full", "future"],
+  ["publishing-only", "immediate"],
+  ["publishing-only", "future"],
+] as const)("postgres %s %s publication preserves safe receipts and exact unsupported IDs", async (backendMode, publicationMode) => {
+  const database = track(await TestPostgresDatabase.create("publication_ids"));
+  await initializePostgresSchema(database.url, "public");
+  const backend =
+    backendMode === "full" ? PostgresBackend : PostgresPublishingBackend;
+  const publisher = track(await backend.connect(database.url));
+  const admin = new Client({ connectionString: database.url });
+  await admin.connect();
+  const query = vi.spyOn(Pool.prototype, "query");
+  try {
+    const encode = vi.fn(echoTask.codec.encode);
+    const task = { ...echoTask, codec: { ...echoTask.codec, encode } };
+    const payload = { name: 'hello "🦀"\n' };
+    const availableFromMs =
+      publicationMode === "future" ? Date.now() + 60_000 : null;
+    const rows = [];
+    for (const [rawTaskId, numericTaskId] of [
+      ["1", 1],
+      ["9007199254740991", Number.MAX_SAFE_INTEGER],
+      ["9007199254740992", null],
+      ["9007199254740993", null],
+      ["9223372036854775807", null],
+    ] as const) {
+      await admin.query(
+        "SELECT setval('bellows_tasks_task_id_seq', $1::bigint, false)",
+        [rawTaskId],
+      );
+      query.mockClear();
+      encode.mockClear();
+      const publication =
+        availableFromMs === null
+          ? publisher.publish(task, payload)
+          : publisher.publishFuture(task, payload, availableFromMs);
+      if (numericTaskId === null) {
+        await expect(publication).rejects.toBeInstanceOf(
+          PostgresPublishedTaskIdError,
+        );
+        await expect(publication).rejects.toMatchObject({
+          name: "PostgresPublishedTaskIdError",
+          message:
+            "PostgreSQL publication returned an ID not representable as a safe integer.",
+          taskId: rawTaskId,
+        });
+      } else {
+        expect(await publication).toEqual({ taskId: numericTaskId });
+      }
+      expect(encode).toHaveBeenCalledExactlyOnceWith(payload);
+      expect(query).toHaveBeenCalledExactlyOnceWith(
+        expect.stringContaining("INSERT INTO"),
+        [task.name, echoTask.codec.encode(payload), null, availableFromMs],
+      );
+      expect(
+        (
+          await admin.query(
+            "SELECT last_value, is_called FROM bellows_tasks_task_id_seq",
+          )
+        ).rows,
+      ).toEqual([{ last_value: rawTaskId, is_called: true }]);
+      rows.push({
+        task_id: rawTaskId,
+        task_name: task.name,
+        payload_json: echoTask.codec.encode(payload),
+        task_unique_key: null,
+        callback_id: null,
+        lease_worker_id: null,
+        available_from_unix_ms:
+          availableFromMs === null ? null : String(availableFromMs),
+      });
+      expect(
+        (await admin.query("SELECT * FROM bellows_tasks ORDER BY task_id"))
+          .rows,
+      ).toEqual(rows);
+    }
+  } finally {
+    query.mockRestore();
+    await admin.end();
+  }
+});
+
 test.each([
   "default",
   "named",
@@ -669,16 +764,18 @@ test("postgres publishing missing schema and table never fall back", async () =>
   }
 });
 
-test("postgres publishing preserves codec and SQL errors without retries and supports safe integer receipts", async () => {
+test.each([
+  "full",
+  "publishing-only",
+])("postgres %s publication preserves codec and SQL errors without retries", async (mode) => {
   const database = track(
     await TestPostgresDatabase.create("publishing_errors"),
   );
   await initializePostgresSchema(database.url, "public");
   const admin = new Client({ connectionString: database.url });
   await admin.connect();
-  const publisher = track(
-    await PostgresPublishingBackend.connect(database.url),
-  );
+  const backend = mode === "full" ? PostgresBackend : PostgresPublishingBackend;
+  const publisher = track(await backend.connect(database.url));
   try {
     const error = new Error("intentional payload serialization failure");
     const rejected = {
@@ -703,36 +800,31 @@ test("postgres publishing preserves codec and SQL errors without retries and sup
     await admin.query(
       "ALTER TABLE bellows_tasks ADD CONSTRAINT reject_insert CHECK (false)",
     );
-    await expect(publisher.publish(ackTask, undefined)).rejects.toMatchObject({
-      code: "23514",
-      constraint: "reject_insert",
-      table: "bellows_tasks",
-    });
+    for (const availableFromMs of [null, Date.now() + 60_000]) {
+      const publication =
+        availableFromMs === null
+          ? publisher.publish(ackTask, undefined)
+          : publisher.publishFuture(ackTask, undefined, availableFromMs);
+      await expect(publication).rejects.toMatchObject({
+        code: "23514",
+        constraint: "reject_insert",
+        table: "bellows_tasks",
+      });
+      await expect(publication).rejects.not.toBeInstanceOf(
+        PostgresPublishedTaskIdError,
+      );
+    }
     expect(
       (await admin.query("SELECT last_value FROM bellows_tasks_task_id_seq"))
         .rows,
-    ).toEqual([{ last_value: "1" }]);
+    ).toEqual([{ last_value: "2" }]);
     expect(
       (await admin.query("SELECT count(*) FROM bellows_tasks")).rows,
     ).toEqual([{ count: "0" }]);
     await admin.query(
       "ALTER TABLE bellows_tasks DROP CONSTRAINT reject_insert",
     );
-    expect(await publisher.publish(ackTask, undefined)).toEqual({ taskId: 2 });
-    await admin.query(
-      `ALTER SEQUENCE bellows_tasks_task_id_seq RESTART WITH ${Number.MAX_SAFE_INTEGER}`,
-    );
-    expect(await publisher.publish(ackTask, undefined)).toEqual({
-      taskId: Number.MAX_SAFE_INTEGER,
-    });
-    expect(
-      (
-        await admin.query(
-          "SELECT task_id FROM bellows_tasks WHERE task_id = $1",
-          [Number.MAX_SAFE_INTEGER],
-        )
-      ).rows,
-    ).toEqual([{ task_id: String(Number.MAX_SAFE_INTEGER) }]);
+    expect(await publisher.publish(ackTask, undefined)).toEqual({ taskId: 3 });
 
     const custom = {
       ...echoTask,
@@ -743,9 +835,6 @@ test("postgres publishing preserves codec and SQL errors without retries and sup
         }),
       },
     };
-    await admin.query(
-      "ALTER SEQUENCE bellows_tasks_task_id_seq RESTART WITH 3",
-    );
     const receipt = await publisher.publish(custom, { name: "codec" });
     expect(
       (

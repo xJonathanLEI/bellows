@@ -142,6 +142,8 @@ fn random_worker_id(
     }
 }
 
+// Keep validation responses inline; this private result never crosses a task boundary.
+#[allow(clippy::result_large_err)]
 async fn validate(request: Request<TextBody>) -> Result<(String, u64), Response<String>> {
     if request.uri().path() != "/process" {
         return Err(error(StatusCode::NOT_FOUND, "not-found"));

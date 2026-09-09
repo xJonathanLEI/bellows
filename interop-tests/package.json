@@ -5,6 +5,7 @@
   "type": "module",
   "exports": {
     "./cloudflare/postgres-fixture": "./cloudflare/postgres-fixture.ts",
+    "./cloudflare/publisher-contracts": "./cloudflare/publisher-contracts.ts",
     "./cloudflare/topology": "./cloudflare/topology.ts"
   },
   "scripts": {

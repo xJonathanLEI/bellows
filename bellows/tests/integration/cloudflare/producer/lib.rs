@@ -1,19 +1,19 @@
 #![cfg(target_arch = "wasm32")]
 
-#[path = "../db.rs"]
-mod db;
 #[path = "../http.rs"]
 mod http;
 #[path = "../task.rs"]
 mod task;
 
 use bellows::{
-    TaskDefinition,
-    cloudflare::{RetainedTaskDispatcher, dispatch_task, sdk::Dispatcher},
+    backends::postgres_publishing::PostgresBackendOptions,
+    cloudflare::{
+        RetainedTaskDispatcher,
+        sdk::{Dispatcher, PostgresPublisher, PostgresPublisherConfig},
+    },
 };
 use serde_json::json;
 use task::{GreetingPayload, GreetingTask};
-use tokio_postgres::types::Type;
 use worker::*;
 
 // ECMAScript String.trim whitespace, including BOM (Rust's str::trim differs).
@@ -43,58 +43,33 @@ pub async fn fetch(mut request: Request, env: Env, _ctx: Context) -> Result<Resp
         );
     };
 
-    let mut task_id = None;
-    let result = async {
-        let schema = http::schema(&env)?;
-        let url = env
-            .hyperdrive("HYPERDRIVE")
-            .map_err(|_| "missing Hyperdrive")?
-            .connection_string();
-        let mut connection = db::Connection::connect(&url).await?;
-        let payload = serde_json::to_string(&GreetingPayload { name: name.into() })
-            .map_err(|_| "payload encoding failed");
-        let publication = async {
-            let payload = payload?;
-            let row = connection
-                .client()
-                .query_typed_one(
-                    &format!(
-                        r#"INSERT INTO "{schema}".bellows_tasks
-                    (task_name, task_unique_key, payload_json, callback_id,
-                     lease_worker_id, available_from_unix_ms)
-                    VALUES ($1, NULL, $2, NULL, NULL, NULL) RETURNING task_id::text"#
-                    ),
-                    &[(&GreetingTask::NAME, Type::TEXT), (&payload, Type::TEXT)],
-                )
-                .await
-                .map_err(|_| "publication failed")?;
-            task_id = Some(row.get::<_, String>(0));
-            Ok::<_, &'static str>(())
+    let publisher = PostgresPublisher::<GreetingTask, _>::new(|env: &Env| {
+        Ok(PostgresPublisherConfig::new(
+            env.hyperdrive("HYPERDRIVE")?.connection_string(),
+            PostgresBackendOptions {
+                schema: Some(env.var("BELLOWS_SCHEMA")?.to_string()),
+            },
+            env.durable_object("DISPATCHER")?,
+        ))
+    });
+    let receipt = match publisher
+        .publish(&env, GreetingPayload { name: name.into() })
+        .await
+    {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            return Ok(Response::from_json(&match error.receipt {
+                None => json!({ "error": "task publication failed" }),
+                Some(receipt) => json!({
+                    "error": "task published, but dispatch acceptance was not confirmed",
+                    "taskId": receipt.task_id
+                }),
+            })?
+            .with_status(503));
         }
-        .await;
-        let closed = connection.close().await;
-        publication?;
-        closed?;
-        // The standalone INSERT has committed and its driver has exited before dispatch.
-        let namespace = env
-            .durable_object("DISPATCHER")
-            .map_err(|_| "missing dispatcher")?;
-        dispatch_task(&namespace, task_id.as_deref().unwrap())
-            .await
-            .map_err(|_| "dispatch failed")
-    }
-    .await;
-    if result.is_err() {
-        return Ok(Response::from_json(&match task_id {
-            None => json!({ "error": "task publication failed" }),
-            Some(task_id) => json!({
-                "error": "task published, but dispatch acceptance was not confirmed",
-                "taskId": task_id
-            }),
-        })?
-        .with_status(503));
-    }
-    let mut response = Response::ok(task_id.unwrap())?.with_status(202);
+    };
+    // Acceptance is not completion; the processor may still be running.
+    let mut response = Response::ok(receipt.task_id)?.with_status(202);
     response
         .headers_mut()
         .set("content-type", "text/plain; charset=utf-8")?;

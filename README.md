@@ -210,17 +210,83 @@ The native backend owns a SQLx pool; closing any clone closes the shared resourc
 
 Publication stores a task and may emit a PostgreSQL notification; listener-free is not notification-free. Future publication stores availability, not a scheduler or a future Worker request. It does not atomically dispatch to a Durable Object, join an application transaction, or retry publication. A database exception near commit does not establish that no row was written.
 
+Lower-level Rust receipts retain exact `u64` IDs. TypeScript PostgreSQL receipts retain numeric IDs only when they are exact safe integers; otherwise `PostgresPublishedTaskIdError` preserves the committed ID as a string. The Cloudflare publisher below returns string receipts and restricts dispatch to the processor's safe-positive range.
+
 ## Cloudflare Workers (Rust and TypeScript)
 
 Both languages can implement the **producer Worker -> retained Durable Object dispatcher -> service-bound processor Worker** topology. PostgreSQL stores the tasks; the Durable Object only retains outstanding dispatch requests **in memory**. The processor claims a task, executes a Bellows worker using the claimed payload, renews ownership while processing, and awaits failure/completion recording.
 
-Use `createPostgresProcessor` from `@xjonathanlei/bellows/cloudflare/postgres` in TypeScript or `bellows::cloudflare::sdk::PostgresProcessor` in Rust. Supply a synchronous environment-to-config callback with the Hyperdrive connection string, optional schema, and your published task's `WorkerFactory`. The delegate owns the `/process` protocol, worker IDs, and a fresh listener-free execution backend for each validated request. Publishing remains application-owned SQL in these examples.
+### Producer
+
+Use `createPostgresPublisher` from `@xjonathanlei/bellows/cloudflare/postgres` in TypeScript or `bellows::cloudflare::sdk::PostgresPublisher` in Rust. Bind one published task and its dispatcher; your application owns authentication, routing, business validation, and HTTP responses. The delegate is a typed operation, not an HTTP endpoint.
+
+For Rust, target `wasm32-unknown-unknown` with `default-features = false, features = ["cloudflare"]`. This helper accepts input already validated by your application handler, as in the [compiled producer](./bellows/tests/integration/cloudflare/producer/lib.rs):
+
+```rust
+use bellows::{
+    PublishTrigger, TaskDefinition,
+    backends::postgres_publishing::PostgresBackendOptions,
+    cloudflare::sdk::{
+        PostgresPublisher, PostgresPublisherConfig, PostgresPublisherError,
+        PostgresPublisherReceipt,
+    },
+};
+use serde::{Deserialize, Serialize};
+use worker::Env;
+
+pub struct GreetingTask;
+
+#[derive(Serialize, Deserialize)]
+pub struct GreetingPayload {
+    pub name: String,
+}
+
+impl TaskDefinition for GreetingTask {
+    const NAME: &str = "cloudflare_greeting";
+    type Callback = ();
+    type Trigger = PublishTrigger<GreetingPayload>;
+}
+
+pub async fn queue_greeting(
+    env: &Env,
+    payload: GreetingPayload,
+) -> Result<PostgresPublisherReceipt, PostgresPublisherError> {
+    let publisher = PostgresPublisher::<GreetingTask, _>::new(|env: &Env| {
+        Ok(PostgresPublisherConfig::new(
+            env.hyperdrive("HYPERDRIVE")?.connection_string(),
+            PostgresBackendOptions {
+                schema: Some(env.var("BELLOWS_SCHEMA")?.to_string()),
+            },
+            env.durable_object("DISPATCHER")?,
+        ))
+    });
+    publisher.publish(env, payload).await
+}
+```
+
+See the [typed TypeScript handler](./bellows-ts/README.md#publisher). Construction performs no I/O. Synchronous configuration runs once per publication, so a delegate can be reused without retaining connections. Each call acquires a fresh listener-free publishing backend, publishes once, retains the ID, validates it, awaits backend shutdown, then awaits the complete `dispatchTask` / `dispatch_task` response from object `global`. Callers must await the operation within the request; it does not extend request lifetime.
+
+Success returns `PostgresPublisherReceipt` (`taskId: string` / `task_id: String`) and confirms **dispatch acceptance, not task completion or business success**. IDs must be canonical positive decimal strings no greater than `9007199254740991`. Callback-bearing definitions support plain publication only, without callback registration; singleton tasks are rejected. Only immediate publication is exposed.
+
+`PostgresPublisherError` retains the first stage and cause, an optional exact receipt, and a separate later backend-close failure. Stages are `configuration`, `acquisition`, `publication`, `task-id`, `backend-close`, and `dispatch`. Top-level messages contain only the stage; underlying causes are available for deliberate inspection, not safe public responses or automatic logging.
+
+- A close or dispatch failure with a receipt means the task was published but acceptance is unconfirmed, not necessarily rejected. Recover through a trusted path using `dispatchTask` / `dispatch_task` with that ID rather than publishing again.
+- A `task-id` error also retains the exact committed ID, including TypeScript's otherwise unsafe PostgreSQL IDs. That ID is **unsupported by this processor** and needs a different recovery action, not blind redispatch.
+- No receipt on a publication error is an unknown outcome, not proof of rollback. Never automatically republish.
+
+Shutdown is awaited on ordinary error paths after acquisition; dropping/cancelling a Rust future, abrupt Worker termination, or a wasm trap has no async-finally guarantee.
+
+### Processor and deployment
+
+Use `createPostgresProcessor` from the same TypeScript subpath or `bellows::cloudflare::sdk::PostgresProcessor` in Rust. Supply a synchronous environment-to-config callback with the Hyperdrive connection string, optional schema, and your published task's `WorkerFactory`. The delegate owns the `/process` protocol, worker IDs, and a fresh listener-free execution backend for each validated request.
 
 The delegate awaits the runtime, registered application cleanup, and Bellows backend shutdown before responding, including no-claim and ordinary failure paths. Applications still own their side-effect resources; use separate business connections and register cleanup for work that can outlive the runtime. TypeScript cleanup must drain outstanding business promises after lease loss; Rust cleanup must retain resource ownership outside the aborted worker.
 
 HTTP **200** with `{ taskId, attemptFinished: true }` means an attempt ended, **not that the task succeeded**. It includes no-claim and handled-failure attempts. The adapter adds no automatic retries, durable dispatcher recovery, or protection against abrupt request termination.
 
-Keep the processor private and use Hyperdrive with query caching disabled and verified origin TLS. TypeScript requires `nodejs_compat` for `pg`; Rust must omit it. For custom integrations, direct `PostgresExecutionBackend` plus `runTaskOnce` / `run_task_once` remains the lower-level option; do not construct the listening `PostgresBackend` in a Worker.
+Keep the processor private, initialize schemas separately through an administrative connection, and use Hyperdrive with query caching disabled and verified origin TLS. TypeScript requires `nodejs_compat` for `pg`; Rust must omit it. Generic TypeScript root/Cloudflare imports do not load PostgreSQL or Node modules; the PostgreSQL subpath still requires `pg` compatibility.
+
+For caller-managed integrations, direct `PostgresPublishingBackend` plus `dispatchTask` / `dispatch_task`, or `PostgresExecutionBackend` plus `runTaskOnce` / `run_task_once`, remain available. Await your own backend shutdown; do not construct the listening `PostgresBackend` in a Worker. The retained dispatcher's 30-second heartbeat is not lease renewal, retry, or eviction recovery. This topology does not provide daemon-equivalent discovery or exactly-once side effects.
 
 - [Rust example and harness](./bellows/tests/integration/cloudflare/README.md)
 - [TypeScript example and harness](./bellows-ts/test/integration/cloudflare/README.md)

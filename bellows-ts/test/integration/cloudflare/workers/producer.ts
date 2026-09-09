@@ -1,11 +1,9 @@
 import { DurableObject } from "cloudflare:workers";
-import { Client } from "pg";
-import { validatePostgresSchemaName } from "../../../../src/backends/postgres-operations.js";
 import {
-  dispatchTask,
-  RetainedTaskDispatcher,
-} from "../../../../src/cloudflare.js";
-import type { TaskPayload } from "../../../../src/index.js";
+  createPostgresPublisher,
+  PostgresPublisherError,
+} from "../../../../src/cloudflare/postgres.js";
+import { RetainedTaskDispatcher } from "../../../../src/cloudflare.js";
 import { greetingTask } from "../task.js";
 
 interface ProducerEnv {
@@ -15,30 +13,12 @@ interface ProducerEnv {
   PROCESSOR: Fetcher;
 }
 
-// Example glue for an immediate, callback-free task, not a general publishing backend.
-async function publishTask(
-  client: Client,
-  schema: string,
-  payload: TaskPayload<typeof greetingTask>,
-): Promise<string> {
-  const table = `"${validatePostgresSchemaName(schema)}".bellows_tasks`;
-  const result = await client.query<{ task_id: string }>(
-    `
-INSERT INTO ${table} (
-    task_name,
-    task_unique_key,
-    payload_json,
-    callback_id,
-    lease_worker_id,
-    available_from_unix_ms
-)
-VALUES ($1, NULL, $2, NULL, NULL, NULL)
-RETURNING task_id::text
-    `,
-    [greetingTask.name, greetingTask.codec.encode(payload)],
-  );
-  return result.rows[0].task_id;
-}
+const publisher = createPostgresPublisher((env: ProducerEnv) => ({
+  connectionString: env.HYPERDRIVE.connectionString,
+  schema: env.BELLOWS_SCHEMA,
+  task: greetingTask,
+  dispatcher: env.DISPATCHER,
+}));
 
 export default {
   async fetch(request, env): Promise<Response> {
@@ -87,22 +67,10 @@ export default {
       );
     }
 
-    let taskId: string | undefined;
     try {
-      const client = new Client({
-        connectionString: env.HYPERDRIVE.connectionString,
+      const { taskId } = await publisher.publish(env, {
+        name: body.name,
       });
-      try {
-        await client.connect();
-        taskId = await publishTask(client, env.BELLOWS_SCHEMA, {
-          name: body.name,
-        });
-      } finally {
-        await client.end();
-      }
-
-      // The standalone INSERT is committed and its client closed before dispatch.
-      await dispatchTask(env.DISPATCHER, taskId);
       // Acceptance is not completion; the processor may still be running.
       return new Response(taskId, {
         status: 202,
@@ -111,7 +79,11 @@ export default {
           "cache-control": "no-store",
         },
       });
-    } catch {
+    } catch (error) {
+      const taskId =
+        error instanceof PostgresPublisherError
+          ? error.receipt?.taskId
+          : undefined;
       return Response.json(
         taskId === undefined
           ? { error: "task publication failed" }

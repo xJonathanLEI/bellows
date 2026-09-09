@@ -3,6 +3,14 @@ import type { PostgresBackendOptions } from "../backends/postgres-operations.js"
 import { runTaskOnce } from "../runtime.js";
 import type { PublishTaskDefinition, WorkerFactory } from "../types.js";
 
+export {
+  createPostgresPublisher,
+  type PostgresPublisherConfig,
+  PostgresPublisherError,
+  type PostgresPublisherReceipt,
+  type PostgresPublisherStage,
+} from "./postgres-publisher.js";
+
 /** A fresh scope for one validated processor request. */
 export interface PostgresProcessorConfig<
   TTask extends PublishTaskDefinition<unknown, unknown>,

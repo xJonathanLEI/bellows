@@ -42,25 +42,40 @@
 //! ## Cloudflare Workers
 //!
 //! Target `wasm32-unknown-unknown` with `default-features = false, features = ["cloudflare"]`.
+//! Use `cloudflare::sdk::PostgresPublisher::<Task, _>` for typed immediate publication after
+//! application validation. Its synchronous environment-to-config callback runs once per call.
+//! Construction performs no I/O; each call publishes once through a fresh listener-free backend,
+//! retains the exact string ID, validates the processor's positive safe-integer range (up to
+//! 9007199254740991), awaits shutdown, then consumes the complete dispatch response.
+//! Success confirms dispatch acceptance, not processing success. The typed error retains its
+//! stage, cause, optional receipt, and any later close failure. Recover close/dispatch failures
+//! using the retained ID rather than republishing; an unsupported `task-id` receipt needs another
+//! recovery action. No receipt on a publication error does not prove rollback.
+//! Applications own authentication, routing, validation, HTTP responses, and business clients.
+//!
 //! Delegate processor requests to `cloudflare::sdk::PostgresProcessor` with a synchronous
 //! environment-to-config callback and a published task's [`WorkerFactory`]. It validates before
 //! configuration, owns a request-scoped execution backend, and awaits [`run_task_once`], registered
 //! application cleanup, and backend shutdown. HTTP 200 means an attempt ended, not task success.
 //! Applications still own side-effect resources; retain cleanup ownership outside aborted workers.
-//! Direct `PostgresExecutionBackend` plus `run_task_once` remains the lower-level integration API.
+//! Direct `PostgresExecutionBackend` plus `run_task_once`, or `PostgresPublishingBackend` plus
+//! `cloudflare::dispatch_task`, remain lower-level integration APIs with caller-owned cleanup.
 //!
 //! Workers use SDK sockets, execution, and timers; native daemon backends are unavailable.
 //! Use [`time::Instant`] for deadlines. Obtain connection strings from Hyperdrive, keep processors
-//! private, and leave schema initialization outside requests. `backends::postgres_publishing`
-//! provides a listener-free `PostgresPublishingBackend` for typed publication. Both reduced backends
-//! require request-scoped connections and awaited `close` on success and error paths; dropping
-//! clones does not close a Workers driver. The showcased producers still use application-owned SQL.
-//! Publication stores availability but does not schedule requests, atomically dispatch to a Durable
-//! Object, join an application transaction, or retry. A database error near commit does not prove
-//! that no task was written. Awaitable publication remains on the full backend for callback delivery.
+//! private, disable query caching, verify origin TLS, and leave schema initialization outside
+//! requests. Both reduced backends require request-scoped connections and awaited `close` on
+//! ordinary success and error paths; the delegates own this lifecycle. Dropping clones does not
+//! close a Workers driver. Lower-level Rust receipts remain exact `u64` values.
+//! The publisher offers no future publication, callback delivery, application cleanup hooks,
+//! transaction participation, atomic PostgreSQL-to-DO delivery, or automatic retries.
+//! Callback-bearing tasks support plain publication; singleton tasks are rejected. Awaitable
+//! publication remains on the full backend for listener-backed callback delivery.
 //!
 //! The `cloudflare` module provides in-memory retained dispatch, not durable recovery or retries.
-//! The processor does not extend request lifetime or recover from abrupt termination or wasm traps.
+//! Its heartbeat is not lease renewal or eviction recovery; this is not daemon-equivalent discovery
+//! or exactly-once processing. Await delegate calls within the request. They do not extend request
+//! lifetime or guarantee async cleanup after future cancellation, abrupt termination, or wasm traps.
 //! See the [Rust examples](https://github.com/xJonathanLEI/bellows/tree/master/bellows/tests/integration/cloudflare)
 //! for setup and limitations. Omit `nodejs_compat`: its Node-style timer handles conflict with SDK timers.
 //!

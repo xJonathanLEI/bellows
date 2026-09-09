@@ -1,3 +1,4 @@
+import { publisherContracts } from "bellows-cloudflare-interop-tests/cloudflare/publisher-contracts";
 import { cloudflareTopology } from "bellows-cloudflare-interop-tests/cloudflare/topology";
 import { describe } from "vitest";
 import { createCloudflarePostgresFixture } from "./postgres-fixture.js";
@@ -18,3 +19,11 @@ describe.sequential("Cloudflare TypeScript producer/DO -> TypeScript processor -
   ));
 
 publishingContracts();
+
+publisherContracts("TypeScript workerd PostgreSQL publisher", () =>
+  createCloudflarePostgresFixture({
+    producer: {
+      configPath: new URL("./wrangler.publisher.jsonc", import.meta.url),
+    },
+  }),
+);

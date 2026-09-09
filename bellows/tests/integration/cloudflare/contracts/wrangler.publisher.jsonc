@@ -1,0 +1,21 @@
+{
+  "name": "bellows-cloudflare-contracts-publisher",
+  "main": "build/worker/shim.mjs",
+  "compatibility_date": "2026-07-01",
+  "workers_dev": false,
+  "preview_urls": false,
+  "build": {
+    "command": "pnpm --workspace-root exec node bellows/tests/integration/cloudflare/build-rust.mjs contracts"
+  },
+  "vars": { "BELLOWS_SCHEMA": "bellows_cloudflare" },
+  "hyperdrive": [
+    {
+      "binding": "HYPERDRIVE",
+      "id": "00000000000000000000000000000000"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [{ "name": "DISPATCHER", "class_name": "PublisherReceiver" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["PublisherReceiver"] }]
+}

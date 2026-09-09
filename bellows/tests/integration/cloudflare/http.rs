@@ -29,20 +29,3 @@ pub async fn body(request: &mut Request, path: &str) -> Result<Value, Response> 
         .await
         .map_err(|_| error(400, "invalid JSON").unwrap())
 }
-
-// Same identifier rule as PostgresBackendOptions, with no new length restriction.
-pub fn schema(env: &worker::Env) -> Result<String, &'static str> {
-    let schema = env
-        .var("BELLOWS_SCHEMA")
-        .map_err(|_| "missing schema")?
-        .to_string();
-    let mut bytes = schema.bytes();
-    if !bytes
-        .next()
-        .is_some_and(|byte| byte.is_ascii_lowercase() || byte == b'_')
-        || !bytes.all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
-    {
-        return Err("invalid schema");
-    }
-    Ok(schema)
-}

@@ -40,6 +40,9 @@ use sqlx::Error as ConnectionError;
 ///
 /// Workers must use a request-scoped Hyperdrive connection and await [`Self::close`] on success and
 /// error paths before returning a response. Never retain connections across requests.
+/// For immediate publication followed by dispatch, `cloudflare::sdk::PostgresPublisher` owns that
+/// lifecycle. This lower-level backend retains exact `u64` receipts, including IDs above the
+/// Cloudflare processor's safe-positive range; the adapter returns string receipts and checks that range.
 #[derive(Debug, Clone)]
 pub struct PostgresPublishingBackend {
     operations: PostgresTaskOperations,

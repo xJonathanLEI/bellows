@@ -10,6 +10,7 @@ import {
 } from "./postgres-operations.js";
 
 export type { PostgresBackendOptions } from "./postgres-operations.js";
+export { PostgresPublishedTaskIdError } from "./postgres-operations.js";
 
 /**
  * Publishing-only PostgreSQL backend, without a listener, callback registry, or execution API.
@@ -20,9 +21,13 @@ export type { PostgresBackendOptions } from "./postgres-operations.js";
  * Future publication stores availability; it does not schedule a future Worker request.
  * Publication does not atomically dispatch to a Durable Object, retry, or join an application
  * transaction. An error after sending an insert does not prove it failed to commit.
+ * Receipts contain safe numeric IDs; `PostgresPublishedTaskIdError` retains the exact committed
+ * ID as a string when it cannot be represented safely.
  *
  * On Workers, use a request-scoped Hyperdrive connection and await `close()` in `finally` before
  * returning the response. Never retain connections across requests.
+ * For immediate publication followed by dispatch, `createPostgresPublisher` from
+ * `cloudflare/postgres` owns that lifecycle and returns checked string receipts.
  */
 export class PostgresPublishingBackend implements TaskPublishingBackend {
   private constructor(

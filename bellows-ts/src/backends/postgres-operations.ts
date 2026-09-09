@@ -79,6 +79,20 @@ export interface PostgresBackendOptions {
   readonly schema?: string;
 }
 
+/**
+ * Publication committed a task whose ID cannot be returned as an exact safe integer.
+ * `taskId` retains the exact PostgreSQL ID; do not automatically republish.
+ * Other publication errors do not establish whether the insert committed.
+ */
+export class PostgresPublishedTaskIdError extends Error {
+  constructor(readonly taskId: string) {
+    super(
+      "PostgreSQL publication returned an ID not representable as a safe integer.",
+    );
+    this.name = "PostgresPublishedTaskIdError";
+  }
+}
+
 export function validatePostgresSchemaName(schemaName: string): string {
   if (
     typeof schemaName !== "string" ||
@@ -154,7 +168,13 @@ RETURNING task_id::text AS task_id
       [task.name, task.codec.encode(payload), callbackId, availableFromMs],
     );
 
-    return { taskId: Number(result.rows[0].task_id) };
+    const rawTaskId = result.rows[0].task_id;
+    const taskId = Number(rawTaskId);
+    if (!Number.isSafeInteger(taskId) || String(taskId) !== rawTaskId) {
+      throw new PostgresPublishedTaskIdError(rawTaskId);
+    }
+
+    return { taskId };
   }
 
   async claimPublished<TPayload, TCallback>(

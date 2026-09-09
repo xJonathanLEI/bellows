@@ -3,6 +3,7 @@ import {
   deadline,
   poll,
 } from "bellows-cloudflare-interop-tests/cloudflare/postgres-fixture";
+import { publisherContracts } from "bellows-cloudflare-interop-tests/cloudflare/publisher-contracts";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
 import { createTestHarness, type TestHarness } from "wrangler";
 import { createCloudflarePostgresFixture } from "./postgres-fixture.js";
@@ -16,6 +17,15 @@ const json = (body: unknown) => ({
 // Registered only by the Rust suite. Real Rust projects and real namespace,
 // service, storage and streaming-response adapters; no Node mocks of Worker I/O.
 export function rustContracts(configPath: URL): void {
+  publisherContracts("Rust workerd PostgreSQL publisher", () =>
+    createCloudflarePostgresFixture({
+      producer: {
+        configPath: new URL("./wrangler.publisher.jsonc", configPath),
+        prebuiltWorkerDir: new URL("./build/harness/", configPath),
+      },
+    }),
+  );
+
   describe.sequential("Rust workerd PostgreSQL contracts", () => {
     let fixture: CloudflarePostgresFixture;
     beforeEach(async () => {

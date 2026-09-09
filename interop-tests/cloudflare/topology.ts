@@ -145,6 +145,107 @@ export function cloudflareTopology(
     await completed([{ taskId, name: "Alice" }]);
   }, 10_000);
 
+  test("closes after an insert constraint failure without retrying and publishes after repair", async () => {
+    await fixture.admin.query(
+      `ALTER TABLE ${fixture.table} ADD CONSTRAINT reject_insert CHECK (false)`,
+    );
+    const gate = await fixture.gate("bellows_tasks");
+    const response = fixture.consume(
+      fixture.server.fetch("/tasks", json({ name: "After repair" })),
+      "failed producer publication and shutdown",
+    );
+    const pids = await gate.blocked(1);
+    await gate.release();
+    const failed = await response;
+    expect(failed.status, failed.body).toBe(503);
+    expect(JSON.parse(failed.body)).toEqual({
+      error: "task publication failed",
+    });
+    await fixture.waitForClientExit(pids);
+    expect(await fixture.activeRequestClients()).toHaveLength(0);
+    expect(await fixture.state()).toEqual({ tasks: [], processed: [] });
+    expect(
+      (
+        await fixture.admin.query(
+          `SELECT last_value, is_called FROM "${fixture.schema}".bellows_tasks_task_id_seq`,
+        )
+      ).rows,
+    ).toEqual([{ last_value: "1", is_called: true }]);
+
+    await fixture.admin.query(
+      `ALTER TABLE ${fixture.table} DROP CONSTRAINT reject_insert`,
+    );
+    const taskId = await publish("After repair");
+    expect(taskId).toBe("2");
+    await completed([{ taskId, name: "After repair" }]);
+  }, 10_000);
+
+  async function nextTaskId(taskId: string): Promise<void> {
+    await fixture.admin.query(
+      "SELECT setval($1::regclass, $2::bigint, false)",
+      [`"${fixture.schema}".bellows_tasks_task_id_seq`, taskId],
+    );
+  }
+
+  test("accepts and processes publication at the maximum safe ID", async () => {
+    await nextTaskId("9007199254740991");
+    const gate = await fixture.gate();
+    const taskId = await publish("Maximum safe ID");
+    expect(taskId).toBe("9007199254740991");
+    await claimed(taskId, "Maximum safe ID");
+    await gate.blocked(1);
+    expect(await fixture.activeRequestClients()).toHaveLength(2);
+    await gate.release();
+    await completed([{ taskId, name: "Maximum safe ID" }]);
+  }, 10_000);
+
+  for (const taskId of [
+    "9007199254740992",
+    "9007199254740993",
+    "9223372036854775807",
+  ]) {
+    test(`retains the exact unsupported publication ID ${taskId} without dispatch`, async () => {
+      await nextTaskId(taskId);
+      const gate = await fixture.gate("bellows_tasks");
+      const response = fixture.consume(
+        fixture.server.fetch("/tasks", json({ name: "Unsupported ID" })),
+        "unsupported producer ID and shutdown",
+      );
+      const pids = await gate.blocked(1);
+      await gate.release();
+      const result = await response;
+      expect(result.status, result.body).toBe(503);
+      expect(JSON.parse(result.body)).toEqual({
+        error: "task published, but dispatch acceptance was not confirmed",
+        taskId,
+      });
+      await fixture.waitForClientExit(pids);
+      expect(await fixture.activeRequestClients()).toHaveLength(0);
+      expect(await fixture.state()).toEqual({
+        tasks: [
+          {
+            task_id: taskId,
+            task_name: "cloudflare_greeting",
+            task_unique_key: null,
+            payload_json: JSON.stringify({ name: "Unsupported ID" }),
+            callback_id: null,
+            lease_worker_id: null,
+            available_from_unix_ms: null,
+          },
+        ],
+        processed: [],
+      });
+      expect(
+        (
+          await fixture.admin.query(
+            `SELECT last_value FROM "${fixture.schema}".bellows_tasks_task_id_seq`,
+          )
+        ).rows,
+      ).toEqual([{ last_value: taskId }]);
+      // Strict teardown log checks also reject any attempted processor rejection.
+    }, 10_000);
+  }
+
   test("suppresses an outstanding duplicate while distinct tasks execute concurrently", async () => {
     const gate = await fixture.gate();
     const firstId = await publish("Alice");

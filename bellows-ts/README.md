@@ -79,7 +79,84 @@ await runTaskOnce(backend, factory, 17, token);
 
 ### Cloudflare Workers
 
-Use `dispatchTask` and `RetainedTaskDispatcher` from `@xjonathanlei/bellows/cloudflare` for dispatch. For a PostgreSQL processor, default-export `createPostgresProcessor` from the separate `@xjonathanlei/bellows/cloudflare/postgres` entry point. It accepts one published task definition and explicit task IDs; the annotated environment lets TypeScript infer the factory's payload and callback types.
+Use `createPostgresPublisher` and `createPostgresProcessor` from `@xjonathanlei/bellows/cloudflare/postgres` for the producer Worker -> retained Durable Object dispatcher -> service-bound processor Worker topology. Keep one `RetainedTaskDispatcher` from `@xjonathanlei/bellows/cloudflare` per Durable Object.
+
+#### Publisher
+
+Bind a publisher to one task and its dispatcher. Your application still owns authentication, routing, JSON decoding, business validation, and HTTP responses. This example handler receives a decoded name from your router; the [complete producer](./test/integration/cloudflare/workers/producer.ts) also demonstrates request validation and the Durable Object wrapper.
+
+```ts
+import { definePublishTask } from "@xjonathanlei/bellows";
+import type { DurableObjectNamespaceLike } from "@xjonathanlei/bellows/cloudflare";
+import {
+  createPostgresPublisher,
+  PostgresPublisherError,
+} from "@xjonathanlei/bellows/cloudflare/postgres";
+
+interface ProducerEnv {
+  HYPERDRIVE: { connectionString: string };
+  BELLOWS_SCHEMA: string;
+  DISPATCHER: DurableObjectNamespaceLike;
+}
+
+const greetingTask = definePublishTask<{ name: string }>("cloudflare_greeting");
+const publisher = createPostgresPublisher((env: ProducerEnv) => ({
+  connectionString: env.HYPERDRIVE.connectionString,
+  schema: env.BELLOWS_SCHEMA,
+  task: greetingTask,
+  dispatcher: env.DISPATCHER,
+}));
+
+export async function queueGreeting(
+  env: ProducerEnv,
+  name: string,
+): Promise<Response> {
+  if (!name.trim() || name.length > 200) {
+    return new Response("Invalid name", { status: 400 });
+  }
+  try {
+    const receipt = await publisher.publish(env, { name });
+    return new Response(receipt.taskId, {
+      status: 202,
+      headers: {
+        "content-type": "text/plain; charset=utf-8",
+        "cache-control": "no-store",
+      },
+    });
+  } catch (error) {
+    if (!(error instanceof PostgresPublisherError)) throw error;
+    return Response.json(
+      error.receipt
+        ? {
+            error: "task published, but dispatch acceptance was not confirmed",
+            taskId: error.receipt.taskId,
+          }
+        : { error: "task publication failed" },
+      { status: 503 },
+    );
+  }
+}
+```
+
+The annotated synchronous callback infers environment and payload types and runs once per publication, not at construction. The delegate can be reused; connections, receipts, and failures are local to each call. `publish` also works detached from the returned object. Its only operation is immediate publication; callback-bearing definitions publish without callback registration or an awaitable result, and singleton definitions are rejected.
+
+Bellows acquires a fresh listener-free `PostgresPublishingBackend`, publishes exactly once, retains the string ID, validates it, awaits `close()`, then calls `dispatchTask` for object `global`. Success waits for complete response-body consumption and returns readonly `PostgresPublisherReceipt.taskId: string`. It confirms **dispatch acceptance, not processing or business success**.
+
+Both PostgreSQL processors require canonical positive decimal IDs up to `9007199254740991`. Lower-level TypeScript PostgreSQL receipts remain `{ taskId: number }` for exact safe integers. Their `PostgresPublishedTaskIdError` preserves an unsupported committed ID as a string; the adapter turns it into a `task-id` failure without rounding or deleting the row. Rust's lower-level receipts remain exact `u64` values.
+
+`PostgresPublisherError` exposes `stage`, `cause`, optional `receipt`, and optional `backendCloseError: { cause: unknown }`. Stages are `configuration`, `acquisition`, `publication`, `task-id`, `backend-close`, and `dispatch`. The first failure stays primary even if closing later fails; arbitrary thrown values, including `undefined`, remain failures. A connection failure on the first pool query can be a `publication` failure; stages identify adapter operations rather than driver network categories.
+
+- A close or dispatch error with a receipt means publication is known but acceptance is unconfirmed, not necessarily rejected. Explicitly call `dispatchTask(env.DISPATCHER, error.receipt.taskId)` through a trusted recovery path instead of republishing.
+- A `task-id` receipt is exact but **not supported by the current processor**. It requires another recovery action, not ordinary redispatch.
+- A publication error without a receipt does not prove rollback. Do not automatically retry publication.
+
+Top-level messages are sanitized and the adapter does not log or generate HTTP responses. Causes may contain credentials or response bodies; inspect them deliberately, never expose them in public responses. Always await `publish` within the request. Normal error paths await shutdown after acquisition, but abrupt termination cannot guarantee cleanup. The operation does not extend request lifetime or own arbitrary business clients or application cleanup hooks.
+
+Publication and dispatch are not atomic. There is no outbox, durable recovery, automatic republishing, future publication/request scheduling, batching, cancellation control, callback delivery, or application-transaction participation. Direct `PostgresPublishingBackend` plus `dispatchTask` remains available for caller-managed integrations; the backend's broader API does not expand the adapter's immediate-only contract.
+
+#### Processor
+
+Default-export `createPostgresProcessor` for one published task and explicit IDs. The annotated environment infers the factory's payload and callback types.
 
 ```ts
 import { definePublishTask, TaskSuccess } from "@xjonathanlei/bellows";
@@ -113,11 +190,11 @@ Configuration is synchronous and runs once per validated request, not at constru
 
 The response waits for the runtime, optional `cleanup: () => Promise<void>`, and backend shutdown, even if application cleanup fails. Cleanup runs once whenever configuration returned, including acquisition failure and no claim. Applications still own arbitrary side-effect resources. Keep business connections separate and drain any tracked business promise in cleanup: lease loss does **not** cancel a pending TypeScript promise. The [SQL processor](./test/integration/cloudflare/workers/processor.ts) demonstrates this with a request-scoped operation and an awaited `pg.Client` shutdown.
 
-HTTP **200** with `{ taskId, attemptFinished: true }` means an attempt ended, including no claim or handled failure, not business success. The adapter adds no retries or protection against abrupt request termination. PostgreSQL stores tasks; the retained Durable Object map is only in-memory dispatch state, not durable recovery. Publishing remains application-owned SQL in the example.
+HTTP **200** with `{ taskId, attemptFinished: true }` means an attempt ended, including no claim or handled failure, not business success. The adapter adds no retries or protection against abrupt request termination. PostgreSQL stores tasks; the retained Durable Object map is only in-memory dispatch state, not durable recovery. Its 30-second heartbeat is not lease renewal, retry, or eviction recovery. This topology does not provide daemon-equivalent discovery or exactly-once side effects.
 
-Keep the processor private and use the Hyperdrive connection string with query caching disabled and verified origin TLS. TypeScript requires `nodejs_compat` for `pg`; Rust must omit it. Do not construct the listening `PostgresBackend` in a Worker. Direct `PostgresExecutionBackend` from `@xjonathanlei/bellows/backends/postgres-execution` with `runTaskOnce()` remains the lower-level option for custom integrations, which must await their own backend shutdown. The generic `cloudflare` entry point does not load PostgreSQL or Node modules.
+Keep the processor private, initialize schemas separately through an administrative connection, and use the Hyperdrive connection string with query caching disabled and verified origin TLS. TypeScript requires `nodejs_compat` for `pg`; Rust must omit it. Do not construct the listening `PostgresBackend` in a Worker. Direct `PostgresExecutionBackend` from `@xjonathanlei/bellows/backends/postgres-execution` with `runTaskOnce()` remains the lower-level option for custom integrations, which must await their own backend shutdown. Generic root/`cloudflare` imports do not load PostgreSQL or Node modules; the PostgreSQL subpath retains its `pg` compatibility requirements without loading the full listening backend or Bellows's Node randomness module.
 
-The [TypeScript Cloudflare–Postgres guide](./test/integration/cloudflare/README.md) exercises a producer Worker -> Durable Object dispatcher -> service-bound processor Worker with PostgreSQL publication, claims, side effects, and completion. `pnpm --dir bellows-ts test:cloudflare` runs five TypeScript -> TypeScript scenarios and four direct publishing-backend contracts without Rust tools; they also run in the package's normal tests. The independent [Rust harness](../bellows/tests/integration/cloudflare/README.md) owns Rust -> Rust and Rust workerd contracts, while the [interop suite](../interop-tests/cloudflare/README.md) owns both mixed directions.
+The [TypeScript Cloudflare–Postgres guide](./test/integration/cloudflare/README.md) exercises publication, claims, side effects, and completion. `pnpm --dir bellows-ts test:cloudflare` runs **16 cases** without Rust tools: ten topology scenarios, four direct publishing-backend contracts, and two publisher-adapter contracts. They also run in the package's normal tests. The independent [Rust harness](../bellows/tests/integration/cloudflare/README.md) owns **31 cases**, while the [interop suite](../interop-tests/cloudflare/README.md) owns **20** across both mixed directions. Root `pnpm test` runs all **67 Cloudflare cases** once.
 
 ## Tasks
 
@@ -176,7 +253,11 @@ try {
 
 The backend owns a `pg.Pool`; call and await `close()` once, including on error paths. On Workers, use `env.HYPERDRIVE.connectionString` inside each request with `nodejs_compat`, and await shutdown before returning the response. Never retain connections across requests. The package root and generic Cloudflare entry point do not load PostgreSQL.
 
+For immediate Cloudflare publication followed by dispatch, prefer [`createPostgresPublisher`](#publisher), which owns this request-scoped lifecycle. Direct backend publication plus `dispatchTask` remains an escape hatch with caller-owned cleanup.
+
 Publication stores a task and may emit a PostgreSQL notification; listener-free is not notification-free. Future publication records availability, not a scheduler or a future Worker request. It does not atomically dispatch to a Durable Object, join an application transaction, or retry publication. A database exception near commit does not establish that no row was written. Awaitable publication remains on the full backend because callback delivery requires its listener.
+
+Both PostgreSQL publishing implementations return `{ taskId: number }` only for exact safe integers, including `Number.MAX_SAFE_INTEGER`. Otherwise they throw `PostgresPublishedTaskIdError`, exported from both `backends/postgres-publishing` and `backends/postgres`, with the committed row's exact ID in readonly `taskId: string`. This error does not undo publication; inspect the retained ID rather than automatically republishing. Other publication errors do not prove rollback.
 
 ### `PostgresExecutionBackend`
 

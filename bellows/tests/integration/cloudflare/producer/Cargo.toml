@@ -12,6 +12,4 @@ crate-type = ["cdylib", "rlib"]
 bellows = { path = "../../../..", default-features = false, features = ["cloudflare"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
-tokio.workspace = true
-tokio-postgres = { workspace = true, features = ["js"] }
-worker = { workspace = true, features = ["tokio-postgres"] }
+worker.workspace = true

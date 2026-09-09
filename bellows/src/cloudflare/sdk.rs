@@ -3,6 +3,14 @@
 //! Store one [`Dispatcher`] per Durable Object, created with [`Dispatcher::from_bindings`],
 //! and forward handlers to [`Dispatcher::fetch_worker`] and [`Dispatcher::alarm_worker`].
 //!
+//! For a producer, bind [`PostgresPublisher`] to one published task and its dispatcher. Its
+//! synchronous configuration runs once per call; construction does no I/O. Await
+//! [`PostgresPublisher::publish`] inside your handler: it publishes once, retains the exact string
+//! ID, validates the processor's safe-positive range, awaits backend shutdown, then consumes the
+//! complete dispatch response. Applications own authentication, routing, validation, and responses.
+//! Success confirms acceptance, not completion. [`PostgresPublisherError`] retains partial success
+//! and causes; do not flatten it into a Worker error before inspecting its receipt.
+//!
 //! For a processor Worker, delegate to [`PostgresProcessor::fetch_worker`]. Its synchronous
 //! configuration callback maps request bindings to [`PostgresProcessorConfig`] for one published
 //! task's factory, after validation. Construction performs no I/O; the delegate owns a fresh
@@ -17,7 +25,12 @@
 //!
 //! Direct [`crate::backends::postgres_execution::PostgresExecutionBackend`] with
 //! [`crate::run_task_once`] remains available for custom integrations with caller-owned cleanup.
-//! The processor does not extend request lifetime or add durable recovery or automatic retries.
+//! Likewise, [`crate::backends::postgres_publishing::PostgresPublishingBackend`] plus
+//! [`super::dispatch_task`] supports caller-managed publication. The publisher is immediate-only:
+//! no future/awaitable publication, callback delivery, or application cleanup hooks.
+//! Neither delegate extends request lifetime or adds durable recovery or automatic retries.
+//! Publication and dispatch are not atomic; cancellation, termination, and wasm traps have no
+//! async-finally guarantee. Initialize schemas administratively, not during requests.
 
 use http::{Request, Response};
 use worker::send::{SendFuture, SendWrapper};
@@ -28,7 +41,12 @@ use super::{
 };
 
 mod postgres;
+mod postgres_publisher;
 pub use postgres::{PostgresProcessor, PostgresProcessorConfig};
+pub use postgres_publisher::{
+    PostgresPublisher, PostgresPublisherConfig, PostgresPublisherError, PostgresPublisherReceipt,
+    PostgresPublisherStage,
+};
 
 /// A Workers service binding adapted to [`ProcessorFetcher`].
 pub struct Service(SendWrapper<worker::Fetcher>);
