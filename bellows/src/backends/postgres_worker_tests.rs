@@ -14,7 +14,13 @@ use tokio::{net::TcpStream, sync::oneshot, time::timeout};
 use tokio_postgres::{NoTls, config::SslMode};
 
 use super::*;
-use crate::{PublishTrigger, SingletonTrigger, backends::postgres::initialize_postgres_schema};
+use crate::{
+    Backend, PublishTrigger, SingletonTrigger, TaskExecutionBackend,
+    backends::{
+        postgres::{PostgresBackend, initialize_postgres_schema},
+        postgres_execution::PostgresExecutionBackend,
+    },
+};
 
 const DATABASE_URL: &str = "postgres://postgres:postgres@localhost:5432/postgres";
 const LIMIT: Duration = Duration::from_secs(5);
@@ -29,6 +35,24 @@ impl TaskDefinition for Echo {
     const NAME: &str = "worker_echo";
     type Callback = String;
     type Trigger = PublishTrigger<Payload>;
+}
+
+#[derive(Deserialize)]
+struct RejectedPayload;
+
+impl Serialize for RejectedPayload {
+    fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+        Err(serde::ser::Error::custom(
+            "intentional payload serialization failure",
+        ))
+    }
+}
+
+struct RejectedPayloadTask;
+impl TaskDefinition for RejectedPayloadTask {
+    const NAME: &str = "worker_rejected_payload";
+    type Callback = String;
+    type Trigger = PublishTrigger<RejectedPayload>;
 }
 
 struct Other;
@@ -222,6 +246,7 @@ impl Fixture {
     async fn wait_for_blocked_query(&self) {
         timeout(LIMIT, async {
             loop {
+                self.admin.batch_execute("SELECT pg_stat_clear_snapshot()").await.unwrap();
                 let blocked: bool = self.admin.query_typed_one(
                     "SELECT EXISTS (SELECT FROM pg_stat_activity WHERE application_name = $1 AND wait_event_type = 'Lock')",
                     &[(&self.schema, Type::TEXT)],
@@ -342,6 +367,304 @@ async fn configuration_validation_and_safe_error_sources() {
     fn thread_safe<T: Send + Sync>() {}
     thread_safe::<PostgresTaskOperations>();
     thread_safe::<PostgresWorkerError>();
+}
+
+#[tokio::test]
+async fn publication_commits_rows_and_notifies_native_consumers_without_callbacks() {
+    // Notifications are database-wide; avoid names used by concurrent fixture contracts.
+    struct PublishingEcho;
+    impl TaskDefinition for PublishingEcho {
+        const NAME: &str = "worker_publishing_echo";
+        type Callback = String;
+        type Trigger = PublishTrigger<Payload>;
+    }
+    let f = Fixture::new().await;
+    let ops = f.connect().await;
+    let options = PostgresBackendOptions {
+        schema: Some(f.schema.clone()),
+    };
+    let listener = PostgresBackend::connect_with_options(DATABASE_URL, options.clone())
+        .await
+        .unwrap();
+    let mut signals = listener.subscribe::<PublishingEcho>().await.unwrap();
+    let executor = PostgresExecutionBackend::connect_with_options(&f.url(), options)
+        .await
+        .unwrap();
+    let deadline = expiration();
+    let deadline_ms = unix_timestamp_ms(SystemTime::now()) + 60_000;
+    let payload = || Payload {
+        name: "hello \"🦀\"\n".into(),
+    };
+    let immediate = ops
+        .publish::<PublishingEcho>(payload(), None, None)
+        .await
+        .unwrap();
+    let future = ops
+        .publish::<PublishingEcho>(payload(), None, Some(deadline))
+        .await
+        .unwrap();
+    let unit = ops.publish::<Other>((), None, None).await.unwrap();
+    let future_unit = ops
+        .publish::<Other>((), None, Some(deadline))
+        .await
+        .unwrap();
+    ops.close().await.unwrap();
+    for (receipt, name, encoded, delayed) in [
+        (
+            immediate,
+            PublishingEcho::NAME,
+            serde_json::to_string(&payload()).unwrap(),
+            false,
+        ),
+        (
+            future,
+            PublishingEcho::NAME,
+            serde_json::to_string(&payload()).unwrap(),
+            true,
+        ),
+        (unit, Other::NAME, "null".to_owned(), false),
+        (future_unit, Other::NAME, "null".to_owned(), true),
+    ] {
+        let state = f.state(receipt.task_id).await.unwrap();
+        assert_eq!(state.payload, encoded);
+        assert_eq!((state.callback, state.owner), (None, None));
+        if delayed {
+            assert!((state.available.unwrap() - deadline_ms).abs() <= 20);
+        } else {
+            assert_eq!(state.available, None);
+        }
+        let row = f
+            .admin
+            .query_typed_one(
+                &format!(
+                    "SELECT task_name, task_unique_key FROM {} WHERE task_id = $1",
+                    f.table
+                ),
+                &[(&(receipt.task_id as i64), Type::INT8)],
+            )
+            .await
+            .unwrap();
+        assert_eq!(row.get::<_, String>(0), name);
+        assert_eq!(row.get::<_, Option<String>>(1), None);
+    }
+    for (receipt, delayed) in [(immediate, false), (future, true)] {
+        let signal = timeout(LIMIT, signals.recv()).await.unwrap().unwrap();
+        assert_eq!(signal.task_id, Some(receipt.task_id));
+        if delayed {
+            assert!(signal.available_from >= deadline - Duration::from_millis(20));
+            assert!(signal.available_from <= deadline + Duration::from_millis(20));
+        } else {
+            assert!(signal.available_from <= Instant::now());
+        }
+    }
+    assert!(matches!(
+        executor
+            .claim_published::<Other>(17, immediate.task_id, expiration())
+            .await,
+        Err(ClaimTaskError::TaskNotFound)
+    ));
+    assert!(matches!(
+        executor
+            .claim_published::<PublishingEcho>(17, future.task_id, expiration())
+            .await,
+        Err(ClaimTaskError::TaskUnavailable {
+            available_from: Some(_)
+        })
+    ));
+    f.make_available(future.task_id).await;
+    for receipt in [immediate, future] {
+        assert_eq!(
+            executor
+                .claim_published::<PublishingEcho>(17, receipt.task_id, expiration())
+                .await
+                .unwrap()
+                .task_payload,
+            payload()
+        );
+        executor
+            .finish::<PublishingEcho>(17, receipt.task_id, "no callback registered".into(), None)
+            .await
+            .unwrap();
+        assert!(f.state(receipt.task_id).await.is_none());
+    }
+    executor.close().await.unwrap();
+    drop(signals);
+    drop(listener);
+    f.cleanup().await;
+}
+
+#[tokio::test]
+async fn publication_errors_preserve_sources_and_do_not_retry_or_undo_committed_inserts() {
+    let f = Fixture::new().await;
+    let ops = f.connect().await;
+    for available in [None, Some(expiration())] {
+        let PublishTaskError::Backend(error) = ops
+            .publish::<RejectedPayloadTask>(RejectedPayload, None, available)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref(),
+            Some(PostgresWorkerError::PayloadSerialization(_))
+        ));
+        assert!(error.source().unwrap().is::<serde_json::Error>());
+        assert!(
+            error
+                .to_string()
+                .contains("intentional payload serialization failure")
+        );
+    }
+    let sequence = format!("\"{}\".bellows_tasks_task_id_seq", f.schema);
+    let called: bool = f
+        .admin
+        .query_one(&format!("SELECT is_called FROM {sequence}"), &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert!(!called);
+    f.admin
+        .batch_execute(&format!(
+            "ALTER TABLE {} ADD CONSTRAINT reject_insert CHECK (false)",
+            f.table
+        ))
+        .await
+        .unwrap();
+    let PublishTaskError::Backend(error) = ops.publish::<Other>((), None, None).await.unwrap_err();
+    let source = error
+        .source()
+        .unwrap()
+        .downcast_ref::<tokio_postgres::Error>()
+        .unwrap();
+    assert_eq!(source.code().unwrap().code(), "23514");
+    let attempts: i64 = f
+        .admin
+        .query_one(&format!("SELECT last_value FROM {sequence}"), &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(attempts, 1);
+    let count: i64 = f
+        .admin
+        .query_one(&format!("SELECT count(*) FROM {}", f.table), &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(count, 0);
+    // Close remains caller-owned after a query failure, and repeated close shares its result.
+    let clone = ops.clone();
+    ops.close().await.unwrap();
+    clone.close().await.unwrap();
+    assert!(matches!(
+        clone.publish::<Other>((), None, None).await,
+        Err(PublishTaskError::Backend(error)) if matches!(error.downcast_ref(), Some(PostgresWorkerError::Closed))
+    ));
+    f.admin.batch_execute(&format!(
+        "ALTER TABLE {} DROP CONSTRAINT reject_insert; ALTER SEQUENCE {sequence} MINVALUE -1 RESTART WITH -1",
+        f.table,
+    )).await.unwrap();
+    let ops = f.connect().await;
+    let PublishTaskError::Backend(error) = ops.publish::<Other>((), None, None).await.unwrap_err();
+    assert!(matches!(
+        error.downcast_ref(),
+        Some(PostgresWorkerError::InvalidTaskId(_))
+    ));
+    assert!(error.source().unwrap().is::<TryFromIntError>());
+    let committed: i64 = f
+        .admin
+        .query_one(
+            &format!("SELECT count(*) FROM {} WHERE task_id = -1", f.table),
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(committed, 1);
+    for id in [9_007_199_254_740_992_i64, i64::MAX] {
+        f.admin
+            .batch_execute(&format!("ALTER SEQUENCE {sequence} RESTART WITH {id}"))
+            .await
+            .unwrap();
+        assert_eq!(
+            ops.publish::<Other>((), None, None).await.unwrap().task_id,
+            id as u64
+        );
+    }
+    ops.close().await.unwrap();
+    f.cleanup().await;
+}
+
+#[tokio::test]
+async fn publication_close_drains_active_and_cancelled_consumers_without_losing_driver_ownership() {
+    for cancel_consumer in [false, true] {
+        let f = Fixture::new().await;
+        let (config, host, port) = connection_config(&f.url()).unwrap();
+        let (client, connection) = config
+            .connect_raw(
+                TcpStream::connect((host.as_str(), port)).await.unwrap(),
+                NoTls,
+            )
+            .await
+            .unwrap();
+        let (exited_tx, exited_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let ops = PostgresTaskOperations::from_connection(
+            client,
+            async move {
+                let result = connection.await;
+                exited_tx.send(()).unwrap();
+                release_rx.await.unwrap();
+                result
+            },
+            Arc::from(f.table.as_str()),
+        );
+        f.admin
+            .batch_execute(&format!(
+                "BEGIN; LOCK TABLE {} IN ACCESS EXCLUSIVE MODE",
+                f.table
+            ))
+            .await
+            .unwrap();
+        let clone = ops.clone();
+        let insert = tokio::spawn(async move { clone.publish::<Other>((), None, None).await });
+        f.wait_for_blocked_query().await;
+        let mut close = Box::pin(ops.close());
+        pending(close.as_mut()).await;
+        assert!(!insert.is_finished());
+        drop(close);
+        if cancel_consumer {
+            insert.abort();
+        }
+        let mut close = Box::pin(ops.close());
+        pending(close.as_mut()).await;
+        f.admin.batch_execute("COMMIT").await.unwrap();
+        let result = timeout(LIMIT, insert).await.unwrap();
+        if cancel_consumer {
+            assert!(result.unwrap_err().is_cancelled());
+        } else {
+            assert_eq!(result.unwrap().unwrap().task_id, 1);
+        }
+        tokio::select! {
+            result = close.as_mut() => panic!("close lost the gated driver: {result:?}"),
+            exited = timeout(LIMIT, exited_rx) => exited.unwrap().unwrap(),
+        }
+        // Even after socket exit, cancelling close must preserve the driver's pending result.
+        drop(close);
+        let mut resumed = Box::pin(ops.close());
+        pending(resumed.as_mut()).await;
+        release_tx.send(()).unwrap();
+        timeout(LIMIT, resumed).await.unwrap().unwrap();
+        ops.clone().close().await.unwrap();
+        // This already-sent autocommit insert commits even if its query consumer was cancelled.
+        assert_eq!(f.state(1).await.unwrap().payload, "null");
+        assert!(matches!(
+            &*ops.shared.driver.lock().await,
+            Driver::Closed(Ok(()))
+        ));
+        assert!(matches!(
+            ops.publish::<Other>((), None, Some(expiration())).await,
+            Err(PublishTaskError::Backend(error)) if matches!(error.downcast_ref(), Some(PostgresWorkerError::Closed))
+        ));
+        f.cleanup().await;
+    }
 }
 
 #[tokio::test]
@@ -1112,6 +1435,8 @@ async fn connection_driver_errors_are_observed_and_repeated_close_returns_the_er
         ops.claim_earliest_published::<Echo>(17, expiration()).await,
         Err(ClaimTaskError::Backend(_))
     ));
+    let PublishTaskError::Backend(error) = ops.publish::<Other>((), None, None).await.unwrap_err();
+    assert!(error.source().unwrap().is::<tokio_postgres::Error>());
     let first = timeout(LIMIT, ops.close()).await.unwrap().unwrap_err();
     let second = ops.clone().close().await.unwrap_err();
     match (&first, &second) {

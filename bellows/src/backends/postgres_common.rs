@@ -49,6 +49,23 @@ pub(super) fn validate_schema_name(schema_name: &str) -> Result<(), io::Error> {
 
 // Only validated, quoted table identifiers are formatted here. All application values remain
 // query parameters. Both drivers use exactly these predicates and parameter positions.
+pub(super) fn publish_sql(table_name: &str) -> String {
+    format!(
+        r#"
+INSERT INTO {table_name} AS tasks (
+    task_name,
+    task_unique_key,
+    payload_json,
+    callback_id,
+    lease_worker_id,
+    available_from_unix_ms
+)
+VALUES ($1, NULL, $2, $3, NULL, $4)
+RETURNING task_id
+"#
+    )
+}
+
 pub(super) fn claim_published_sql(table_name: &str) -> String {
     format!(
         r#"

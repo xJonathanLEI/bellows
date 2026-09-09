@@ -45,6 +45,11 @@ type NotificationPayload =
 
 const MAX_CALLBACK_ID = BigInt(Number.MAX_SAFE_INTEGER);
 
+/**
+ * Full PostgreSQL backend with listener-backed signaling and callback delivery.
+ * For plain publication without a listener, use `PostgresPublishingBackend` from
+ * `@xjonathanlei/bellows/backends/postgres-publishing`, including for callback-bearing definitions.
+ */
 export class PostgresBackend implements Backend {
   private readonly signals = new Map<string, SignalHub>();
   private readonly callbacks = new Map<number, CallbackSink>();

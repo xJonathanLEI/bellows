@@ -1,12 +1,13 @@
 import { randomUUID } from "node:crypto";
 import { Client } from "pg";
-import { afterEach, expect, test } from "vitest";
+import { afterEach, expect, expectTypeOf, test } from "vitest";
 import {
   initializePostgresSchema,
   PostgresBackend,
 } from "../src/backends/postgres.js";
 import { PostgresExecutionBackend } from "../src/backends/postgres-execution.js";
 import { validatePostgresSchemaName } from "../src/backends/postgres-operations.js";
+import { PostgresPublishingBackend } from "../src/backends/postgres-publishing.js";
 import {
   definePublishTask,
   defineSingletonTask,
@@ -486,10 +487,420 @@ test("postgres rejects invalid schemas before connecting", async () => {
       PostgresExecutionBackend.connect("not a database URL", { schema }),
     ).rejects.toThrow("Database schema names");
     await expect(
+      PostgresPublishingBackend.connect("not a database URL", { schema }),
+    ).rejects.toThrow("Database schema names");
+    await expect(
       initializePostgresSchema("not a database URL", schema),
     ).rejects.toThrow("Database schema names");
   }
 });
+
+test("postgres publishing backend exposes only publication and lifecycle methods", () => {
+  expectTypeOf<keyof PostgresPublishingBackend>().toEqualTypeOf<
+    "publish" | "publishFuture" | "close"
+  >();
+});
+
+test.each([
+  "default",
+  "named",
+])("postgres publishing stores rows, notifies consumers, and supports execution with a %s schema", async (mode) => {
+  const database = track(await TestPostgresDatabase.create("publishing_rows"));
+  const admin = new Client({ connectionString: database.url });
+  await admin.connect();
+  const schema = mode === "named" ? "publishing" : undefined;
+  const table = `"${schema ?? "public"}".bellows_tasks`;
+  let publisher: PostgresPublishingBackend | undefined;
+  let closed = false;
+  try {
+    if (schema) {
+      await admin.query(`CREATE SCHEMA "${schema}"`);
+    }
+    publisher = await PostgresPublishingBackend.connect(database.url, {
+      schema,
+    });
+    expect(
+      (await admin.query("SELECT to_regclass($1)::text AS name", [table])).rows,
+    ).toEqual([{ name: null }]);
+    await expect(publisher.publish(ackTask, undefined)).rejects.toMatchObject({
+      code: "42P01",
+    });
+    await initializePostgresSchema(database.url, schema ?? "public");
+    const listener = track(
+      await PostgresBackend.connect(database.url, { schema }),
+    );
+    const signals = track(await listener.subscribe(echoTask));
+    const executor = track(
+      await PostgresExecutionBackend.connect(database.url, { schema }),
+    );
+    const before = Date.now();
+    const deadline = before + 60_000;
+    const payload = { name: 'hello "🦀"\n' };
+    const immediate = await publisher.publish(echoTask, payload);
+    const future = await publisher.publishFuture(echoTask, payload, deadline);
+    const unit = await publisher.publish(ackTask, undefined);
+    const futureUnit = await publisher.publishFuture(
+      ackTask,
+      undefined,
+      deadline,
+    );
+    await publisher.close();
+    closed = true;
+    for (const [receipt, name, encoded, available] of [
+      [immediate, echoTask.name, echoTask.codec.encode(payload), null],
+      [future, echoTask.name, echoTask.codec.encode(payload), String(deadline)],
+      [unit, ackTask.name, "null", null],
+      [futureUnit, ackTask.name, "null", String(deadline)],
+    ] as const) {
+      expect(
+        (
+          await admin.query(`SELECT * FROM ${table} WHERE task_id = $1`, [
+            receipt.taskId,
+          ])
+        ).rows,
+      ).toEqual([
+        {
+          task_id: String(receipt.taskId),
+          task_name: name,
+          payload_json: encoded,
+          task_unique_key: null,
+          callback_id: null,
+          lease_worker_id: null,
+          available_from_unix_ms: available,
+        },
+      ]);
+    }
+    const immediateSignal = await signals.recv();
+    expect(immediateSignal).toMatchObject({
+      type: "new-task-available",
+      taskId: immediate.taskId,
+    });
+    expect(immediateSignal?.availableFromMs).toBeGreaterThanOrEqual(before);
+    expect(immediateSignal?.availableFromMs).toBeLessThanOrEqual(Date.now());
+    expect(await signals.recv()).toEqual({
+      type: "new-task-available",
+      taskId: future.taskId,
+      availableFromMs: deadline,
+    });
+    await expect(
+      executor.claimPublished(ackTask, 17, immediate.taskId, deadline),
+    ).rejects.toBeInstanceOf(TaskNotFoundError);
+    await expect(
+      executor.claimPublished(echoTask, 17, future.taskId, deadline),
+    ).rejects.toEqual(new TaskUnavailableError(deadline));
+    await admin.query(
+      `UPDATE ${table} SET available_from_unix_ms = NULL WHERE task_id = $1`,
+      [future.taskId],
+    );
+    for (const receipt of [immediate, future]) {
+      expect(
+        (await executor.claimPublished(echoTask, 17, receipt.taskId, deadline))
+          .taskPayload,
+      ).toEqual(payload);
+      await executor.finish(
+        echoTask,
+        17,
+        receipt.taskId,
+        "no callback registered",
+        null,
+      );
+    }
+    await admin.query(
+      `UPDATE ${table} SET available_from_unix_ms = NULL WHERE task_id = $1`,
+      [futureUnit.taskId],
+    );
+    for (const receipt of [unit, futureUnit]) {
+      await executor.claimPublished(ackTask, 17, receipt.taskId, deadline);
+      await executor.finish(ackTask, 17, receipt.taskId, undefined, null);
+    }
+    expect((await admin.query(`SELECT count(*) FROM ${table}`)).rows).toEqual([
+      { count: "0" },
+    ]);
+    if (schema) {
+      expect(
+        (
+          await admin.query(
+            "SELECT to_regclass('public.bellows_tasks')::text AS name",
+          )
+        ).rows,
+      ).toEqual([{ name: null }]);
+    }
+  } finally {
+    if (!closed) {
+      await publisher?.close();
+    }
+    await admin.end();
+  }
+});
+
+test("postgres publishing missing schema and table never fall back", async () => {
+  const database = track(
+    await TestPostgresDatabase.create("publishing_missing"),
+  );
+  await initializePostgresSchema(database.url, "public");
+  const admin = new Client({ connectionString: database.url });
+  await admin.connect();
+  const publisher = track(
+    await PostgresPublishingBackend.connect(database.url, {
+      schema: "missing",
+    }),
+  );
+  try {
+    for (const exists of [false, true]) {
+      if (exists) {
+        await admin.query("CREATE SCHEMA missing");
+      }
+      await expect(publisher.publish(ackTask, undefined)).rejects.toMatchObject(
+        { code: "42P01" },
+      );
+      expect(
+        (
+          await admin.query(
+            "SELECT EXISTS (SELECT FROM pg_namespace WHERE nspname = 'missing') AS present",
+          )
+        ).rows,
+      ).toEqual([{ present: exists }]);
+      expect(
+        (await admin.query("SELECT count(*) FROM public.bellows_tasks")).rows,
+      ).toEqual([{ count: "0" }]);
+    }
+  } finally {
+    await admin.end();
+  }
+});
+
+test("postgres publishing preserves codec and SQL errors without retries and supports safe integer receipts", async () => {
+  const database = track(
+    await TestPostgresDatabase.create("publishing_errors"),
+  );
+  await initializePostgresSchema(database.url, "public");
+  const admin = new Client({ connectionString: database.url });
+  await admin.connect();
+  const publisher = track(
+    await PostgresPublishingBackend.connect(database.url),
+  );
+  try {
+    const error = new Error("intentional payload serialization failure");
+    const rejected = {
+      ...echoTask,
+      codec: {
+        ...echoTask.codec,
+        encode: () => {
+          throw error;
+        },
+      },
+    };
+    await expect(
+      publisher.publish(rejected, { name: "rejected" }),
+    ).rejects.toBe(error);
+    await expect(
+      publisher.publishFuture(rejected, { name: "rejected" }, Date.now()),
+    ).rejects.toBe(error);
+    expect(
+      (await admin.query("SELECT is_called FROM bellows_tasks_task_id_seq"))
+        .rows,
+    ).toEqual([{ is_called: false }]);
+    await admin.query(
+      "ALTER TABLE bellows_tasks ADD CONSTRAINT reject_insert CHECK (false)",
+    );
+    await expect(publisher.publish(ackTask, undefined)).rejects.toMatchObject({
+      code: "23514",
+      constraint: "reject_insert",
+      table: "bellows_tasks",
+    });
+    expect(
+      (await admin.query("SELECT last_value FROM bellows_tasks_task_id_seq"))
+        .rows,
+    ).toEqual([{ last_value: "1" }]);
+    expect(
+      (await admin.query("SELECT count(*) FROM bellows_tasks")).rows,
+    ).toEqual([{ count: "0" }]);
+    await admin.query(
+      "ALTER TABLE bellows_tasks DROP CONSTRAINT reject_insert",
+    );
+    expect(await publisher.publish(ackTask, undefined)).toEqual({ taskId: 2 });
+    await admin.query(
+      `ALTER SEQUENCE bellows_tasks_task_id_seq RESTART WITH ${Number.MAX_SAFE_INTEGER}`,
+    );
+    expect(await publisher.publish(ackTask, undefined)).toEqual({
+      taskId: Number.MAX_SAFE_INTEGER,
+    });
+    expect(
+      (
+        await admin.query(
+          "SELECT task_id FROM bellows_tasks WHERE task_id = $1",
+          [Number.MAX_SAFE_INTEGER],
+        )
+      ).rows,
+    ).toEqual([{ task_id: String(Number.MAX_SAFE_INTEGER) }]);
+
+    const custom = {
+      ...echoTask,
+      codec: {
+        encode: ({ name }: { name: string }) => `custom:${name}`,
+        decode: (encoded: string) => ({
+          name: encoded.slice("custom:".length),
+        }),
+      },
+    };
+    await admin.query(
+      "ALTER SEQUENCE bellows_tasks_task_id_seq RESTART WITH 3",
+    );
+    const receipt = await publisher.publish(custom, { name: "codec" });
+    expect(
+      (
+        await admin.query(
+          "SELECT payload_json FROM bellows_tasks WHERE task_id = $1",
+          [receipt.taskId],
+        )
+      ).rows,
+    ).toEqual([{ payload_json: "custom:codec" }]);
+    const executor = track(
+      await PostgresExecutionBackend.connect(database.url),
+    );
+    expect(
+      (
+        await executor.claimPublished(
+          custom,
+          17,
+          receipt.taskId,
+          Date.now() + 60_000,
+        )
+      ).taskPayload,
+    ).toEqual({ name: "codec" });
+    await executor.finish(custom, 17, receipt.taskId, "done", null);
+  } finally {
+    await admin.end();
+  }
+});
+
+test("postgres publishing serial pool has no listener and awaited close removes its connections", async () => {
+  const database = track(await TestPostgresDatabase.create("publishing_pool"));
+  await initializePostgresSchema(database.url, "public");
+  const admin = new Client({ connectionString: database.url });
+  await admin.connect();
+  const app = `publishing_${randomUUID().replaceAll("-", "")}`;
+  const url = new URL(database.url);
+  url.searchParams.set("application_name", app);
+  const publisher = await PostgresPublishingBackend.connect(url.toString());
+  let closed = false;
+  try {
+    for (let i = 0; i < 8; i++) {
+      await publisher.publish(ackTask, undefined);
+    }
+    await waitForPublisherConnections(admin, app, 1);
+    const activity = await admin.query<{ query: string }>(
+      "SELECT query FROM pg_stat_activity WHERE application_name = $1",
+      [app],
+    );
+    expect(
+      activity.rows.every(
+        ({ query }) => !query.toUpperCase().includes("LISTEN"),
+      ),
+    ).toBe(true);
+    await publisher.close();
+    closed = true;
+    await waitForPublisherConnections(admin, app, 0);
+    await expect(publisher.publish(ackTask, undefined)).rejects.toThrow(
+      "Cannot use a pool after calling end on the pool",
+    );
+    await expect(
+      publisher.publishFuture(ackTask, undefined, Date.now()),
+    ).rejects.toThrow("Cannot use a pool after calling end on the pool");
+  } finally {
+    if (!closed) {
+      await publisher.close();
+    }
+    await admin.end();
+  }
+});
+
+test("postgres publishing close waits for a SQL-gated insert", async () => {
+  const database = track(await TestPostgresDatabase.create("publishing_close"));
+  await initializePostgresSchema(database.url, "public");
+  const admin = new Client({ connectionString: database.url });
+  await admin.connect();
+  const app = `publishing_${randomUUID().replaceAll("-", "")}`;
+  const url = new URL(database.url);
+  url.searchParams.set("application_name", app);
+  const publisher = await PostgresPublishingBackend.connect(url.toString());
+  let insert: ReturnType<typeof publisher.publish> | undefined;
+  let close: Promise<void> | undefined;
+  let transactionOpen = false;
+  try {
+    await admin.query("BEGIN");
+    transactionOpen = true;
+    await admin.query("LOCK TABLE bellows_tasks IN ACCESS EXCLUSIVE MODE");
+    let inserted = false;
+    insert = publisher.publish(ackTask, undefined).then((receipt) => {
+      inserted = true;
+      return receipt;
+    });
+    await expect
+      .poll(
+        async () => {
+          // The gate transaction otherwise caches activity before the lazy pool connects.
+          await admin.query("SELECT pg_stat_clear_snapshot()");
+          return (
+            await admin.query(
+              "SELECT EXISTS (SELECT FROM pg_stat_activity WHERE application_name = $1 AND wait_event_type = 'Lock') AS blocked",
+              [app],
+            )
+          ).rows[0].blocked;
+        },
+        { timeout: 1_000 },
+      )
+      .toBe(true);
+    let closed = false;
+    close = publisher.close().then(() => {
+      closed = true;
+    });
+    await sleep(20);
+    expect(inserted).toBe(false);
+    expect(closed).toBe(false);
+    await admin.query("COMMIT");
+    transactionOpen = false;
+    const receipt = await insert;
+    await close;
+    expect(
+      (
+        await admin.query(
+          "SELECT count(*) FROM bellows_tasks WHERE task_id = $1",
+          [receipt.taskId],
+        )
+      ).rows,
+    ).toEqual([{ count: "1" }]);
+    await waitForPublisherConnections(admin, app, 0);
+  } finally {
+    if (transactionOpen) {
+      await admin.query("ROLLBACK");
+    }
+    await insert?.catch(() => undefined);
+    await (close ?? publisher.close());
+    await admin.end();
+  }
+});
+
+async function waitForPublisherConnections(
+  admin: Client,
+  app: string,
+  expected: number,
+): Promise<void> {
+  await expect
+    .poll(
+      async () =>
+        Number(
+          (
+            await admin.query(
+              "SELECT count(*) FROM pg_stat_activity WHERE application_name = $1",
+              [app],
+            )
+          ).rows[0].count,
+        ),
+      { timeout: 1_000 },
+    )
+    .toBe(expected);
+}
 
 test("postgres missing schema does not fall back", async () => {
   const database = track(await TestPostgresDatabase.create("missing_schema"));

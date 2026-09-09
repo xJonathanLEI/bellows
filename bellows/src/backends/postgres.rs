@@ -1,4 +1,7 @@
-//! Postgres task backend implementation.
+//! Full PostgreSQL backend with listener-backed signaling and callback delivery.
+//!
+//! Producers that do not need callback delivery or subscriptions can use
+//! [`super::postgres_publishing::PostgresPublishingBackend`] without a listener.
 
 use std::{
     collections::{HashMap, hash_map::Entry as HashMapEntry},
@@ -20,6 +23,7 @@ use crate::backends::{
     Backend, BackendSignal, BackendSignalSubscription, ClaimTaskError, ClaimedTask, FailTaskError,
     FailedTask, FinishTaskError, FinishedTask, NewTaskAvailableSignalPayload, PublishTaskError,
     PublishedTask, RenewTaskError, RenewedTaskLease, SubscribeError, TaskExecutionBackend,
+    TaskPublishingBackend,
 };
 use crate::{AwaitableTask, PublishActivationStrategy, TaskDefinition};
 
@@ -42,6 +46,8 @@ const LISTENER_RETRY_DELAY: Duration = Duration::from_secs(1);
 /// This full backend supports both [`crate::dispatcher::WorkerDispatcher`] and
 /// [`crate::run_task_once`]. For execution without a dedicated listener or publishing/subscription
 /// capabilities, use [`super::postgres_execution::PostgresExecutionBackend`] instead.
+/// For plain publication, including callback-bearing definitions without a callback handle, use
+/// [`super::postgres_publishing::PostgresPublishingBackend`].
 #[derive(Clone)]
 pub struct PostgresBackend {
     operations: PostgresTaskOperations,
@@ -196,6 +202,23 @@ impl Backend for PostgresBackend {
         ))
     }
 
+    async fn publish_awaitable<T>(
+        &self,
+        payload: <<T as TaskDefinition>::Trigger as PublishActivationStrategy>::Payload,
+    ) -> Result<AwaitableTask<T::Callback>, PublishTaskError>
+    where
+        T: TaskDefinition,
+        T::Trigger: PublishActivationStrategy,
+    {
+        let (callback_id, callback_rx) = self.reserve_callback::<T::Callback>();
+        let published = self
+            .publish_impl::<T>(payload, Some(callback_id), None)
+            .await?;
+        Ok(AwaitableTask::new(published.task_id, callback_rx))
+    }
+}
+
+impl TaskPublishingBackend for PostgresBackend {
     async fn publish<T>(
         &self,
         payload: <<T as TaskDefinition>::Trigger as PublishActivationStrategy>::Payload,
@@ -218,21 +241,6 @@ impl Backend for PostgresBackend {
     {
         self.publish_impl::<T>(payload, None, Some(available_from))
             .await
-    }
-
-    async fn publish_awaitable<T>(
-        &self,
-        payload: <<T as TaskDefinition>::Trigger as PublishActivationStrategy>::Payload,
-    ) -> Result<AwaitableTask<T::Callback>, PublishTaskError>
-    where
-        T: TaskDefinition,
-        T::Trigger: PublishActivationStrategy,
-    {
-        let (callback_id, callback_rx) = self.reserve_callback::<T::Callback>();
-        let published = self
-            .publish_impl::<T>(payload, Some(callback_id), None)
-            .await?;
-        Ok(AwaitableTask::new(published.task_id, callback_rx))
     }
 }
 

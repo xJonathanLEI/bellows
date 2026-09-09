@@ -9,8 +9,8 @@ use std::{
 };
 
 use bellows::{
-    Backend, PublishTrigger, SingletonTrigger, TaskDefinition, TaskFailure, TaskResult,
-    TaskSuccess, Worker, WorkerFactory, backends::in_memory::InMemoryBackend,
+    Backend, PublishTrigger, SingletonTrigger, TaskDefinition, TaskFailure, TaskPublishingBackend,
+    TaskResult, TaskSuccess, Worker, WorkerFactory, backends::in_memory::InMemoryBackend,
     dispatcher::WorkerDispatcher,
 };
 use serde::{Deserialize, Serialize};

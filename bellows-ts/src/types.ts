@@ -236,17 +236,26 @@ export interface TaskExecutionBackend {
   ): Promise<FinishedTask>;
 }
 
-export interface Backend extends TaskExecutionBackend {
-  subscribe(task: TaskDefinition): Promise<BackendSignalSubscription>;
+/**
+ * Plain task publication without execution or subscriptions.
+ * Callback-bearing definitions are supported without registering a callback.
+ */
+export interface TaskPublishingBackend {
   publish<TPayload, TCallback>(
     task: PublishTaskDefinition<TPayload, TCallback>,
     payload: TPayload,
   ): Promise<PublishedTask>;
+  /** Records future availability; it does not provide a scheduler. */
   publishFuture<TPayload, TCallback>(
     task: PublishTaskDefinition<TPayload, TCallback>,
     payload: TPayload,
     availableFromMs: number,
   ): Promise<PublishedTask>;
+}
+
+/** Both capabilities plus subscriptions and awaitable callback delivery. */
+export interface Backend extends TaskPublishingBackend, TaskExecutionBackend {
+  subscribe(task: TaskDefinition): Promise<BackendSignalSubscription>;
   publishAwaitable<TPayload, TCallback>(
     task: PublishTaskDefinition<TPayload, TCallback>,
     payload: TPayload,

@@ -33,6 +33,10 @@
       "types": "./dist/backends/postgres-execution.d.ts",
       "default": "./dist/backends/postgres-execution.js"
     },
+    "./backends/postgres-publishing": {
+      "types": "./dist/backends/postgres-publishing.d.ts",
+      "default": "./dist/backends/postgres-publishing.js"
+    },
     "./cloudflare": {
       "types": "./dist/cloudflare.d.ts",
       "default": "./dist/cloudflare.js"

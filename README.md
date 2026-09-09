@@ -68,7 +68,7 @@ When an external host already knows which task to attempt, use `run_task_once` w
 
 ```rust
 use bellows::{
-    Backend, PublishDispatchToken, PublishTrigger, TaskDefinition, TaskResult, TaskSuccess,
+    PublishDispatchToken, PublishTrigger, TaskDefinition, TaskPublishingBackend, TaskResult, TaskSuccess,
     Worker, WorkerFactory, backends::in_memory::InMemoryBackend, run_task_once,
 };
 
@@ -118,6 +118,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Built-in backends
 
+Backend capabilities are separate in both languages:
+
+| Capability              | API                                                             |
+| ----------------------- | --------------------------------------------------------------- |
+| `TaskPublishingBackend` | Immediate and future publication, returning a task receipt.     |
+| `TaskExecutionBackend`  | Claim, renew, fail, and finish tasks.                           |
+| `Backend`               | Both capabilities, plus subscription and awaitable publication. |
+
+Plain publication supports callback-bearing definitions without registering a callback; singleton definitions are not publishable. Awaitable publication remains on the full backend because callback delivery needs its signal channel (a PostgreSQL listener). In Rust, import `TaskPublishingBackend` for concrete `publish` / `publish_future` calls, even on a full backend.
+
 `bellows` currently ships with:
 
 - an in-memory backend for lightweight testing;
@@ -145,6 +155,60 @@ The Postgres backend uses native `LISTEN`/`NOTIFY` signaling. Task inserts trigg
 Because the signaling is provided by Postgres itself, this backend works naturally across multiple worker processes and across multiple machines, as long as they can all reach the same Postgres database.
 
 This makes the Postgres backend the built-in option intended for durable distributed deployments, while SQLite remains the lightweight single-process durable option.
+
+### Publishing without a listener
+
+Use `PostgresPublishingBackend` when your producer only needs typed publication. It exposes no initialization, execution, subscription, or awaitable API. Create the schema and initialize tables separately with [`initialize_postgres_schema`](./bellows/src/backends/postgres.rs) through an administrative connection. This example assumes the existing `bellows` schema is initialized:
+
+```rust
+use bellows::{
+    PublishTrigger, TaskDefinition, TaskPublishingBackend,
+    backends::{
+        PublishTaskError,
+        postgres_publishing::{PostgresBackendOptions, PostgresPublishingBackend},
+    },
+    time::Instant,
+};
+use std::time::Duration;
+
+struct Welcome;
+impl TaskDefinition for Welcome {
+    const NAME: &str = "send_welcome_email";
+    type Callback = String;
+    type Trigger = PublishTrigger<String>;
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let backend = PostgresPublishingBackend::connect_with_options(
+        &std::env::var("DATABASE_URL")?,
+        PostgresBackendOptions {
+            schema: Some("bellows".into()),
+        },
+    )
+    .await?;
+    let publication = async {
+        let now = backend.publish::<Welcome>("alice@example.com".into()).await?;
+        let later = backend
+            .publish_future::<Welcome>(
+                "bob@example.com".into(),
+                Instant::now() + Duration::from_secs(60),
+            )
+            .await?;
+        Ok::<_, PublishTaskError>((now, later))
+    }
+    .await;
+    // Await shutdown even when publication failed.
+    backend.close().await?;
+    let (now, later) = publication?;
+    println!("Published {} and {}", now.task_id, later.task_id);
+    Ok(())
+}
+```
+
+The native backend owns a SQLx pool; closing any clone closes the shared resources. On Workers, enable only `cloudflare`, connect through Hyperdrive inside each request, and await `close()` on success and error paths before responding. Never retain connections across requests or rely on dropping clones to close the driver. See the [TypeScript equivalent](./bellows-ts/README.md#postgrespublishingbackend) for its dedicated package subpath and awaited pool shutdown.
+
+Publication stores a task and may emit a PostgreSQL notification; listener-free is not notification-free. Future publication stores availability, not a scheduler or a future Worker request. It does not atomically dispatch to a Durable Object, join an application transaction, or retry publication. A database exception near commit does not establish that no row was written.
 
 ## Cloudflare Workers (Rust and TypeScript)
 

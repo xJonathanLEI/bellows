@@ -1,0 +1,16 @@
+{
+  "$schema": "../../../node_modules/wrangler/config-schema.json",
+  "name": "bellows-cloudflare-publishing-contracts",
+  "main": "workers/publishing.ts",
+  "compatibility_date": "2026-07-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": false,
+  "preview_urls": false,
+  "vars": { "BELLOWS_SCHEMA": "bellows_cloudflare" },
+  "hyperdrive": [
+    {
+      "binding": "HYPERDRIVE",
+      "id": "00000000000000000000000000000000"
+    }
+  ]
+}

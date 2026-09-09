@@ -1,7 +1,9 @@
 //! Built-in task backend implementations.
 //!
 //! Native defaults include in-memory, SQLite, and PostgreSQL. On wasm, disable defaults and enable
-//! `cloudflare` for listener-free PostgreSQL execution. Portable deadlines use [`crate::time::Instant`].
+//! `cloudflare` for listener-free PostgreSQL publishing and execution. Producers can depend on
+//! [`TaskPublishingBackend`], processors on [`TaskExecutionBackend`], and native dispatchers on the
+//! full [`Backend`]. Portable deadlines use [`crate::time::Instant`].
 
 use std::{
     error::Error as StdError,
@@ -30,6 +32,11 @@ pub mod postgres_execution;
 #[cfg(all(not(target_arch = "wasm32"), feature = "postgres"))]
 mod postgres_operations;
 #[cfg(any(
+    all(not(target_arch = "wasm32"), feature = "postgres"),
+    all(target_arch = "wasm32", feature = "cloudflare")
+))]
+pub mod postgres_publishing;
+#[cfg(any(
     all(test, not(target_arch = "wasm32"), feature = "postgres"),
     all(target_arch = "wasm32", feature = "cloudflare")
 ))]
@@ -45,11 +52,12 @@ pub mod sqlite;
     all(target_arch = "wasm32", not(feature = "cloudflare")),
     doc = "[`crate::run_task_once`]: https://docs.rs/bellows/latest/bellows/fn.run_task_once.html"
 )]
-/// Publishing and subscription capabilities in addition to [`TaskExecutionBackend`].
+/// Full backend capabilities: publishing, execution, subscriptions, and awaitable publication.
 ///
 /// A full backend connects to the underlying task registry and its associated signal channel.
-/// The native [`crate::dispatcher::WorkerDispatcher`] requires this trait; [`crate::run_task_once`]
-/// only requires the execution trait. Implementations must be cheaply cloneable.
+/// The native [`crate::dispatcher::WorkerDispatcher`] requires this trait. Producers only need
+/// [`TaskPublishingBackend`]; [`crate::run_task_once`] only needs [`TaskExecutionBackend`].
+/// Implementations must be cheaply cloneable.
 ///
 /// Some [`Backend`] implementations would have "intrinsic" connection between its task registry
 /// and the signal channel, such as Postgres where inserting a task row would trigger a `NOTIFY`
@@ -57,7 +65,7 @@ pub mod sqlite;
 ///
 /// Other implementations may not have those and might use a two-step register-trigger process
 /// where dispatchers handle signaling on the side.
-pub trait Backend: TaskExecutionBackend {
+pub trait Backend: TaskPublishingBackend + TaskExecutionBackend {
     /// Subscribes for signals for important task updates for a specific task definition.
     ///
     /// This is usually used by worker dispatchers to react to task availability. Backends must
@@ -69,6 +77,27 @@ pub trait Backend: TaskExecutionBackend {
     where
         T: TaskDefinition;
 
+    /// Publishes a task and returns a typed handle that can await the worker callback payload.
+    ///
+    /// Awaitable publication requires the full backend's callback delivery channel.
+    fn publish_awaitable<T>(
+        &self,
+        payload: <<T as TaskDefinition>::Trigger as PublishActivationStrategy>::Payload,
+    ) -> impl Future<Output = Result<AwaitableTask<T::Callback>, PublishTaskError>> + Send
+    where
+        T: TaskDefinition,
+        T::Trigger: PublishActivationStrategy;
+}
+
+/// Plain task publication without requiring execution or subscriptions.
+///
+/// Implementations must be cheaply cloneable. Callback-bearing task definitions are supported,
+/// but these methods do not register a callback or return an awaitable handle. Singleton task
+/// definitions cannot be published.
+///
+/// Import this trait when calling `publish` or `publish_future` on concrete backend types, even
+/// when they implement [`Backend`]. Generic `B: Backend` bounds include this capability.
+pub trait TaskPublishingBackend: Clone + Send + Sync {
     /// Publishes a task to be processed by workers.
     fn publish<T>(
         &self,
@@ -79,20 +108,13 @@ pub trait Backend: TaskExecutionBackend {
         T::Trigger: PublishActivationStrategy;
 
     /// Publishes a task to become available for processing at a specific time.
+    ///
+    /// This records availability; it does not provide a scheduler.
     fn publish_future<T>(
         &self,
         payload: <<T as TaskDefinition>::Trigger as PublishActivationStrategy>::Payload,
         available_from: Instant,
     ) -> impl Future<Output = Result<PublishedTask, PublishTaskError>> + Send
-    where
-        T: TaskDefinition,
-        T::Trigger: PublishActivationStrategy;
-
-    /// Publishes a task and returns a typed handle that can await the worker callback payload.
-    fn publish_awaitable<T>(
-        &self,
-        payload: <<T as TaskDefinition>::Trigger as PublishActivationStrategy>::Payload,
-    ) -> impl Future<Output = Result<AwaitableTask<T::Callback>, PublishTaskError>> + Send
     where
         T: TaskDefinition,
         T::Trigger: PublishActivationStrategy;
@@ -108,8 +130,9 @@ pub trait Backend: TaskExecutionBackend {
 /// subscriptions; full [`Backend`] implementations provide those capabilities in addition to these
 /// execution methods.
 ///
-/// Custom backends implement these six methods here and publishing/subscription methods separately
-/// in [`Backend`]. Import this trait when calling execution methods on concrete backend types.
+/// Custom full backends implement these six methods here, plain publication in
+/// [`TaskPublishingBackend`], and subscriptions and awaitable publication in [`Backend`].
+/// Import this trait when calling execution methods on concrete backend types.
 pub trait TaskExecutionBackend: Clone + Send + Sync {
     /// Claims a specific published task until a lease expiration time.
     fn claim_published<T>(

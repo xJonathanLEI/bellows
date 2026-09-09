@@ -117,7 +117,7 @@ HTTP **200** with `{ taskId, attemptFinished: true }` means an attempt ended, in
 
 Keep the processor private and use the Hyperdrive connection string with query caching disabled and verified origin TLS. TypeScript requires `nodejs_compat` for `pg`; Rust must omit it. Do not construct the listening `PostgresBackend` in a Worker. Direct `PostgresExecutionBackend` from `@xjonathanlei/bellows/backends/postgres-execution` with `runTaskOnce()` remains the lower-level option for custom integrations, which must await their own backend shutdown. The generic `cloudflare` entry point does not load PostgreSQL or Node modules.
 
-The [TypeScript Cloudflare–Postgres guide](./test/integration/cloudflare/README.md) exercises a producer Worker -> Durable Object dispatcher -> service-bound processor Worker with PostgreSQL publication, claims, side effects, and completion. `pnpm --dir bellows-ts test:cloudflare` runs five TypeScript -> TypeScript scenarios without Rust tools; they also run in the package's normal tests. The independent [Rust harness](../bellows/tests/integration/cloudflare/README.md) owns Rust -> Rust and Rust workerd contracts, while the [interop suite](../interop-tests/cloudflare/README.md) owns both mixed directions.
+The [TypeScript Cloudflare–Postgres guide](./test/integration/cloudflare/README.md) exercises a producer Worker -> Durable Object dispatcher -> service-bound processor Worker with PostgreSQL publication, claims, side effects, and completion. `pnpm --dir bellows-ts test:cloudflare` runs five TypeScript -> TypeScript scenarios and four direct publishing-backend contracts without Rust tools; they also run in the package's normal tests. The independent [Rust harness](../bellows/tests/integration/cloudflare/README.md) owns Rust -> Rust and Rust workerd contracts, while the [interop suite](../interop-tests/cloudflare/README.md) owns both mixed directions.
 
 ## Tasks
 
@@ -135,6 +135,53 @@ const task = defineSingletonTask("singleton_echo");
 
 ## Backends
 
+`TaskPublishingBackend` exposes only `publish` and `publishFuture`; `TaskExecutionBackend` exposes claim, renewal, failure, and completion. `Backend` extends both with subscription and awaitable publication. All full backends implement both capabilities. Plain publication accepts callback-bearing definitions without registering a callback; singleton definitions remain unpublishable.
+
+### `PostgresPublishingBackend`
+
+For producer-only applications, import the listener-free backend from its dedicated subpath. Create the schema and initialize its tables separately with `initializePostgresSchema` from `@xjonathanlei/bellows/backends/postgres` through an administrative connection. The publisher exposes no initialization, execution, subscription, or awaitable API.
+
+This example assumes an initialized `bellows` schema and a `DATABASE_URL` environment variable:
+
+```ts
+import {
+  definePublishTask,
+  type TaskPublishingBackend,
+} from "@xjonathanlei/bellows";
+import { PostgresPublishingBackend } from "@xjonathanlei/bellows/backends/postgres-publishing";
+
+const welcome = definePublishTask<string, string>("send_welcome_email");
+
+async function publishWelcome(backend: TaskPublishingBackend) {
+  const now = await backend.publish(welcome, "alice@example.com");
+  const later = await backend.publishFuture(
+    welcome,
+    "bob@example.com",
+    Date.now() + 60_000,
+  );
+  return [now, later];
+}
+
+const databaseUrl = process.env.DATABASE_URL;
+if (!databaseUrl) throw new Error("DATABASE_URL is required");
+const backend = await PostgresPublishingBackend.connect(databaseUrl, {
+  schema: "bellows",
+});
+try {
+  console.log(await publishWelcome(backend));
+} finally {
+  await backend.close();
+}
+```
+
+The backend owns a `pg.Pool`; call and await `close()` once, including on error paths. On Workers, use `env.HYPERDRIVE.connectionString` inside each request with `nodejs_compat`, and await shutdown before returning the response. Never retain connections across requests. The package root and generic Cloudflare entry point do not load PostgreSQL.
+
+Publication stores a task and may emit a PostgreSQL notification; listener-free is not notification-free. Future publication records availability, not a scheduler or a future Worker request. It does not atomically dispatch to a Durable Object, join an application transaction, or retry publication. A database exception near commit does not establish that no row was written. Awaitable publication remains on the full backend because callback delivery requires its listener.
+
+### `PostgresExecutionBackend`
+
+Use `@xjonathanlei/bellows/backends/postgres-execution` with `runTaskOnce` for execution without publishing or subscriptions. You own acquisition and awaited `close()`; the processor delegate manages this lifecycle for its requests.
+
 ### `InMemoryBackend`
 
 Good for tests and local development.
@@ -151,6 +198,7 @@ await backend.initialize();
 ### `PostgresBackend`
 
 Durable storage with `LISTEN` / `NOTIFY` signaling for normal `WorkerDispatcher` daemon processing.
+Use [`PostgresPublishingBackend`](#postgrespublishingbackend) instead when you only need plain publication.
 
 ```ts
 const backend = await PostgresBackend.connect(

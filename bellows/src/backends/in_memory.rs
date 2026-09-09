@@ -19,6 +19,7 @@ use crate::backends::{
     Backend, BackendSignal, BackendSignalSubscription, ClaimTaskError, ClaimedTask, FailTaskError,
     FailedTask, FinishTaskError, FinishedTask, NewTaskAvailableSignalPayload, PublishTaskError,
     PublishedTask, RenewTaskError, RenewedTaskLease, SubscribeError, TaskExecutionBackend,
+    TaskPublishingBackend,
 };
 use crate::{AwaitableTask, TaskDefinition};
 
@@ -127,6 +128,28 @@ impl Backend for InMemoryBackend {
         Ok(BackendSignalSubscription::new(result.sub_rx))
     }
 
+    async fn publish_awaitable<T>(
+        &self,
+        payload: <<T as TaskDefinition>::Trigger as PublishActivationStrategy>::Payload,
+    ) -> Result<AwaitableTask<T::Callback>, PublishTaskError>
+    where
+        T: TaskDefinition,
+        T::Trigger: PublishActivationStrategy,
+    {
+        let (callback_tx, callback_rx) = tokio::sync::oneshot::channel();
+        let published = self
+            .publish_impl::<T>(
+                payload,
+                Some(Box::new(TypedCallbackSink { tx: callback_tx })),
+                None,
+            )
+            .await?;
+
+        Ok(AwaitableTask::new(published.task_id, callback_rx))
+    }
+}
+
+impl TaskPublishingBackend for InMemoryBackend {
     async fn publish<T>(
         &self,
         payload: <<T as TaskDefinition>::Trigger as PublishActivationStrategy>::Payload,
@@ -149,26 +172,6 @@ impl Backend for InMemoryBackend {
     {
         self.publish_impl::<T>(payload, None, Some(available_from))
             .await
-    }
-
-    async fn publish_awaitable<T>(
-        &self,
-        payload: <<T as TaskDefinition>::Trigger as PublishActivationStrategy>::Payload,
-    ) -> Result<AwaitableTask<T::Callback>, PublishTaskError>
-    where
-        T: TaskDefinition,
-        T::Trigger: PublishActivationStrategy,
-    {
-        let (callback_tx, callback_rx) = tokio::sync::oneshot::channel();
-        let published = self
-            .publish_impl::<T>(
-                payload,
-                Some(Box::new(TypedCallbackSink { tx: callback_tx })),
-                None,
-            )
-            .await?;
-
-        Ok(AwaitableTask::new(published.task_id, callback_rx))
     }
 }
 

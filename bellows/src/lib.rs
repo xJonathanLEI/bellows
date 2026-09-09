@@ -32,6 +32,9 @@
 //! - a low-bandwidth, low-latency, and high-throughput signal channel.
 //!
 //! The native [`dispatcher::WorkerDispatcher`] uses both capabilities for discovery and processing.
+//! Producers can depend only on [`TaskPublishingBackend`] for immediate or future publication,
+//! without requiring execution or subscriptions. Import that trait for plain publication calls on
+//! concrete backend types; [`Backend`] retains subscription and awaitable callback delivery.
 //! An external host can instead await [`run_task_once`] with only a [`TaskExecutionBackend`], without
 //! launching a dispatcher. Each call attempts one task; its unit return is not an execution-success
 //! status.
@@ -48,7 +51,13 @@
 //!
 //! Workers use SDK sockets, execution, and timers; native daemon backends are unavailable.
 //! Use [`time::Instant`] for deadlines. Obtain connection strings from Hyperdrive, keep processors
-//! private, and leave schema initialization outside requests. Publishing remains application-owned.
+//! private, and leave schema initialization outside requests. `backends::postgres_publishing`
+//! provides a listener-free `PostgresPublishingBackend` for typed publication. Both reduced backends
+//! require request-scoped connections and awaited `close` on success and error paths; dropping
+//! clones does not close a Workers driver. The showcased producers still use application-owned SQL.
+//! Publication stores availability but does not schedule requests, atomically dispatch to a Durable
+//! Object, join an application transaction, or retry. A database error near commit does not prove
+//! that no task was written. Awaitable publication remains on the full backend for callback delivery.
 //!
 //! The `cloudflare` module provides in-memory retained dispatch, not durable recovery or retries.
 //! The processor does not extend request lifetime or recover from abrupt termination or wasm traps.
@@ -75,7 +84,7 @@ use time::Instant;
 
 pub mod backends;
 use backends::ClaimedTask;
-pub use backends::{Backend, TaskExecutionBackend};
+pub use backends::{Backend, TaskExecutionBackend, TaskPublishingBackend};
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod dispatcher;

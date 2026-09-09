@@ -1,18 +1,19 @@
 # TypeScript Cloudflare Workers with PostgreSQL
 
-This executable example runs a **producer Worker -> `global` Durable Object dispatcher -> service-bound processor Worker**. This directory owns the five TypeScript -> TypeScript scenarios. See the independent [Rust/Wasm harness](../../../../bellows/tests/integration/cloudflare/README.md) for Rust -> Rust and workerd contracts, and the [mixed-language suite](../../../../interop-tests/cloudflare/README.md) for both cross-language directions.
+This executable example runs a **producer Worker -> `global` Durable Object dispatcher -> service-bound processor Worker**. This directory owns five TypeScript -> TypeScript scenarios and four direct publishing-backend contracts. See the independent [Rust/Wasm harness](../../../../bellows/tests/integration/cloudflare/README.md) for Rust -> Rust and workerd contracts, and the [mixed-language suite](../../../../interop-tests/cloudflare/README.md) for both cross-language directions.
 
 PostgreSQL stores tasks. The Durable Object retains outstanding processor requests **in memory**, suppressing duplicate IDs until each response body is consumed. The processor claims the task, executes its decoded payload, renews the lease, and records completion or failure.
 
 ## Files and APIs
 
-| File                                                    | Purpose                                                                  |
-| ------------------------------------------------------- | ------------------------------------------------------------------------ |
-| `task.ts`                                               | Shared `cloudflare_greeting` task with `{ name: string }` payload.       |
-| `workers/producer.ts`                                   | `POST /tasks`, SQL publication, and the `TaskDispatcher` Durable Object. |
-| `workers/processor.ts`                                  | Processor delegate configuration and the `processed_tasks` side effect.  |
-| `wrangler.*.jsonc`                                      | Hyperdrive, Durable Object, and service bindings.                        |
-| `cloudflare.integration.test.ts`, `postgres-fixture.ts` | TypeScript-only workerd suite and production schema-initializer adapter. |
+| File                                                    | Purpose                                                                          |
+| ------------------------------------------------------- | -------------------------------------------------------------------------------- |
+| `task.ts`                                               | Shared `cloudflare_greeting` task with `{ name: string }` payload.               |
+| `workers/producer.ts`                                   | `POST /tasks`, SQL publication, and the `TaskDispatcher` Durable Object.         |
+| `workers/processor.ts`                                  | Processor delegate configuration and the `processed_tasks` side effect.          |
+| `workers/publishing.ts`, `publishing-contracts.ts`      | Test-only direct publishing contracts; no dispatch or processing. Do not deploy. |
+| `wrangler.*.jsonc`                                      | Hyperdrive, Durable Object, and service bindings.                                |
+| `cloudflare.integration.test.ts`, `postgres-fixture.ts` | TypeScript-only workerd suite and production schema-initializer adapter.         |
 
 The examples import repository source. In an application, use:
 
@@ -20,6 +21,7 @@ The examples import repository source. In an application, use:
 - `@xjonathanlei/bellows/cloudflare` for `dispatchTask` and `RetainedTaskDispatcher`.
 - `@xjonathanlei/bellows/cloudflare/postgres` for `createPostgresProcessor`.
 - `@xjonathanlei/bellows/backends/postgres` for direct, Node-side schema initialization.
+- `@xjonathanlei/bellows/backends/postgres-publishing` for listener-free typed publication.
 
 ## Processor delegate and cleanup
 
@@ -32,6 +34,8 @@ Applications own their business resources. This processor opens a separate `pg.C
 The delegate awaits application cleanup once whenever configuration returned, including randomness/acquisition failure and no-claim paths, then always awaits Bellows backend shutdown if acquisition succeeded. A cleanup failure cannot skip that shutdown. Configuration that throws before returning remains responsible for partially created resources; abrupt request termination is not recoverable by this contract.
 
 For custom integrations, `PostgresExecutionBackend` from `@xjonathanlei/bellows/backends/postgres-execution` plus `runTaskOnce` remains available as the lower-level API, with caller-owned cleanup. Do **not** construct the listening `PostgresBackend` in a Worker or retain clients globally or in a Durable Object. The generic `cloudflare` import stays independent of the PostgreSQL entry point. Publishing remains the producer's existing SQL.
+
+`PostgresPublishingBackend` implements only `TaskPublishingBackend`. For direct publication, connect through Hyperdrive inside each request and await `close()` in `finally` before returning. See the [typed example and capability limits](../../../README.md#postgrespublishingbackend). This does not provide a publish-and-dispatch adapter or migrate the showcased producer.
 
 ## Run locally
 
@@ -60,7 +64,7 @@ pnpm --dir bellows-ts test:cloudflare
 
 `BELLOWS_CLOUDFLARE_TEST_POSTGRES_URL` overrides the Cloudflare database URL. This TypeScript adapter falls back to `BELLOWS_TS_TEST_POSTGRES_URL`, then `postgres://postgres:postgres@localhost:5432/postgres`. The focused suite needs schema creation/deletion privileges and initializes each isolated schema with the production `initializePostgresSchema`. The full TypeScript suite also creates temporary databases and uses `BELLOWS_TS_TEST_POSTGRES_URL` for its other PostgreSQL tests. Native Rust tests use the local default URL, not these overrides.
 
-The five scenarios cover early acceptance, duplicates/concurrency, ownership/redelivery, failure/retry, and validation/cleanup. They also run under `pnpm --dir bellows-ts test`. Neither command prepares Rust or requires a TypeScript `dist` prebuild. Root `pnpm test` is the aggregate command: it runs all three test packages serially, including the Rust and mixed suites, and therefore needs their Rust prerequisites. The aggregate covers all 34 Cloudflare cases once: five TypeScript, 19 Rust, and ten mixed.
+The five scenarios cover early acceptance, duplicates/concurrency, ownership/redelivery, failure/retry, and validation/cleanup. Four direct backend contracts cover immediate/future callback-bearing and void tasks, SQL errors, and gated publication with awaited shutdown. They use one test-only Hyperdrive Worker without a dispatcher or processor and inspect committed rows and client exit independently. All nine cases also run under `pnpm --dir bellows-ts test`. Neither command prepares Rust or requires a TypeScript `dist` prebuild. Root `pnpm test` is the aggregate command: it runs all three test packages serially, including the Rust and mixed suites, and therefore needs their Rust prerequisites. The aggregate covers all 43 Cloudflare cases once: nine TypeScript, 24 Rust, and ten mixed.
 
 The [neutral fixture and scenarios](../../../../interop-tests/cloudflare/README.md#shared-support) preserve real bindings, SQL gates, and observed lease/payload/side-effect/deletion assertions. Response deadlines include full body consumption within two seconds; polls are bounded to three seconds, startup to eight seconds, and harness shutdown to five seconds. Cleanup releases locks, drains responses and request clients, closes workerd, drops only the owned schema, closes administrative connections, and restores `CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE`, including on failure. Unexpected runtime logs and cleanup errors fail tests; unavailable PostgreSQL fails rather than skipping them.
 

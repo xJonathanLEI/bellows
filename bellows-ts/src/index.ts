@@ -16,6 +16,7 @@ export type {
   TaskDefinition,
   TaskExecutionBackend,
   TaskPayload,
+  TaskPublishingBackend,
   TaskResult,
   Worker,
   WorkerFactory,

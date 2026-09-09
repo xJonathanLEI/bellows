@@ -10,9 +10,9 @@ use std::{
 };
 
 use bellows::{
-    ActivationStrategy, Backend, PublishActivationStrategy, PublishDispatchToken, PublishTrigger,
-    SingletonTrigger, TaskDefinition, TaskExecutionBackend, TaskFailure, TaskResult, TaskSuccess,
-    Worker, WorkerFactory,
+    ActivationStrategy, PublishActivationStrategy, PublishDispatchToken, PublishTrigger,
+    SingletonTrigger, TaskDefinition, TaskExecutionBackend, TaskFailure, TaskPublishingBackend,
+    TaskResult, TaskSuccess, Worker, WorkerFactory,
     backends::{
         ClaimTaskError, ClaimedTask, FailTaskError, FailedTask, FinishTaskError, FinishedTask,
         RenewTaskError, RenewedTaskLease, in_memory::InMemoryBackend,

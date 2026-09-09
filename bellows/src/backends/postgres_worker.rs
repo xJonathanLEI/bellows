@@ -13,7 +13,7 @@ use crate::{
     ActivationStrategy, ActivationStrategyKind, PublishActivationStrategy, TaskDefinition,
     backends::{
         ClaimTaskError, ClaimedTask, FailTaskError, FailedTask, FinishTaskError, FinishedTask,
-        RenewTaskError, RenewedTaskLease,
+        PublishTaskError, PublishedTask, RenewTaskError, RenewedTaskLease,
     },
     platform,
     time::clock::{Instant, SystemTime},
@@ -23,7 +23,8 @@ use super::postgres_common::{
     NOTIFY_CHANNEL, NOTIFY_SQL, NotificationPayload, PostgresBackendOptions, claim_earliest_sql,
     claim_published_sql, claim_singleton_sql, earliest_availability_sql, fail_sql,
     finish_published_sql, finish_rescheduled_sql, finish_singleton_sql, instant_to_unix_ms,
-    published_state_sql, renew_sql, singleton_state_sql, unix_ms_to_instant, unix_timestamp_ms,
+    publish_sql, published_state_sql, renew_sql, singleton_state_sql, unix_ms_to_instant,
+    unix_timestamp_ms,
 };
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -43,6 +44,7 @@ pub enum PostgresWorkerError {
     Closed,
     InvalidTaskId(TryFromIntError),
     InvalidWorkerId(TryFromIntError),
+    PayloadSerialization(Arc<serde_json::Error>),
     PayloadDeserialization(Arc<serde_json::Error>),
     CallbackSerialization(Arc<serde_json::Error>),
 }
@@ -57,12 +59,15 @@ impl fmt::Display for PostgresWorkerError {
             Self::Socket(_) => f.write_str("Workers Postgres socket creation failed"),
             Self::Postgres(error) => write!(f, "postgres operation failed: {error}"),
             Self::Driver(_) => f.write_str("postgres connection driver exited without a result"),
-            Self::Closed => f.write_str("postgres execution connection is closed"),
+            Self::Closed => f.write_str("postgres connection is closed"),
             Self::InvalidTaskId(error) => {
                 write!(f, "task ID could not be represented in Postgres: {error}")
             }
             Self::InvalidWorkerId(error) => {
                 write!(f, "worker ID could not be represented in Postgres: {error}")
+            }
+            Self::PayloadSerialization(error) => {
+                write!(f, "task payload serialization failed: {error}")
             }
             Self::PayloadDeserialization(error) => {
                 write!(f, "task payload deserialization failed: {error}")
@@ -82,9 +87,9 @@ impl StdError for PostgresWorkerError {
             Self::Postgres(error) => Some(error.as_ref()),
             Self::Driver(error) => Some(error.as_ref()),
             Self::InvalidTaskId(error) | Self::InvalidWorkerId(error) => Some(error),
-            Self::PayloadDeserialization(error) | Self::CallbackSerialization(error) => {
-                Some(error.as_ref())
-            }
+            Self::PayloadSerialization(error)
+            | Self::PayloadDeserialization(error)
+            | Self::CallbackSerialization(error) => Some(error.as_ref()),
         }
     }
 }
@@ -93,6 +98,10 @@ impl From<tokio_postgres::Error> for PostgresWorkerError {
     fn from(error: tokio_postgres::Error) -> Self {
         Self::Postgres(Arc::new(error))
     }
+}
+
+fn publish_error(error: impl Into<PostgresWorkerError>) -> PublishTaskError {
+    PublishTaskError::Backend(Box::new(error.into()))
 }
 
 fn claim_error(error: impl Into<PostgresWorkerError>) -> ClaimTaskError {
@@ -264,6 +273,40 @@ impl PostgresTaskOperations {
             Driver::Closed(result) => result.clone(),
             Driver::Running(_) => unreachable!("the driver was awaited above"),
         }
+    }
+
+    pub(super) async fn publish<T>(
+        &self,
+        payload: <<T as TaskDefinition>::Trigger as PublishActivationStrategy>::Payload,
+        callback_id: Option<i64>,
+        available_from: Option<Instant>,
+    ) -> Result<PublishedTask, PublishTaskError>
+    where
+        T: TaskDefinition,
+        T::Trigger: PublishActivationStrategy,
+    {
+        let payload_json = serde_json::to_string(&payload).map_err(|error| {
+            publish_error(PostgresWorkerError::PayloadSerialization(Arc::new(error)))
+        })?;
+        let now_system = SystemTime::now();
+        let available_from_unix_ms =
+            available_from.map(|available_from| instant_to_unix_ms(available_from, now_system));
+        let client = self.client().await.map_err(publish_error)?;
+        let row = client
+            .query_typed_one(
+                &publish_sql(&self.table_name),
+                &[
+                    (&T::NAME, Type::TEXT),
+                    (&payload_json, Type::TEXT),
+                    (&callback_id, Type::INT8),
+                    (&available_from_unix_ms, Type::INT8),
+                ],
+            )
+            .await
+            .map_err(publish_error)?;
+        let task_id = u64::try_from(row.try_get::<_, i64>("task_id").map_err(publish_error)?)
+            .map_err(|error| publish_error(PostgresWorkerError::InvalidTaskId(error)))?;
+        Ok(PublishedTask { task_id })
     }
 
     pub(super) async fn claim_published<T>(

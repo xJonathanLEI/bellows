@@ -20,6 +20,9 @@ pub async fn fetch(request: Request, env: Env, _ctx: Context) -> Result<Response
     if path == "/postgres/close" {
         return postgres::run(&env).await;
     }
+    if let Some(mode) = path.strip_prefix("/postgres/publish/") {
+        return postgres::publish(&env, mode).await;
+    }
     if let Some(mode) = path.strip_prefix("/runtime/") {
         if ![
             "finish",

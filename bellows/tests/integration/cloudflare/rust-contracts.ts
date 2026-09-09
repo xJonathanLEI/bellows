@@ -16,7 +16,7 @@ const json = (body: unknown) => ({
 // Registered only by the Rust suite. Real Rust projects and real namespace,
 // service, storage and streaming-response adapters; no Node mocks of Worker I/O.
 export function rustContracts(configPath: URL): void {
-  describe.sequential("Rust workerd PostgreSQL cleanup", () => {
+  describe.sequential("Rust workerd PostgreSQL contracts", () => {
     let fixture: CloudflarePostgresFixture;
     beforeEach(async () => {
       fixture = createCloudflarePostgresFixture({
@@ -62,6 +62,104 @@ export function rustContracts(configPath: URL): void {
       ]);
       // Aborting a future cannot roll back an already-sent side effect. Cleanup still awaits I/O.
     }, 10_000);
+
+    const publish = (mode: string) =>
+      fixture.consume(
+        fixture.server.fetch(`/postgres/publish/${mode}`),
+        `publishing ${mode} and closing the backend`,
+      );
+    const row = (
+      id: number,
+      unit = false,
+      available: string | null = null,
+    ) => ({
+      task_id: String(id),
+      task_name: unit ? "publishing_contract_unit" : "publishing_contract",
+      task_unique_key: null,
+      payload_json: unit ? "null" : JSON.stringify(['hello "🦀"\n', [1, 2, 3]]),
+      callback_id: null,
+      lease_worker_id: null,
+      available_from_unix_ms: available,
+    });
+
+    for (const mode of ["immediate", "future"]) {
+      test(`commits ${mode} callback-bearing and unit tasks without dispatch`, async () => {
+        const response = await publish(mode);
+        expect(response.status, response.body).toBe(200);
+        const receipt = JSON.parse(response.body);
+        expect(receipt.closed).toBe(true);
+        expect(receipt.taskId).toBe(1);
+        expect(receipt.unitTaskId).toBe(2);
+        const state = await fixture.state();
+        expect(state.processed).toEqual([]);
+        expect(state.tasks).toHaveLength(2);
+        for (const [index, task] of state.tasks.entries()) {
+          const available = task.available_from_unix_ms;
+          if (mode === "future") {
+            // Public Rust deadlines are monotonic instants, converted to wall-clock milliseconds.
+            expect(Number(available)).toBeGreaterThanOrEqual(
+              receipt.beforeMs + 60_000 - 1,
+            );
+            expect(Number(available)).toBeLessThanOrEqual(
+              receipt.afterMs + 60_000 + 1,
+            );
+          } else {
+            expect(available).toBeNull();
+          }
+          expect(task).toEqual(row(index + 1, index === 1, available));
+        }
+        await fixture.waitForIdle();
+      }, 10_000);
+    }
+
+    test("awaits shutdown after a SQL error without retrying", async () => {
+      await fixture.admin.query(
+        `ALTER TABLE ${fixture.table} ADD CONSTRAINT reject_insert CHECK (false)`,
+      );
+      expect(await publish("immediate")).toEqual({
+        status: 500,
+        body: '{"closed":true,"failed":true}',
+      });
+      expect(await fixture.state()).toEqual({ tasks: [], processed: [] });
+      expect(
+        (
+          await fixture.admin.query(
+            `SELECT last_value FROM "${fixture.schema}".bellows_tasks_task_id_seq`,
+          )
+        ).rows,
+      ).toEqual([{ last_value: "1" }]);
+      await fixture.waitForIdle();
+    }, 10_000);
+
+    for (const mode of ["gated", "cancelled"]) {
+      test(`drains a SQL-gated insert and closes its sole request connection: ${mode}`, async () => {
+        const gate = await fixture.gate("bellows_tasks");
+        let ended = false;
+        const response = publish(mode).finally(() => {
+          ended = true;
+        });
+        const pids = await gate.blocked(1);
+        expect(ended).toBe(false);
+        expect(
+          (await fixture.activeRequestClients()).map(({ pid }) => pid),
+        ).toEqual(pids);
+        expect(await fixture.state()).toEqual({ tasks: [], processed: [] });
+        await gate.release();
+        const result = await response;
+        expect(result.status, result.body).toBe(200);
+        expect(JSON.parse(result.body)).toMatchObject(
+          mode === "cancelled"
+            ? { cancelled: true, closed: true }
+            : { taskId: 1, closed: true },
+        );
+        await fixture.waitForClientExit(pids);
+        // Cancelling the query consumer does not roll back an already-sent autocommit insert.
+        expect(await fixture.state()).toEqual({
+          tasks: [row(1)],
+          processed: [],
+        });
+      }, 10_000);
+    }
   });
 
   describe.sequential("Rust workerd platform and SDK contracts", () => {

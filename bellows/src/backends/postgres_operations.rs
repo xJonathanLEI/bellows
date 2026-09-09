@@ -22,8 +22,8 @@ use super::postgres_common::{
     NOTIFY_CHANNEL, NOTIFY_SQL, NotificationPayload, PostgresBackendOptions, claim_earliest_sql,
     claim_published_sql, claim_singleton_sql, earliest_availability_sql, fail_sql,
     finish_published_sql, finish_rescheduled_sql, finish_singleton_sql, instant_to_unix_ms,
-    published_state_sql, renew_sql, singleton_state_sql, unix_ms_to_instant, unix_timestamp_ms,
-    validate_schema_name,
+    publish_sql, published_state_sql, renew_sql, singleton_state_sql, unix_ms_to_instant,
+    unix_timestamp_ms, validate_schema_name,
 };
 
 const INITIALIZE_SCHEMA_SQL: &str = r#"
@@ -229,28 +229,14 @@ impl PostgresTaskOperations {
         let available_from_unix_ms =
             available_from.map(|available_from| instant_to_unix_ms(available_from, now_system));
 
-        let row = sqlx::query(&format!(
-            r#"
-INSERT INTO {table_name} AS tasks (
-    task_name,
-    task_unique_key,
-    payload_json,
-    callback_id,
-    lease_worker_id,
-    available_from_unix_ms
-)
-VALUES ($1, NULL, $2, $3, NULL, $4)
-RETURNING task_id
-"#,
-            table_name = self.table_name
-        ))
-        .bind(T::NAME)
-        .bind(payload_json)
-        .bind(callback_id)
-        .bind(available_from_unix_ms)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|err| PublishTaskError::Backend(Box::new(PostgresBackendError::Sqlx(err))))?;
+        let row = sqlx::query(&publish_sql(&self.table_name))
+            .bind(T::NAME)
+            .bind(payload_json)
+            .bind(callback_id)
+            .bind(available_from_unix_ms)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|err| PublishTaskError::Backend(Box::new(PostgresBackendError::Sqlx(err))))?;
 
         let task_id = u64::try_from(row.get::<i64, _>("task_id")).map_err(|err| {
             PublishTaskError::Backend(Box::new(PostgresBackendError::InvalidTaskId(err)))

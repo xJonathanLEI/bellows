@@ -2,9 +2,9 @@
 
 These Rust/Wasm projects implement **producer Worker -> `global` Durable Object dispatcher -> service-bound processor Worker -> PostgreSQL**. Either side can be replaced by its TypeScript counterpart.
 
-This directory owns a private Node/Vitest/Wrangler harness for **19 cases**: five Rust -> Rust topology scenarios and all 14 Rust workerd contracts. It runs actual Rust/Wasm Workers without importing or building the TypeScript library. The [TypeScript suite](../../../../bellows-ts/test/integration/cloudflare/README.md) owns five TypeScript -> TypeScript scenarios; the [mixed suite](../../../../interop-tests/cloudflare/README.md) owns ten scenarios across both mixed directions.
+This directory owns a private Node/Vitest/Wrangler harness for **24 cases**: five Rust -> Rust topology scenarios and all 19 Rust workerd contracts. It runs actual Rust/Wasm Workers without importing or building the TypeScript library. The [TypeScript suite](../../../../bellows-ts/test/integration/cloudflare/README.md) owns five TypeScript -> TypeScript scenarios and four publishing contracts; the [mixed suite](../../../../interop-tests/cloudflare/README.md) owns ten scenarios across both mixed directions.
 
-The topology scenarios cover early acceptance, duplicates/concurrency, ownership/redelivery, failure/retry, and validation/cleanup. Contracts cover runtime ownership, namespace and retained service-response streaming, heartbeat/alarm behavior, and PostgreSQL cancellation/shutdown. Local Hyperdrive connects directly to PostgreSQL; these tests do not exercise hosted pooling or caching.
+The topology scenarios cover early acceptance, duplicates/concurrency, ownership/redelivery, failure/retry, and validation/cleanup. Contracts cover runtime ownership, namespace and retained service-response streaming, heartbeat/alarm behavior, and PostgreSQL cancellation/shutdown. Five direct publishing contracts cover immediate/future callback-bearing and unit tasks, SQL errors, gated inserts, and cancelled publication/close drainage. They use one test-only Hyperdrive Worker without dispatch or processing bindings. Local Hyperdrive connects directly to PostgreSQL; these tests do not exercise hosted pooling or caching.
 
 ## Projects
 
@@ -75,6 +75,8 @@ Applications still own arbitrary side-effect resources. Use separate business co
 
 Direct `PostgresExecutionBackend` from `bellows::backends::postgres_execution` plus `bellows::run_task_once` remains the lower-level option for custom integrations. Callers then own backend acquisition and awaited `close()` as well as business cleanup. Do not construct the listening `PostgresBackend` in a Worker. Publishing remains the producer's existing SQL.
 
+For typed publication alone, use `PostgresPublishingBackend` from `bellows::backends::postgres_publishing` and import `TaskPublishingBackend`. Connect inside the request and await `close()` on success and error paths; dropping clones is insufficient. See the [publishing example and capability limits](../../../../README.md#publishing-without-a-listener). This is a backend, not a publish-and-dispatch adapter; the showcased producer is unchanged.
+
 **Do not add `nodejs_compat` to Rust configurations.** With the configured compatibility date, Node-style timer handles are incompatible with the SDK's numeric handles. TypeScript needs this flag for `pg`; Rust sockets do not.
 
 PostgreSQL stores tasks; the dispatcher map is only in-memory state. Its 30-second heartbeat provides neither lease renewal nor restart recovery. The processor adds no automatic retries. Publication gaps and rediscovery remain application concerns, and side effects plus completion are not atomic or exactly-once.
@@ -120,7 +122,7 @@ pnpm --dir bellows/tests/integration/cloudflare test:cloudflare:contracts
 cargo test -p bellows --features cloudflare --test cloudflare --locked
 ```
 
-`test:cloudflare` (also the package's `test` script) runs all 19 cases. `test:cloudflare:contracts` selects all 14 contracts. For the 13 platform/SDK cases that do not need PostgreSQL, use `pnpm --dir bellows/tests/integration/cloudflare test:cloudflare -t 'Rust workerd platform and SDK contracts'`.
+`test:cloudflare` (also the package's `test` script) runs all 24 cases. `test:cloudflare:contracts` selects all 19 contracts. For the 13 platform/SDK cases that do not need PostgreSQL, use `pnpm --dir bellows/tests/integration/cloudflare test:cloudflare -t 'Rust workerd platform and SDK contracts'`.
 
 Set `BELLOWS_CLOUDFLARE_TEST_POSTGRES_URL` to override `postgres://postgres:postgres@localhost:5432/postgres`. The harness needs schema creation/deletion privileges. The legacy `BELLOWS_TS_TEST_POSTGRES_URL` fallback applies only to the TypeScript adapter, not this Rust suite. Missing database or build prerequisites fail tests rather than skipping them.
 
@@ -134,7 +136,7 @@ See the [shared protocol and opt-in hosted verification instructions](../../../.
 
 ## Complete repository validation
 
-Native Rust tests require the default local PostgreSQL server and temporary-database privileges; the Cloudflare URL override does not configure them. The full TypeScript suite also creates temporary databases, using `BELLOWS_TS_TEST_POSTGRES_URL` or the local default. Root `pnpm test` runs the three Node test packages serially so Worker preparation cannot race, covering all 34 Cloudflare cases once alongside the other Node tests. Full Cargo workspace builds intentionally retain the separate native interop crate's TypeScript build. Run from the repository root:
+Native Rust tests require the default local PostgreSQL server and temporary-database privileges; the Cloudflare URL override does not configure them. The full TypeScript suite also creates temporary databases, using `BELLOWS_TS_TEST_POSTGRES_URL` or the local default. Root `pnpm test` runs the three Node test packages serially so Worker preparation cannot race, covering all 43 Cloudflare cases once alongside the other Node tests. Full Cargo workspace builds intentionally retain the separate native interop crate's TypeScript build. Run from the repository root:
 
 ```bash
 cargo fmt --all && cargo build --all --all-targets && cargo clippy --all --all-targets && cargo test --all

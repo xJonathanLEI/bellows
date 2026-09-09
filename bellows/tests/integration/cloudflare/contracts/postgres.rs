@@ -1,13 +1,116 @@
-//! Cancellation-safe shutdown of the same request connection helper used by the examples.
+//! Direct publishing backend contracts and cancellation-safe example connection shutdown.
 
 #[path = "../db.rs"]
 mod db;
 
 use futures_util::poll;
 use serde_json::json;
-use std::pin::pin;
+use std::{pin::pin, time::Duration};
 use tokio_postgres::types::Type;
 use worker::{Env, Response};
+
+use bellows::{
+    PublishTrigger, TaskDefinition, TaskPublishingBackend,
+    backends::postgres_publishing::{PostgresBackendOptions, PostgresPublishingBackend},
+    time::Instant,
+};
+
+struct PublishingTask;
+impl TaskDefinition for PublishingTask {
+    const NAME: &str = "publishing_contract";
+    type Callback = Vec<String>;
+    type Trigger = PublishTrigger<(String, Vec<u32>)>;
+}
+
+struct UnitTask;
+impl TaskDefinition for UnitTask {
+    const NAME: &str = "publishing_contract_unit";
+    type Callback = ();
+    type Trigger = PublishTrigger<()>;
+}
+
+pub async fn publish(env: &Env, mode: &str) -> worker::Result<Response> {
+    if !["immediate", "future", "gated", "cancelled"].contains(&mode) {
+        return Response::error("not-found", 404);
+    }
+    let backend = PostgresPublishingBackend::connect_with_options(
+        &env.hyperdrive("HYPERDRIVE")?.connection_string(),
+        PostgresBackendOptions {
+            schema: Some(env.var("BELLOWS_SCHEMA")?.to_string()),
+        },
+    )
+    .await
+    .map_err(|_| worker::Error::from("publishing backend connection failed"))?;
+    let result = async {
+        let payload = ("hello \"🦀\"\n".to_owned(), vec![1, 2, 3]);
+        let before_ms = worker::Date::now().as_millis();
+        let available = Instant::now() + Duration::from_secs(60);
+        let task = match mode {
+            "cancelled" => {
+                {
+                    let mut insert = pin!(backend.publish::<PublishingTask>(payload));
+                    assert!(poll!(&mut insert).is_pending());
+                    // Drop only the query consumer. Already-enqueued SQL can still commit.
+                }
+                {
+                    let mut close = pin!(backend.close());
+                    assert!(poll!(&mut close).is_pending());
+                    // Cancelling close must retain driver ownership for the awaited close below.
+                }
+                return Ok(json!({ "cancelled": true, "closed": true }));
+            }
+            "gated" => {
+                let mut insert = pin!(backend.publish::<PublishingTask>(payload));
+                assert!(poll!(&mut insert).is_pending());
+                {
+                    let mut close = pin!(backend.close());
+                    assert!(poll!(&mut close).is_pending());
+                }
+                insert.await?
+            }
+            "future" => {
+                backend
+                    .publish_future::<PublishingTask>(payload, available)
+                    .await?
+            }
+            _ => backend.publish::<PublishingTask>(payload).await?,
+        };
+        let unit = match mode {
+            "immediate" => Some(backend.publish::<UnitTask>(()).await?.task_id),
+            "future" => Some(
+                backend
+                    .publish_future::<UnitTask>((), available)
+                    .await?
+                    .task_id,
+            ),
+            _ => None,
+        };
+        Ok::<_, bellows::backends::PublishTaskError>(json!({
+            "taskId": task.task_id,
+            "unitTaskId": unit,
+            "beforeMs": before_ms,
+            "afterMs": worker::Date::now().as_millis(),
+            "closed": true
+        }))
+    }
+    .await;
+    // Close on success and error, including after cancellation of an active query or close future.
+    backend
+        .clone()
+        .close()
+        .await
+        .map_err(|_| worker::Error::from("publishing backend shutdown failed"))?;
+    backend
+        .close()
+        .await
+        .map_err(|_| worker::Error::from("repeated publishing backend shutdown failed"))?;
+    assert!(backend.publish::<UnitTask>(()).await.is_err());
+    match result {
+        Ok(body) => Response::from_json(&body),
+        Err(_) => Response::from_json(&json!({ "failed": true, "closed": true }))
+            .map(|response| response.with_status(500)),
+    }
+}
 
 pub async fn run(env: &Env) -> worker::Result<Response> {
     let url = env.hyperdrive("HYPERDRIVE")?.connection_string();

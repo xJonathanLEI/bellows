@@ -23,6 +23,7 @@ use crate::backends::{
     Backend, BackendSignal, BackendSignalSubscription, ClaimTaskError, ClaimedTask, FailTaskError,
     FailedTask, FinishTaskError, FinishedTask, NewTaskAvailableSignalPayload, PublishTaskError,
     PublishedTask, RenewTaskError, RenewedTaskLease, SubscribeError, TaskExecutionBackend,
+    TaskPublishingBackend,
 };
 use crate::{AwaitableTask, PublishActivationStrategy, TaskDefinition};
 
@@ -371,6 +372,23 @@ impl Backend for SqliteBackend {
         ))
     }
 
+    async fn publish_awaitable<T>(
+        &self,
+        payload: <<T as TaskDefinition>::Trigger as PublishActivationStrategy>::Payload,
+    ) -> Result<AwaitableTask<T::Callback>, PublishTaskError>
+    where
+        T: TaskDefinition,
+        T::Trigger: PublishActivationStrategy,
+    {
+        let (callback_id, callback_rx) = self.reserve_callback::<T::Callback>();
+        let published = self
+            .publish_impl::<T>(payload, Some(callback_id), None)
+            .await?;
+        Ok(AwaitableTask::new(published.task_id, callback_rx))
+    }
+}
+
+impl TaskPublishingBackend for SqliteBackend {
     async fn publish<T>(
         &self,
         payload: <<T as TaskDefinition>::Trigger as PublishActivationStrategy>::Payload,
@@ -393,21 +411,6 @@ impl Backend for SqliteBackend {
     {
         self.publish_impl::<T>(payload, None, Some(available_from))
             .await
-    }
-
-    async fn publish_awaitable<T>(
-        &self,
-        payload: <<T as TaskDefinition>::Trigger as PublishActivationStrategy>::Payload,
-    ) -> Result<AwaitableTask<T::Callback>, PublishTaskError>
-    where
-        T: TaskDefinition,
-        T::Trigger: PublishActivationStrategy,
-    {
-        let (callback_id, callback_rx) = self.reserve_callback::<T::Callback>();
-        let published = self
-            .publish_impl::<T>(payload, Some(callback_id), None)
-            .await?;
-        Ok(AwaitableTask::new(published.task_id, callback_rx))
     }
 }
 
