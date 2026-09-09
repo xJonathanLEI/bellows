@@ -1,10 +1,18 @@
-//! Retained Cloudflare dispatch using the TypeScript-compatible string-ID protocol.
+//! Cloudflare dispatch and PostgreSQL processing with TypeScript-compatible string-ID protocols.
 //!
 //! Keep one [`RetainedTaskDispatcher`] per Durable Object. It acknowledges early and suppresses
 //! duplicates until the processor response is consumed. A response ends an attempt, not necessarily successfully.
+//! Generic dispatch accepts opaque IDs; the wasm `sdk::PostgresProcessor` delegate accepts canonical
+//! positive safe-integer IDs for one published task definition.
+//!
+//! The processor validates before calling your synchronous environment-to-config callback. It owns
+//! a fresh execution backend and awaits the runtime, registered application cleanup, and backend
+//! shutdown. Applications still own business resources. Use `PostgresExecutionBackend` with
+//! [`crate::run_task_once`] for lower-level integrations with caller-owned cleanup.
 //!
 //! State is in-memory; the 30-second heartbeat provides no lease renewal, retry, or eviction recovery.
-//! Publication gaps and rediscovery remain application concerns.
+//! Publication gaps and rediscovery remain application concerns. Processor cleanup does not extend
+//! request lifetime or recover from wasm traps.
 //!
 //! Enable `cloudflare`, disabling defaults on wasm. Native use requires Tokio; wasm uses `sdk` adapters.
 //! See the [Rust examples](https://github.com/xJonathanLEI/bellows/tree/master/bellows/tests/integration/cloudflare).
@@ -22,6 +30,9 @@ use crate::{platform, time::clock};
 
 #[cfg(target_arch = "wasm32")]
 pub mod sdk;
+
+#[cfg(any(target_arch = "wasm32", test))]
+mod processor;
 
 const DISPATCHER_NAME: &str = "global";
 const DISPATCH_URL: &str = "https://dispatcher/dispatch";

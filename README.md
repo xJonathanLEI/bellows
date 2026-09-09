@@ -150,6 +150,14 @@ This makes the Postgres backend the built-in option intended for durable distrib
 
 Both languages can implement the **producer Worker -> retained Durable Object dispatcher -> service-bound processor Worker** topology. PostgreSQL stores the tasks; the Durable Object only retains outstanding dispatch requests **in memory**. The processor claims a task, executes a Bellows worker using the claimed payload, renews ownership while processing, and awaits failure/completion recording.
 
+Use `createPostgresProcessor` from `@xjonathanlei/bellows/cloudflare/postgres` in TypeScript or `bellows::cloudflare::sdk::PostgresProcessor` in Rust. Supply a synchronous environment-to-config callback with the Hyperdrive connection string, optional schema, and your published task's `WorkerFactory`. The delegate owns the `/process` protocol, worker IDs, and a fresh listener-free execution backend for each validated request. Publishing remains application-owned SQL in these examples.
+
+The delegate awaits the runtime, registered application cleanup, and Bellows backend shutdown before responding, including no-claim and ordinary failure paths. Applications still own their side-effect resources; use separate business connections and register cleanup for work that can outlive the runtime. TypeScript cleanup must drain outstanding business promises after lease loss; Rust cleanup must retain resource ownership outside the aborted worker.
+
+HTTP **200** with `{ taskId, attemptFinished: true }` means an attempt ended, **not that the task succeeded**. It includes no-claim and handled-failure attempts. The adapter adds no automatic retries, durable dispatcher recovery, or protection against abrupt request termination.
+
+Keep the processor private and use Hyperdrive with query caching disabled and verified origin TLS. TypeScript requires `nodejs_compat` for `pg`; Rust must omit it. For custom integrations, direct `PostgresExecutionBackend` plus `runTaskOnce` / `run_task_once` remains the lower-level option; do not construct the listening `PostgresBackend` in a Worker.
+
 - [Rust example and harness](./bellows/tests/integration/cloudflare/README.md)
 - [TypeScript example and harness](./bellows-ts/test/integration/cloudflare/README.md)
 - [Mixed-language harness and shared fixtures](./interop-tests/cloudflare/README.md)

@@ -2,6 +2,22 @@
 //!
 //! Store one [`Dispatcher`] per Durable Object, created with [`Dispatcher::from_bindings`],
 //! and forward handlers to [`Dispatcher::fetch_worker`] and [`Dispatcher::alarm_worker`].
+//!
+//! For a processor Worker, delegate to [`PostgresProcessor::fetch_worker`]. Its synchronous
+//! configuration callback maps request bindings to [`PostgresProcessorConfig`] for one published
+//! task's factory, after validation. Construction performs no I/O; the delegate owns a fresh
+//! listener-free execution backend for each request.
+//!
+//! Register owned application cleanup with [`PostgresProcessorConfig::with_cleanup`], retaining
+//! business-connection ownership outside the spawned worker to survive lease-loss aborts. Cleanup
+//! runs once whenever configuration returned, even after acquisition failure or no claim. Backend
+//! shutdown is always awaited afterwards if acquired, even when application cleanup fails.
+//! HTTP 200 reports an ended attempt, not business success. Applications still own arbitrary
+//! side-effect resources.
+//!
+//! Direct [`crate::backends::postgres_execution::PostgresExecutionBackend`] with
+//! [`crate::run_task_once`] remains available for custom integrations with caller-owned cleanup.
+//! The processor does not extend request lifetime or add durable recovery or automatic retries.
 
 use http::{Request, Response};
 use worker::send::{SendFuture, SendWrapper};
@@ -10,6 +26,9 @@ use super::{
     AlarmStorage, BoxDispatchError, DurableObjectNamespaceLike, ProcessorFetcher,
     RetainedTaskDispatcher, TextBody,
 };
+
+mod postgres;
+pub use postgres::{PostgresProcessor, PostgresProcessorConfig};
 
 /// A Workers service binding adapted to [`ProcessorFetcher`].
 pub struct Service(SendWrapper<worker::Fetcher>);
@@ -38,34 +57,8 @@ impl Dispatcher {
     }
 
     /// Forwards an SDK request, validating route and content type before reading the body.
-    pub async fn fetch_worker(
-        &self,
-        mut request: worker::Request,
-    ) -> worker::Result<worker::Response> {
-        let mut builder = Request::builder()
-            .method(request.method().as_ref())
-            .uri(request.url()?.as_str());
-        for (name, value) in request.headers().entries() {
-            builder = builder.header(name, value);
-        }
-        let body: TextBody = Box::pin(SendFuture::new(async move {
-            request.text().await.map_err(sdk_error)
-        }));
-        let request = builder
-            .body(body)
-            .map_err(|error| worker::Error::RustError(error.to_string()))?;
-        let response = self.fetch(request).await;
-        let headers = worker::Headers::new();
-        for (name, value) in response.headers() {
-            headers.set(
-                name.as_str(),
-                value.to_str().expect("dispatch headers are ASCII"),
-            )?;
-        }
-        let status = response.status().as_u16();
-        Ok(worker::Response::ok(response.into_body())?
-            .with_status(status)
-            .with_headers(headers))
+    pub async fn fetch_worker(&self, request: worker::Request) -> worker::Result<worker::Response> {
+        outgoing_response(self.fetch(incoming_request(request)?).await)
     }
 
     /// Forwards an alarm and returns an empty response.
@@ -141,6 +134,35 @@ impl AlarmStorage for Storage {
                 .map_err(sdk_error)
         })
     }
+}
+
+fn incoming_request(mut request: worker::Request) -> worker::Result<Request<TextBody>> {
+    let mut builder = Request::builder()
+        .method(request.method().as_ref())
+        .uri(request.url()?.as_str());
+    for (name, value) in request.headers().entries() {
+        builder = builder.header(name, value);
+    }
+    let body: TextBody = Box::pin(SendFuture::new(async move {
+        request.text().await.map_err(sdk_error)
+    }));
+    builder
+        .body(body)
+        .map_err(|error| worker::Error::RustError(error.to_string()))
+}
+
+fn outgoing_response(response: Response<String>) -> worker::Result<worker::Response> {
+    let headers = worker::Headers::new();
+    for (name, value) in response.headers() {
+        headers.set(
+            name.as_str(),
+            value.to_str().expect("response headers are ASCII"),
+        )?;
+    }
+    let status = response.status().as_u16();
+    Ok(worker::Response::ok(response.into_body())?
+        .with_status(status)
+        .with_headers(headers))
 }
 
 fn outgoing_request(request: Request<String>) -> Result<worker::Request, BoxDispatchError> {

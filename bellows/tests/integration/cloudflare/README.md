@@ -11,7 +11,7 @@ The topology scenarios cover early acceptance, duplicates/concurrency, ownership
 | Source                                 | Purpose                                                                             |
 | -------------------------------------- | ----------------------------------------------------------------------------------- |
 | `producer/lib.rs`                      | `POST /tasks`, committed SQL publication, dispatch, and the Durable Object adapter. |
-| `processor/lib.rs`                     | `POST /process`, task claims, payload execution, and awaited cleanup.               |
+| `processor/lib.rs`                     | Processor delegate configuration, business SQL, and abort-safe application cleanup. |
 | `task.rs`                              | Shared `cloudflare_greeting` task carrying `{ name: string }`.                      |
 | `db.rs`, `http.rs`                     | Example-only connection and request helpers.                                        |
 | `contracts/`, `rust-contracts.ts`      | Test-only Workers and workerd contracts. Do not deploy.                             |
@@ -23,15 +23,61 @@ The topology scenarios cover early acceptance, duplicates/concurrency, ownership
 
 Target `wasm32-unknown-unknown` with Bellows default features disabled and `features = ["cloudflare"]`. Match `worker` and `worker-build` **0.8.5**. Native workspace builds do not compile the examples' Wasm-only bodies.
 
-- Import `PostgresExecutionBackend` and `PostgresBackendOptions` from `bellows::backends::postgres_execution`. Supply the real Hyperdrive binding's connection string and an explicit schema; initialization stays outside Workers.
-- Await `bellows::run_task_once` in a live request. It claims before constructing the worker, renews ownership during processing, and awaits finalization. Its `()` result means an attempt ended, **not success**.
+- Use `bellows::cloudflare::sdk::{PostgresProcessor, PostgresProcessorConfig}` for one published task definition and explicit task IDs. Its synchronous configuration callback runs once per validated request, not at construction. Supply the real Hyperdrive binding's connection string, `PostgresBackendOptions`, and your `WorkerFactory`; the execution backend validates the schema, and initialization stays outside Workers.
+- Await `PostgresProcessor::fetch_worker` in the event handler or delegate from an existing router. Bellows owns the `/process` protocol, random worker IDs, and a fresh listener-free execution backend. It uses `run_task_once` to claim before building the worker, pass the claimed payload, renew ownership, and await finalization.
+- HTTP **200** with `{ taskId, attemptFinished: true }` means the runtime returned normally and adapter cleanup succeeded, **not task success**. No-claim attempts, handled task failures, and backend errors handled by the runtime can all return this envelope. Adapter-visible failures return a generic **500** and log only the validated ID and lifecycle stage.
 - Use `bellows::time::Instant` for portable deadlines. It is `std::time::Instant` on native targets and `web_time::Instant` on Wasm. Workers use SDK execution and timers, not a Tokio runtime; public `Send`/`Sync` bounds remain unchanged.
 - Keep one `bellows::cloudflare::sdk::Dispatcher` per Durable Object, constructed with `RetainedTaskDispatcher::from_bindings`. Forward handlers to `fetch_worker` and `alarm_worker`; `dispatch_task` accepts `worker::ObjectNamespace` directly.
-- Use separate execution and side-effect connections, never global or DO-owned clients. Await `close()` before responding, including failure/no-claim paths. The processor retains side-effect connection ownership outside the spawned worker so aborted processing can still be cleaned up. Dropping a future does not undo already-sent SQL.
+
+The event wrapper in [`processor/lib.rs`](./processor/lib.rs) uses its application-defined `GreetingFactory` and `db::Connection`:
+
+```rust
+use bellows::{
+    backends::postgres_execution::PostgresBackendOptions,
+    cloudflare::sdk::{PostgresProcessor, PostgresProcessorConfig},
+};
+use std::sync::Arc;
+use tokio::sync::Mutex;
+use worker::*;
+
+#[event(fetch)]
+pub async fn fetch(request: Request, env: Env, _ctx: Context) -> Result<Response> {
+    PostgresProcessor::new(|env: &Env| {
+        let url = env.hyperdrive("HYPERDRIVE")?.connection_string();
+        let schema = env.var("BELLOWS_SCHEMA")?.to_string();
+        let side_effect = Arc::new(Mutex::new(None));
+        Ok(PostgresProcessorConfig::new(
+            url.clone(),
+            PostgresBackendOptions {
+                schema: Some(schema.clone()),
+            },
+            GreetingFactory {
+                hyperdrive_url: url,
+                schema,
+                side_effect: side_effect.clone(),
+            },
+        )
+        .with_cleanup(async move {
+            match side_effect.lock().await.as_mut() {
+                Some(connection) => connection.close().await.map_err(Error::from),
+                None => Ok(()),
+            }
+        }))
+    })
+    .fetch_worker(request, &env)
+    .await
+}
+```
+
+Applications still own arbitrary side-effect resources. Use separate business connections, opened only after a claim, never global or DO-owned clients. Here `Arc<Mutex<Option<db::Connection>>>` keeps ownership outside the spawned worker so cleanup can await cancellation-safe `close()` after lease-loss aborts. The factory retains the runtime's existing `Send`/`Sync` and ownership requirements; the owned cleanup future can hold SDK-affine values.
+
+`with_cleanup` registers a future awaited once whenever configuration returned, including randomness/acquisition failure and no claim. Bellows always awaits its own backend shutdown afterwards if acquisition succeeded, even when application cleanup fails. Configuration that fails before returning owns its partially created resources. Dropping a future does not undo already-sent SQL; abrupt request termination and Wasm traps remain outside this cleanup contract. TypeScript instead needs to drain tracked business promises, which its runtime cannot cancel.
+
+Direct `PostgresExecutionBackend` from `bellows::backends::postgres_execution` plus `bellows::run_task_once` remains the lower-level option for custom integrations. Callers then own backend acquisition and awaited `close()` as well as business cleanup. Do not construct the listening `PostgresBackend` in a Worker. Publishing remains the producer's existing SQL.
 
 **Do not add `nodejs_compat` to Rust configurations.** With the configured compatibility date, Node-style timer handles are incompatible with the SDK's numeric handles. TypeScript needs this flag for `pg`; Rust sockets do not.
 
-PostgreSQL stores tasks; the dispatcher map is only in-memory state. Its 30-second heartbeat provides neither lease renewal nor restart recovery. Publication gaps and rediscovery remain application concerns, and side effects plus completion are not atomic or exactly-once.
+PostgreSQL stores tasks; the dispatcher map is only in-memory state. Its 30-second heartbeat provides neither lease renewal nor restart recovery. The processor adds no automatic retries. Publication gaps and rediscovery remain application concerns, and side effects plus completion are not atomic or exactly-once.
 
 ## Build and test
 

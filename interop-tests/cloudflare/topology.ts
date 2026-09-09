@@ -23,6 +23,14 @@ export function cloudflareTopology(
     await fixture.start();
   }, 10_000);
 
+  function assertAttempt(response: ConsumedResponse, taskId: string): void {
+    expect(response.status, response.body).toBe(200);
+    expect(JSON.parse(response.body)).toEqual({
+      taskId,
+      attemptFinished: true,
+    });
+  }
+
   afterEach(async ({ task }) => {
     try {
       try {
@@ -152,6 +160,14 @@ export function cloudflareTopology(
     const secondOwner = await claimed(secondId, "Bob");
     expect(secondOwner).not.toBe(firstOwner);
     await gate.blocked(2);
+    for (const taskId of [firstId, secondId]) {
+      expect(await dispatch(taskId)).toEqual({
+        ok: true,
+        taskId,
+        duplicate: true,
+      });
+    }
+    await gate.blocked(2);
     expect(await fixture.activeRequestClients()).toHaveLength(4);
     await gate.release();
     await completed([
@@ -172,11 +188,7 @@ export function cloudflareTopology(
       ),
       "competing processor attempt to finish without claiming or writing",
     );
-    expect(competing.status, competing.body).toBe(200);
-    expect(JSON.parse(competing.body)).toEqual({
-      taskId,
-      attemptFinished: true,
-    });
+    assertAttempt(competing, taskId);
     expect(await claimed(taskId, "Claimed payload")).toBe(owner);
     await gate.blocked(1);
     // The no-claim competitor has also awaited its request-scoped driver shutdown.
@@ -222,8 +234,18 @@ ADD CONSTRAINT reject_retry_name CHECK (name <> 'Retry after repair')
     });
     expect(failed.processed).toEqual([]);
     await fixture.waitForIdle();
-    // The runtime handles the database failure. An attempt's HTTP 200 would not
-    // establish success; only these database assertions can establish the result.
+
+    const retry = await fixture.consume(
+      fixture.processor.fetch(
+        "/process",
+        json({ taskId, payload: { name: "Not the claimed payload" } }),
+      ),
+      "handled constraint failure to finalize and drain before responding",
+    );
+    assertAttempt(retry, taskId);
+    expect(await fixture.activeRequestClients()).toHaveLength(0);
+    // HTTP 200 is not success, and the request cannot replace the failing claimed payload.
+    expect(await fixture.state()).toEqual(failed);
     await fixture.admin.query(
       `ALTER TABLE ${fixture.processedTable} DROP CONSTRAINT reject_retry_name`,
     );
@@ -261,15 +283,28 @@ ADD CONSTRAINT reject_retry_name CHECK (name <> 'Retry after repair')
         status,
       );
     }
-    for (const [path, init, status] of [
-      ["/missing", json({ taskId: "1" }), 404],
-      ["/process", { method: "GET" }, 405],
-      ["/process", { method: "POST", body: "{}" }, 415],
-      ["/process", { ...json({}), body: "{" }, 400],
+    const canonicalError = "taskId must be a canonical positive decimal string";
+    for (const [path, init, status, error] of [
+      ["/missing", json({ taskId: "1" }), 404, "not-found"],
+      ["/process", { method: "GET" }, 405, "method-not-allowed"],
+      [
+        "/process",
+        { method: "POST", body: "{}" },
+        415,
+        "content-type must be application/json",
+      ],
+      [
+        "/process",
+        { ...json({}), headers: { "content-type": "text/plain" } },
+        415,
+        "content-type must be application/json",
+      ],
+      ["/process", { ...json({}), body: "{" }, 400, "invalid JSON"],
       ...[null, [], "1", {}, { taskId: 1 }].map(
-        (body) => ["/process", json(body), 400] as const,
+        (body) => ["/process", json(body), 400, canonicalError] as const,
       ),
       ...[
+        "",
         "0",
         "-1",
         "01",
@@ -278,30 +313,47 @@ ADD CONSTRAINT reject_retry_name CHECK (name <> 'Retry after repair')
         "+1",
         " 1",
         "1 ",
+        "1\n",
+        "1\r\n",
+        "١",
+        "１",
         "NaN",
         "Infinity",
         "not-a-number",
-        "9007199254740992",
         "99999999999999999",
-      ].map((taskId) => ["/process", json({ taskId }), 400] as const),
-    ] as const) {
-      assertError(
-        await fixture.consume(
-          fixture.processor.fetch(path, init),
-          `invalid processor request ${path}`,
-        ),
-        status,
-      );
-    }
-    const noClaim = await fixture.consume(
-      fixture.processor.fetch(
-        "/process",
-        json({ taskId: String(Number.MAX_SAFE_INTEGER) }),
+      ].map(
+        (taskId) =>
+          ["/process", json({ taskId }), 400, canonicalError] as const,
       ),
-      "safe-integer boundary with no task to claim",
-    );
-    expect(noClaim.status, noClaim.body).toBe(200);
+      [
+        "/process",
+        json({ taskId: "9007199254740992" }),
+        400,
+        "taskId must encode a positive safe integer canonically",
+      ],
+    ] as const) {
+      const response = await fixture.consume(
+        fixture.processor.fetch(path, init),
+        `invalid processor request ${path}`,
+      );
+      expect(response.status, response.body).toBe(status);
+      expect(JSON.parse(response.body)).toEqual({ error });
+    }
     expect(await fixture.state()).toEqual({ tasks: [], processed: [] });
+    expect(await fixture.activeRequestClients()).toHaveLength(0);
+
+    for (const taskId of ["1", String(Number.MAX_SAFE_INTEGER)]) {
+      const noClaim = await fixture.consume(
+        fixture.processor.fetch(
+          "/process",
+          json({ taskId, payload: { name: "Ignored" } }),
+        ),
+        `safe-integer boundary ${taskId} with no task to claim`,
+      );
+      assertAttempt(noClaim, taskId);
+      expect(await fixture.activeRequestClients()).toHaveLength(0);
+      expect(await fixture.state()).toEqual({ tasks: [], processed: [] });
+    }
 
     const taskId = "not-a-number";
     const expectedError = {

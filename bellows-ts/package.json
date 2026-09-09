@@ -37,6 +37,10 @@
       "types": "./dist/cloudflare.d.ts",
       "default": "./dist/cloudflare.js"
     },
+    "./cloudflare/postgres": {
+      "types": "./dist/cloudflare/postgres.d.ts",
+      "default": "./dist/cloudflare/postgres.js"
+    },
     "./backends/sqlite": {
       "types": "./dist/backends/sqlite.d.ts",
       "default": "./dist/backends/sqlite.js"

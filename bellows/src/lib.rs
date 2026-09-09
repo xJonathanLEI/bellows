@@ -39,10 +39,19 @@
 //! ## Cloudflare Workers
 //!
 //! Target `wasm32-unknown-unknown` with `default-features = false, features = ["cloudflare"]`.
-//! Await `run_task_once` and PostgreSQL `close()` within each request. Workers use SDK sockets,
-//! execution, and timers; native daemon backends are unavailable. Use [`time::Instant`] for deadlines.
+//! Delegate processor requests to `cloudflare::sdk::PostgresProcessor` with a synchronous
+//! environment-to-config callback and a published task's [`WorkerFactory`]. It validates before
+//! configuration, owns a request-scoped execution backend, and awaits [`run_task_once`], registered
+//! application cleanup, and backend shutdown. HTTP 200 means an attempt ended, not task success.
+//! Applications still own side-effect resources; retain cleanup ownership outside aborted workers.
+//! Direct `PostgresExecutionBackend` plus `run_task_once` remains the lower-level integration API.
+//!
+//! Workers use SDK sockets, execution, and timers; native daemon backends are unavailable.
+//! Use [`time::Instant`] for deadlines. Obtain connection strings from Hyperdrive, keep processors
+//! private, and leave schema initialization outside requests. Publishing remains application-owned.
 //!
 //! The `cloudflare` module provides in-memory retained dispatch, not durable recovery or retries.
+//! The processor does not extend request lifetime or recover from abrupt termination or wasm traps.
 //! See the [Rust examples](https://github.com/xJonathanLEI/bellows/tree/master/bellows/tests/integration/cloudflare)
 //! for setup and limitations. Omit `nodejs_compat`: its Node-style timer handles conflict with SDK timers.
 //!

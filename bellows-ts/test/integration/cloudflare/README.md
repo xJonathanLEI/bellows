@@ -10,18 +10,28 @@ PostgreSQL stores tasks. The Durable Object retains outstanding processor reques
 | ------------------------------------------------------- | ------------------------------------------------------------------------ |
 | `task.ts`                                               | Shared `cloudflare_greeting` task with `{ name: string }` payload.       |
 | `workers/producer.ts`                                   | `POST /tasks`, SQL publication, and the `TaskDispatcher` Durable Object. |
-| `workers/processor.ts`                                  | `POST /process`, task execution, and the `processed_tasks` side effect.  |
+| `workers/processor.ts`                                  | Processor delegate configuration and the `processed_tasks` side effect.  |
 | `wrangler.*.jsonc`                                      | Hyperdrive, Durable Object, and service bindings.                        |
 | `cloudflare.integration.test.ts`, `postgres-fixture.ts` | TypeScript-only workerd suite and production schema-initializer adapter. |
 
 The examples import repository source. In an application, use:
 
-- `@xjonathanlei/bellows` for task definitions, `runTaskOnce`, and `TaskSuccess`.
+- `@xjonathanlei/bellows` for task definitions, `WorkerFactory`, and `TaskSuccess`.
 - `@xjonathanlei/bellows/cloudflare` for `dispatchTask` and `RetainedTaskDispatcher`.
-- `@xjonathanlei/bellows/backends/postgres-execution` for `PostgresExecutionBackend`.
+- `@xjonathanlei/bellows/cloudflare/postgres` for `createPostgresProcessor`.
 - `@xjonathanlei/bellows/backends/postgres` for direct, Node-side schema initialization.
 
-Do **not** construct the listening `PostgresBackend` in a Worker. Worker connections come only from `env.HYPERDRIVE.connectionString`, are request-scoped, and close before returning—including failure and no-claim paths. Use a separate connection for side effects so lease renewal can progress.
+## Processor delegate and cleanup
+
+[`workers/processor.ts`](./workers/processor.ts) default-exports `createPostgresProcessor((env: ProcessorEnv) => config)`. The synchronous callback maps `env.HYPERDRIVE.connectionString` and `env.BELLOWS_SCHEMA`, creates a typed `WorkerFactory<typeof greetingTask>`, and registers application cleanup. It runs only after request validation, once per request. See the [short default-export example](../../../README.md#cloudflare-workers); a router can instead return `processor.fetch(request, env)` without binding `this`.
+
+Bellows owns request parsing, safe-integer ID validation, random worker IDs, and execution-backend acquisition/shutdown. Each request uses a fresh listener-free backend. The runtime claims before `factory.build`, so only the database's claimed payload reaches the business worker. Schema validation belongs to the execution backend; initialization stays outside Workers.
+
+Applications own their business resources. This processor opens a separate `pg.Client` only during claimed processing so lease renewal can progress, and awaits `client.end()` in `finally`. It also retains the business operation promise in the request's configuration scope: TypeScript does not cancel that promise on renewal loss, so a local `finally` alone cannot prove the operation has ended when the runtime returns. Registered cleanup drains the operation, including its shutdown, without reclassifying handled worker failures as adapter failures.
+
+The delegate awaits application cleanup once whenever configuration returned, including randomness/acquisition failure and no-claim paths, then always awaits Bellows backend shutdown if acquisition succeeded. A cleanup failure cannot skip that shutdown. Configuration that throws before returning remains responsible for partially created resources; abrupt request termination is not recoverable by this contract.
+
+For custom integrations, `PostgresExecutionBackend` from `@xjonathanlei/bellows/backends/postgres-execution` plus `runTaskOnce` remains available as the lower-level API, with caller-owned cleanup. Do **not** construct the listening `PostgresBackend` in a Worker or retain clients globally or in a Durable Object. The generic `cloudflare` import stays independent of the PostgreSQL entry point. Publishing remains the producer's existing SQL.
 
 ## Run locally
 
@@ -69,8 +79,9 @@ Worker typechecking generates its runtime declarations and also runs under norma
 ## Protocol and limits
 
 - `POST /tasks` accepts a non-blank `name` of at most 200 UTF-16 code units. Publication commits and its connection closes before dispatch. HTTP **202** returns the task ID, not completion.
-- Generic dispatch forwards `{ taskId: string }`, accepting opaque IDs of 1–200 UTF-16 code units. The example processor requires a canonical positive decimal ID no greater than `9007199254740991`.
-- `{ taskId, attemptFinished: true }` means an attempt ended, including no claim or handled failure. A persisted side effect plus deletion of the Bellows row establishes success.
+- Generic dispatch forwards `{ taskId: string }`, accepting opaque IDs of 1–200 UTF-16 code units. Both PostgreSQL processor delegates require 1–16 ASCII decimal digits, starting with 1–9, with a value no greater than `9007199254740991`. IDs remain strings in responses; extra request properties are ignored.
+- HTTP **200** with `{ taskId, attemptFinished: true }` means the runtime returned normally and adapter cleanup succeeded, including no-claim and handled-failure attempts. Some backend errors are also handled by the runtime; this response is not business success. A persisted side effect plus deletion of the Bellows row establishes success in these tests.
+- Adapter-visible configuration, randomness, acquisition, uncaught attempt, or cleanup failures return HTTP **500** with `{ "error": "task processing attempt failed" }`. Server diagnostics identify only the validated ID and lifecycle stage, not configuration or driver error strings.
 - If dispatch fails after publication, HTTP **503** includes the existing ID. Redispatch that ID through a trusted path; publishing again creates another task.
 - Schema initialization belongs outside Worker requests. Qualify tables and parameterize values. Schema names use lowercase ASCII letters, digits, and underscores, starting with a letter or underscore; choose short names to avoid PostgreSQL truncation.
 - The 30-second alarm is a heartbeat, not lease renewal or retry. Dispatch state is not persisted. Publication gaps, expired-task discovery, and restart/eviction recovery remain application concerns.
