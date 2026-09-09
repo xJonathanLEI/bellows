@@ -146,6 +146,14 @@ Because the signaling is provided by Postgres itself, this backend works natural
 
 This makes the Postgres backend the built-in option intended for durable distributed deployments, while SQLite remains the lightweight single-process durable option.
 
+## Cloudflare Workers (Rust and TypeScript)
+
+Both languages can implement the **producer Worker -> retained Durable Object dispatcher -> service-bound processor Worker** topology. PostgreSQL stores the tasks; the Durable Object only retains outstanding dispatch requests **in memory**. The processor claims a task, executes a Bellows worker using the claimed payload, renews ownership while processing, and awaits failure/completion recording.
+
+- [Rust example and harness](./bellows/tests/integration/cloudflare/README.md)
+- [TypeScript example and harness](./bellows-ts/test/integration/cloudflare/README.md)
+- [Mixed-language harness and shared fixtures](./interop-tests/cloudflare/README.md)
+
 ## License
 
 Licensed under either of

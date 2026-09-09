@@ -1,0 +1,38 @@
+{
+  "$schema": "../../../node_modules/wrangler/config-schema.json",
+  "name": "bellows-cloudflare-producer",
+  "main": "workers/producer.ts",
+  "compatibility_date": "2026-07-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "vars": {
+    "BELLOWS_SCHEMA": "bellows_cloudflare"
+  },
+  "hyperdrive": [
+    {
+      "binding": "HYPERDRIVE",
+      // Local-example-only placeholder. Use a real, caching-disabled Hyperdrive ID to deploy.
+      // Locally, set CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE.
+      "id": "00000000000000000000000000000000"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "DISPATCHER",
+        "class_name": "TaskDispatcher"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["TaskDispatcher"]
+    }
+  ],
+  "services": [
+    {
+      "binding": "PROCESSOR",
+      "service": "bellows-cloudflare-processor"
+    }
+  ]
+}

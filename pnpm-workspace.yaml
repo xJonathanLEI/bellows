@@ -1,5 +1,7 @@
 packages:
   - bellows-ts
+  - interop-tests
+  - bellows/tests/integration/cloudflare
 
 catalog:
   "@biomejs/biome": 2.4.6
@@ -8,3 +10,8 @@ catalog:
   pg: 8.20.0
   typescript: 5.9.3
   vitest: ^3.2.4
+  wrangler: 4.129.1
+
+onlyBuiltDependencies:
+  - esbuild
+  - workerd

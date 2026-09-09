@@ -33,6 +33,10 @@
       "types": "./dist/backends/postgres-execution.d.ts",
       "default": "./dist/backends/postgres-execution.js"
     },
+    "./cloudflare": {
+      "types": "./dist/cloudflare.d.ts",
+      "default": "./dist/cloudflare.js"
+    },
     "./backends/sqlite": {
       "types": "./dist/backends/sqlite.d.ts",
       "default": "./dist/backends/sqlite.js"
@@ -43,7 +47,10 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "test": "vitest run",
-    "typecheck": "tsc --noEmit -p tsconfig.typecheck.json"
+    "test:cloudflare": "vitest run test/integration/cloudflare/cloudflare.integration.test.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.typecheck.json && pnpm typecheck:workers",
+    "types:workers": "node -e \"require('node:fs').mkdirSync('test/integration/cloudflare/.wrangler', { recursive: true })\" && wrangler types test/integration/cloudflare/.wrangler/runtime.d.ts --config test/integration/cloudflare/wrangler.producer.jsonc --include-env=false",
+    "typecheck:workers": "pnpm types:workers && tsc -p test/integration/cloudflare/tsconfig.workers.json"
   },
   "dependencies": {
     "pg": "catalog:"
@@ -51,7 +58,9 @@
   "devDependencies": {
     "@types/node": "catalog:",
     "@types/pg": "catalog:",
+    "bellows-cloudflare-interop-tests": "workspace:*",
     "typescript": "catalog:",
-    "vitest": "catalog:"
+    "vitest": "catalog:",
+    "wrangler": "catalog:"
   }
 }

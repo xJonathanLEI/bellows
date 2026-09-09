@@ -9,21 +9,39 @@ documentation = "https://docs.rs/bellows"
 repository = "https://github.com/xJonathanLEI/bellows"
 description = "Durable task processing framework in Rust for applications of all sizes"
 
+[[example]]
+name = "cloudflare_initialize_postgres"
+path = "tests/integration/cloudflare/initialize.rs"
+required-features = ["postgres"]
+
 [features]
 default = ["in_memory", "sqlite", "postgres"]
-in_memory = ["serde_json"]
-sqlite = ["sqlx", "serde_json"]
-postgres = ["sqlx", "serde_json"]
+cloudflare = ["dep:futures-util", "dep:http", "serde_json", "dep:tokio-postgres", "dep:worker", "worker/tokio-postgres"]
+in_memory = ["dep:rand", "serde_json"]
+sqlite = ["dep:rand", "sqlx", "serde_json"]
+postgres = ["dep:rand", "sqlx", "serde_json"]
 
 [dependencies]
-rand.workspace = true
+http = { workspace = true, optional = true }
 serde.workspace = true
 serde_json = { workspace = true, optional = true }
-sqlx = { workspace = true, optional = true }
 tokio.workspace = true
 tracing.workspace = true
 
-[dev-dependencies]
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rand = { workspace = true, optional = true }
+sqlx = { workspace = true, optional = true }
+tokio = { workspace = true, features = ["rt", "time"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+futures-util = { workspace = true, optional = true }
+tokio-postgres = { workspace = true, features = ["js"], optional = true }
+web-time.workspace = true
+worker = { workspace = true, optional = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 serde = { workspace = true, features = ["std", "derive"] }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread"] }
+tokio-postgres = { workspace = true, features = ["runtime"] }
+tracing = { workspace = true, features = ["std"] }

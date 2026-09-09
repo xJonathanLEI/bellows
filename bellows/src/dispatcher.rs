@@ -108,8 +108,7 @@ pub struct WorkerDispatcherHandle {
 }
 
 impl WorkerDispatcherHandle {
-    /// Stops the dispatcher from claiming new tasks immediately and waits for all in-flight tasks
-    /// to finish processing.
+    /// Stops new attempts and waits for in-flight work, including workers started by pending claims.
     pub async fn drain(self) {
         self.drain_signal.notify_one();
         self.drained_signal.notified().await;

@@ -1,0 +1,12 @@
+{
+  "extends": "../../../tsconfig.json",
+  "compilerOptions": {
+    "lib": ["ES2022"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "rootDir": "../../..",
+    "noEmit": true,
+    "types": ["node"]
+  },
+  "include": ["workers/**/*.ts", "task.ts", ".wrangler/runtime.d.ts"]
+}

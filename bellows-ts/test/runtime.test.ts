@@ -353,3 +353,70 @@ test.each([
     renewal === "renewed" ? TaskNotFoundError : TaskLeasedError,
   );
 });
+
+test.each([
+  "renewed",
+  "lost",
+  "error",
+])("worker progresses during pending renewal: %s", async (renewal) => {
+  const inner = new InMemoryBackend();
+  const published = await inner.publish(blockingTask, undefined);
+  const renewing = new Gate();
+  const renewalGate = new Gate();
+  const backend: TaskExecutionBackend = {
+    ...executionOnly(inner),
+    async claimPublished(task, workerId, taskId, expiration) {
+      const claimed = await inner.claimPublished(
+        task,
+        workerId,
+        taskId,
+        expiration,
+      );
+      return { ...claimed, leaseExpirationMs: Date.now() };
+    },
+    async renew(workerId, taskId, expiration) {
+      renewing.release();
+      await renewalGate.wait();
+      if (renewal === "lost") {
+        throw new LeaseLostError();
+      }
+      if (renewal === "error") {
+        throw new Error("injected renewal error");
+      }
+      return inner.renew(workerId, taskId, expiration);
+    },
+  };
+  const finish = vi.spyOn(backend, "finish");
+  const fail = vi.spyOn(backend, "fail");
+  const { factory, gate, started, process } = gatedFactory();
+  const execution = runTaskOnce(backend, factory, 17, {
+    type: "task",
+    taskId: published.taskId,
+  });
+  let completed = false;
+  void execution.then(() => {
+    completed = true;
+  });
+  await started.wait();
+  await renewing.wait();
+  gate.release();
+  await process.mock.results[0]?.value;
+  expect(completed).toBe(false);
+  expect(finish).not.toHaveBeenCalled();
+  expect(fail).not.toHaveBeenCalled();
+
+  renewalGate.release();
+  await expect(execution).resolves.toBeUndefined();
+  expect(fail).not.toHaveBeenCalled();
+  expect(finish).toHaveBeenCalledTimes(renewal === "renewed" ? 1 : 0);
+  await expect(
+    inner.claimPublished(
+      blockingTask,
+      18,
+      published.taskId,
+      Date.now() + 60_000,
+    ),
+  ).rejects.toBeInstanceOf(
+    renewal === "renewed" ? TaskNotFoundError : TaskLeasedError,
+  );
+});

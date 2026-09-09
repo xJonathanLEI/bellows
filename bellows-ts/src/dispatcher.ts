@@ -65,6 +65,9 @@ export class WorkerDispatcherHandle {
     this.drained.resolve();
   }
 
+  /**
+   * Stops new attempts and waits for in-flight work, including workers started by pending claims.
+   */
   async drain(): Promise<void> {
     this.requestDrain();
     await this.drained.promise;

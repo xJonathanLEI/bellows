@@ -1,3 +1,17 @@
 node_modules/
 /target
 /bellows-ts/dist/
+.wrangler/
+/bellows-ts/test/integration/cloudflare/.dev.vars
+/bellows-ts/test/integration/cloudflare/.dev.vars.*
+/bellows-ts/test/integration/cloudflare/.env
+/bellows-ts/test/integration/cloudflare/.env.*
+/bellows/tests/integration/cloudflare/*/build/
+/bellows/tests/integration/cloudflare/.dev.vars
+/bellows/tests/integration/cloudflare/.dev.vars.*
+/bellows/tests/integration/cloudflare/.env
+/bellows/tests/integration/cloudflare/.env.*
+/bellows/tests/integration/cloudflare/*/.dev.vars
+/bellows/tests/integration/cloudflare/*/.dev.vars.*
+/bellows/tests/integration/cloudflare/*/.env
+/bellows/tests/integration/cloudflare/*/.env.*

@@ -1,4 +1,4 @@
-#![cfg(feature = "sqlite")]
+#![cfg(all(not(target_arch = "wasm32"), feature = "sqlite"))]
 
 use std::{
     sync::{
@@ -502,9 +502,12 @@ async fn test_sqlite_singleton_task_dispatch() {
         .expect("singleton task should be re-dispatched after finishing");
     assert_eq!(second_task_id, first_task_id);
 
-    let drain_handle = tokio::spawn(dispatcher_handle.drain());
-    release_signal.add_permits(1);
-    drain_handle.await.unwrap();
+    // Poll the drain request before releasing the worker, so another singleton cannot start.
+    tokio::join!(
+        biased;
+        dispatcher_handle.drain(),
+        async { release_signal.add_permits(1) },
+    );
 
     assert!(processed_rx.try_recv().is_err());
 }
@@ -698,9 +701,12 @@ async fn test_successful_singleton_task_can_schedule_next_run() {
     assert_eq!(second_task_id, first_task_id);
     assert_eq!(attempts.load(Ordering::SeqCst), 2);
 
-    let drain_handle = tokio::spawn(dispatcher_handle.drain());
-    release_signal.add_permits(1);
-    drain_handle.await.unwrap();
+    // Poll the drain request before releasing the worker, so another singleton cannot start.
+    tokio::join!(
+        biased;
+        dispatcher_handle.drain(),
+        async { release_signal.add_permits(1) },
+    );
 
     assert!(processed_rx.try_recv().is_err());
 }

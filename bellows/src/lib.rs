@@ -31,22 +31,54 @@
 //! - a persistent assignment registry; and
 //! - a low-bandwidth, low-latency, and high-throughput signal channel.
 //!
-//! [`dispatcher::WorkerDispatcher`] uses both capabilities for discovery and processing. An external
-//! host can instead await [`run_task_once`] with only a [`TaskExecutionBackend`], without launching a
-//! dispatcher. Each call attempts one task; its unit return is not an execution-success status.
+//! The native [`dispatcher::WorkerDispatcher`] uses both capabilities for discovery and processing.
+//! An external host can instead await [`run_task_once`] with only a [`TaskExecutionBackend`], without
+//! launching a dispatcher. Each call attempts one task; its unit return is not an execution-success
+//! status.
+//!
+//! ## Cloudflare Workers
+//!
+//! Target `wasm32-unknown-unknown` with `default-features = false, features = ["cloudflare"]`.
+//! Await `run_task_once` and PostgreSQL `close()` within each request. Workers use SDK sockets,
+//! execution, and timers; native daemon backends are unavailable. Use [`time::Instant`] for deadlines.
+//!
+//! The `cloudflare` module provides in-memory retained dispatch, not durable recovery or retries.
+//! See the [Rust examples](https://github.com/xJonathanLEI/bellows/tree/master/bellows/tests/integration/cloudflare)
+//! for setup and limitations. Omit `nodejs_compat`: its Node-style timer handles conflict with SDK timers.
+//!
 
-use std::{marker::PhantomData, time::Instant};
+#![cfg_attr(
+    target_arch = "wasm32",
+    doc = "[`dispatcher::WorkerDispatcher`]: https://docs.rs/bellows/latest/bellows/dispatcher/struct.WorkerDispatcher.html"
+)]
+#![cfg_attr(
+    all(target_arch = "wasm32", not(feature = "cloudflare")),
+    doc = "[`run_task_once`]: https://docs.rs/bellows/latest/bellows/fn.run_task_once.html"
+)]
+
+use std::marker::PhantomData;
 
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::sync::oneshot;
+
+pub mod time;
+use time::Instant;
 
 pub mod backends;
 use backends::ClaimedTask;
 pub use backends::{Backend, TaskExecutionBackend};
 
+#[cfg(not(target_arch = "wasm32"))]
 pub mod dispatcher;
 
+#[cfg(feature = "cloudflare")]
+pub mod cloudflare;
+
+#[cfg(any(not(target_arch = "wasm32"), feature = "cloudflare"))]
+mod platform;
+#[cfg(any(not(target_arch = "wasm32"), feature = "cloudflare"))]
 pub(crate) mod runtime;
+#[cfg(any(not(target_arch = "wasm32"), feature = "cloudflare"))]
 pub use runtime::run_task_once;
 
 pub trait TaskDefinition: Send {
@@ -183,6 +215,10 @@ pub struct AwaitableTask<T> {
 }
 
 impl<T> AwaitableTask<T> {
+    #[cfg(all(
+        not(target_arch = "wasm32"),
+        any(feature = "in_memory", feature = "sqlite", feature = "postgres")
+    ))]
     pub(crate) fn new(task_id: u64, callback_rx: oneshot::Receiver<T>) -> Self {
         Self {
             task_id,
@@ -232,6 +268,10 @@ where
     payload_type: PhantomData<Payload>,
 }
 
+#[cfg_attr(
+    all(target_arch = "wasm32", not(feature = "cloudflare")),
+    doc = "[`run_task_once`]: https://docs.rs/bellows/latest/bellows/fn.run_task_once.html"
+)]
 /// Selects the published task to attempt with [`run_task_once`].
 ///
 /// Singleton tasks use `()` instead of this token.

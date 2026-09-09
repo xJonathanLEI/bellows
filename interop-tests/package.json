@@ -1,0 +1,23 @@
+{
+  "name": "bellows-cloudflare-interop-tests",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./cloudflare/postgres-fixture": "./cloudflare/postgres-fixture.ts",
+    "./cloudflare/topology": "./cloudflare/topology.ts"
+  },
+  "scripts": {
+    "test": "vitest run cloudflare/cloudflare.integration.test.ts",
+    "test:cloudflare": "vitest run cloudflare/cloudflare.integration.test.ts",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "devDependencies": {
+    "@types/node": "catalog:",
+    "@types/pg": "catalog:",
+    "pg": "catalog:",
+    "typescript": "catalog:",
+    "vitest": "catalog:",
+    "wrangler": "catalog:"
+  }
+}

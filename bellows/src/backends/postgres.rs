@@ -23,12 +23,10 @@ use crate::backends::{
 };
 use crate::{AwaitableTask, PublishActivationStrategy, TaskDefinition};
 
-use super::postgres_operations::{
-    NOTIFY_CHANNEL, NotificationPayload, PostgresTaskOperations, unix_ms_to_instant,
-};
-pub use super::postgres_operations::{
-    PostgresBackendError, PostgresBackendOptions, initialize_postgres_schema,
-};
+pub use super::postgres_common::PostgresBackendOptions;
+use super::postgres_common::{NOTIFY_CHANNEL, NotificationPayload, unix_ms_to_instant};
+use super::postgres_operations::PostgresTaskOperations;
+pub use super::postgres_operations::{PostgresBackendError, initialize_postgres_schema};
 
 const SIGNAL_CHANNEL_SIZE: usize = 1024;
 const LISTENER_RETRY_DELAY: Duration = Duration::from_secs(1);

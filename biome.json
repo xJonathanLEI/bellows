@@ -13,7 +13,17 @@
       "tsconfig.json",
       "biome.json",
       "bellows-ts/**",
+      "interop-tests/package.json",
+      "interop-tests/tsconfig.json",
+      "interop-tests/cloudflare/**/*.ts",
+      "bellows/tests/integration/cloudflare/package.json",
+      "bellows/tests/integration/cloudflare/tsconfig.json",
+      "bellows/tests/integration/cloudflare/*.ts",
+      "bellows/tests/integration/cloudflare/*.mjs",
+      "bellows/tests/integration/cloudflare/**/wrangler*.jsonc",
       "!**/node_modules",
+      "!**/.wrangler",
+      "!bellows/tests/integration/cloudflare/**/build",
       "!bellows-ts/dist"
     ]
   },

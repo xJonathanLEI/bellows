@@ -1,4 +1,4 @@
-#![cfg(feature = "in_memory")]
+#![cfg(all(not(target_arch = "wasm32"), feature = "in_memory"))]
 
 use std::{
     marker::PhantomData,
@@ -46,6 +46,7 @@ struct Factory<T> {
     gate: Arc<Semaphore>,
     dropped: Arc<Semaphore>,
     result: TaskResult<()>,
+    panics: bool,
     task: PhantomData<fn() -> T>,
 }
 
@@ -59,6 +60,7 @@ impl<T> Factory<T> {
                 gate: Arc::new(Semaphore::new(0)),
                 dropped: Arc::new(Semaphore::new(0)),
                 result: Ok(TaskSuccess::done(())),
+                panics: false,
                 task: PhantomData,
             },
             rx,
@@ -102,6 +104,7 @@ where
             .send((self.worker_id, task_id))
             .unwrap();
         self.factory.gate.acquire().await.unwrap().forget();
+        assert!(!self.factory.panics, "injected worker panic");
         self.factory.result
     }
 }
@@ -505,4 +508,74 @@ async fn renews_while_processing_and_aborts_worker_on_renewal_failure() {
             assert!(matches!(claim, Err(ClaimTaskError::TaskLeased { .. })));
         }
     }
+}
+
+#[tokio::test]
+async fn worker_progresses_during_pending_renewal_but_finalization_waits_for_ownership() {
+    for renewal in [Renewal::Due, Renewal::Lost, Renewal::Error] {
+        let inner = InMemoryBackend::new();
+        let task = inner.publish::<Published>(()).await.unwrap();
+        let mut backend = ExecutionOnly::new(inner.clone());
+        backend.renewal = renewal;
+        let (factory, mut started) = Factory::<Published>::new();
+        let execution = tokio::spawn(run_task_once(
+            backend.clone(),
+            factory.clone(),
+            17,
+            PublishDispatchToken::Task(task.task_id),
+        ));
+        assert_eq!(started.recv().await, Some((17, task.task_id)));
+        backend.renewing.acquire().await.unwrap().forget();
+
+        // The worker must be driven independently, even while the renewal query is blocked.
+        factory.gate.add_permits(1);
+        factory.dropped.acquire().await.unwrap().forget();
+        assert!(!execution.is_finished());
+        assert_eq!(backend.recording.available_permits(), 0);
+
+        backend.renewal_gate.add_permits(1);
+        execution.await.unwrap();
+        let claim = inner
+            .claim_published::<Published>(18, task.task_id, lease_expiration())
+            .await;
+        if matches!(renewal, Renewal::Due) {
+            assert_eq!(backend.recording.available_permits(), 1);
+            assert!(matches!(claim, Err(ClaimTaskError::TaskNotFound)));
+        } else {
+            // Even an already-finished worker cannot finalize after a failed renewal.
+            assert_eq!(backend.recording.available_permits(), 0);
+            assert!(matches!(claim, Err(ClaimTaskError::TaskLeased { .. })));
+        }
+    }
+}
+
+#[tokio::test]
+async fn native_worker_panic_awaits_failure_recording_and_releases_the_task() {
+    let inner = InMemoryBackend::new();
+    let task = inner.publish::<Published>(()).await.unwrap();
+    let mut backend = ExecutionOnly::new(inner.clone());
+    let gate = Arc::new(Semaphore::new(0));
+    backend.recording_gate = Some(gate.clone());
+    let (mut factory, _started) = Factory::<Published>::new();
+    factory.panics = true;
+    factory.gate.add_permits(1);
+
+    let execution = tokio::spawn(run_task_once(
+        backend.clone(),
+        factory.clone(),
+        17,
+        PublishDispatchToken::Task(task.task_id),
+    ));
+    backend.recording.acquire().await.unwrap().forget();
+    factory.dropped.acquire().await.unwrap().forget();
+    assert!(!execution.is_finished());
+    assert_eq!(factory.builds.load(Ordering::SeqCst), 1);
+    gate.add_permits(1);
+    let (): () = execution.await.unwrap();
+    assert!(
+        inner
+            .claim_published::<Published>(18, task.task_id, lease_expiration())
+            .await
+            .is_ok()
+    );
 }

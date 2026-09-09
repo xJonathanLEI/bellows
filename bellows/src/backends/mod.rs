@@ -1,32 +1,55 @@
 //! Built-in task backend implementations.
+//!
+//! Native defaults include in-memory, SQLite, and PostgreSQL. On wasm, disable defaults and enable
+//! `cloudflare` for listener-free PostgreSQL execution. Portable deadlines use [`crate::time::Instant`].
 
 use std::{
     error::Error as StdError,
     fmt::{Display, Formatter},
     marker::PhantomData,
-    time::Instant,
 };
 
 use tokio::sync::broadcast::Receiver as BroadcastReceiver;
 
-use crate::{AwaitableTask, PublishActivationStrategy, TaskDefinition};
+use crate::{AwaitableTask, PublishActivationStrategy, TaskDefinition, time::Instant};
 
-#[cfg(feature = "in_memory")]
+#[cfg(all(not(target_arch = "wasm32"), feature = "in_memory"))]
 pub mod in_memory;
-#[cfg(feature = "postgres")]
+#[cfg(all(not(target_arch = "wasm32"), feature = "postgres"))]
 pub mod postgres;
-#[cfg(feature = "postgres")]
+#[cfg(any(
+    all(not(target_arch = "wasm32"), feature = "postgres"),
+    all(target_arch = "wasm32", feature = "cloudflare")
+))]
+mod postgres_common;
+#[cfg(any(
+    all(not(target_arch = "wasm32"), feature = "postgres"),
+    all(target_arch = "wasm32", feature = "cloudflare")
+))]
 pub mod postgres_execution;
-#[cfg(feature = "postgres")]
+#[cfg(all(not(target_arch = "wasm32"), feature = "postgres"))]
 mod postgres_operations;
-#[cfg(feature = "sqlite")]
+#[cfg(any(
+    all(test, not(target_arch = "wasm32"), feature = "postgres"),
+    all(target_arch = "wasm32", feature = "cloudflare")
+))]
+mod postgres_worker;
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite"))]
 pub mod sqlite;
 
+#[cfg_attr(
+    target_arch = "wasm32",
+    doc = "[`crate::dispatcher::WorkerDispatcher`]: https://docs.rs/bellows/latest/bellows/dispatcher/struct.WorkerDispatcher.html"
+)]
+#[cfg_attr(
+    all(target_arch = "wasm32", not(feature = "cloudflare")),
+    doc = "[`crate::run_task_once`]: https://docs.rs/bellows/latest/bellows/fn.run_task_once.html"
+)]
 /// Publishing and subscription capabilities in addition to [`TaskExecutionBackend`].
 ///
 /// A full backend connects to the underlying task registry and its associated signal channel.
-/// [`crate::dispatcher::WorkerDispatcher`] requires this trait; [`crate::run_task_once`] only
-/// requires the execution trait. Implementations must be cheaply cloneable.
+/// The native [`crate::dispatcher::WorkerDispatcher`] requires this trait; [`crate::run_task_once`]
+/// only requires the execution trait. Implementations must be cheaply cloneable.
 ///
 /// Some [`Backend`] implementations would have "intrinsic" connection between its task registry
 /// and the signal channel, such as Postgres where inserting a task row would trigger a `NOTIFY`
@@ -75,6 +98,10 @@ pub trait Backend: TaskExecutionBackend {
         T::Trigger: PublishActivationStrategy;
 }
 
+#[cfg_attr(
+    all(target_arch = "wasm32", not(feature = "cloudflare")),
+    doc = "[`crate::run_task_once`]: https://docs.rs/bellows/latest/bellows/fn.run_task_once.html"
+)]
 /// The task execution operations required by [`crate::run_task_once`].
 ///
 /// Implementations must be cheaply cloneable. This capability does not require publishing or
@@ -205,6 +232,10 @@ where
 }
 
 impl<T> BackendSignalSubscription<T> {
+    #[cfg(all(
+        not(target_arch = "wasm32"),
+        any(feature = "in_memory", feature = "sqlite", feature = "postgres")
+    ))]
     pub(crate) fn new(rx: BroadcastReceiver<BackendSignal>) -> Self {
         Self {
             rx,

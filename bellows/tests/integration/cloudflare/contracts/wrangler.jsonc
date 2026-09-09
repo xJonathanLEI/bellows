@@ -1,0 +1,22 @@
+{
+  "name": "bellows-cloudflare-contracts",
+  "main": "build/worker/shim.mjs",
+  "compatibility_date": "2026-07-01",
+  "workers_dev": false,
+  "preview_urls": false,
+  "build": {
+    "command": "pnpm --workspace-root exec node bellows/tests/integration/cloudflare/build-rust.mjs contracts"
+  },
+  "durable_objects": {
+    "bindings": [
+      { "name": "DISPATCHER", "class_name": "ContractDispatcher" },
+      { "name": "BODY", "class_name": "BodySource" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["ContractDispatcher", "BodySource"] }
+  ],
+  "services": [
+    { "binding": "PROCESSOR", "service": "bellows-cloudflare-contracts" }
+  ]
+}

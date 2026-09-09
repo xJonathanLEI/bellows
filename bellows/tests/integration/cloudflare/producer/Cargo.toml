@@ -1,0 +1,17 @@
+[package]
+name = "bellows-cloudflare-producer"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+path = "lib.rs"
+crate-type = ["cdylib", "rlib"]
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+bellows = { path = "../../../..", default-features = false, features = ["cloudflare"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+tokio.workspace = true
+tokio-postgres = { workspace = true, features = ["js"] }
+worker = { workspace = true, features = ["tokio-postgres"] }

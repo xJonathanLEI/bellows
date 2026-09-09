@@ -77,6 +77,12 @@ const token: PublishDispatchToken = { type: "task", taskId: task.taskId };
 await runTaskOnce(backend, factory, 17, token);
 ```
 
+### Cloudflare Workers
+
+Use `dispatchTask` and `RetainedTaskDispatcher` from `@xjonathanlei/bellows/cloudflare` for dispatch, and `PostgresExecutionBackend` from `@xjonathanlei/bellows/backends/postgres-execution` with `runTaskOnce()` for request-driven execution. PostgreSQL stores tasks; the retained Durable Object map is only in-memory dispatch state. Do not construct the listening `PostgresBackend` in a Worker.
+
+The [TypeScript Cloudflare–Postgres guide](./test/integration/cloudflare/README.md) exercises a producer Worker -> Durable Object dispatcher -> service-bound processor Worker with PostgreSQL publication, claims, side effects, and completion. `pnpm --dir bellows-ts test:cloudflare` runs five TypeScript -> TypeScript scenarios without Rust tools; they also run in the package's normal tests. The independent [Rust harness](../bellows/tests/integration/cloudflare/README.md) owns Rust -> Rust and Rust workerd contracts, while the [interop suite](../interop-tests/cloudflare/README.md) owns both mixed directions.
+
 ## Tasks
 
 Use `definePublishTask()` for payload-carrying tasks:

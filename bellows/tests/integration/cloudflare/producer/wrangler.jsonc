@@ -1,0 +1,23 @@
+{
+  "name": "bellows-cloudflare-producer",
+  "main": "build/worker/shim.mjs",
+  "compatibility_date": "2026-07-01",
+  "build": {
+    "command": "pnpm --workspace-root exec node bellows/tests/integration/cloudflare/build-rust.mjs producer"
+  },
+  "vars": { "BELLOWS_SCHEMA": "bellows_cloudflare" },
+  "hyperdrive": [
+    {
+      "binding": "HYPERDRIVE",
+      // Local-example-only placeholder. Deploy with a real caching-disabled Hyperdrive ID.
+      "id": "00000000000000000000000000000000"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [{ "name": "DISPATCHER", "class_name": "TaskDispatcher" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["TaskDispatcher"] }],
+  "services": [
+    { "binding": "PROCESSOR", "service": "bellows-cloudflare-processor" }
+  ]
+}

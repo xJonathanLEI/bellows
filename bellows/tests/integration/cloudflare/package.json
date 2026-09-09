@@ -1,0 +1,20 @@
+{
+  "name": "bellows-cloudflare-rust-tests",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "vitest run cloudflare.integration.test.ts",
+    "test:cloudflare": "vitest run cloudflare.integration.test.ts",
+    "test:cloudflare:contracts": "vitest run cloudflare.integration.test.ts -t 'Rust workerd'",
+    "build:cloudflare": "node build-rust.mjs",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "devDependencies": {
+    "@types/node": "catalog:",
+    "bellows-cloudflare-interop-tests": "workspace:*",
+    "typescript": "catalog:",
+    "vitest": "catalog:",
+    "wrangler": "catalog:"
+  }
+}

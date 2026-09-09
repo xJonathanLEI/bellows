@@ -1,11 +1,10 @@
-use std::{
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{sync::Arc, time::Duration};
 
 use crate::{
     ActivationStrategy, TaskDefinition, TaskExecutionBackend, TaskSuccess, Worker, WorkerFactory,
     backends::{ClaimTaskError, FailTaskError, FinishTaskError, RenewTaskError},
+    platform,
+    time::Instant,
 };
 use tokio::sync::mpsc::UnboundedSender as MpscSender;
 use tracing::{trace, warn};
@@ -23,12 +22,14 @@ const LEASE_RENEWAL_THRESHOLD: Duration = Duration::from_secs(10);
 /// failure or completion recording attempt before returning. A normal unit return is **not** a
 /// success status: missing, leased, or unavailable tasks do not start a worker, and backend
 /// claim/finalization errors are logged by the runtime rather than returned.
-/// Do not map this unit return directly to an HTTP success response. Renewal failure aborts the
-/// Rust worker and exits without recording completion.
+/// Renewal failure aborts the worker without recording completion or undoing side effects.
 ///
 /// This does not discover work or retry internally. Retries and successful rescheduling require
 /// another external trigger. The host must drive/await this future to execute it; dropping it
 /// does not provide a cancellation guarantee.
+///
+/// Requires Tokio with timers natively, or `cloudflare` and a live Workers request on wasm.
+/// Does not extend request lifetime. Native worker panics record failure; wasm traps may leave a lease held.
 pub async fn run_task_once<B, F>(
     backend: B,
     factory: F,
@@ -69,11 +70,12 @@ where
     B: TaskExecutionBackend + 'static,
     F: WorkerFactory + 'static,
 {
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn run(
         self,
         dispatch_token: <<<F::Worker as Worker>::Task as TaskDefinition>::Trigger as ActivationStrategy>::DispatchToken,
     ) {
-        tokio::spawn(self.run_and_wait(dispatch_token));
+        platform::spawn(self.run_and_wait(dispatch_token));
     }
 
     pub async fn run_and_wait(
@@ -186,7 +188,7 @@ where
             } => {
                 let worker = self.factory.build(self.worker_id);
                 let worker_handle =
-                    tokio::spawn(async move { worker.process(task_id, task_payload).await });
+                    platform::spawn(async move { worker.process(task_id, task_payload).await });
 
                 (
                     DaemonStatus::WorkerStarted {
@@ -206,8 +208,7 @@ where
                 let renewal_deadline = lease_expiration
                     .checked_sub(LEASE_RENEWAL_THRESHOLD)
                     .unwrap_or_else(Instant::now);
-                let renewal =
-                    tokio::time::sleep_until(tokio::time::Instant::from_std(renewal_deadline));
+                let renewal = platform::sleep_until(renewal_deadline);
 
                 tokio::select! {
                     _ = renewal => {
@@ -401,7 +402,7 @@ where
     /// The background worker has been spawned.
     WorkerStarted {
         task_id: u64,
-        worker_handle: tokio::task::JoinHandle<crate::TaskResult<T::Callback>>,
+        worker_handle: platform::JoinHandle<crate::TaskResult<T::Callback>>,
         lease_expiration: Instant,
     },
     /// The worker finished unsuccessfully and the task should be released back to the backend.

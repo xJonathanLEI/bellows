@@ -100,6 +100,176 @@ test.each([
   }
 });
 
+test.each([
+  "delete",
+  "reschedule",
+  "singleton",
+])("postgres execution rolls back failed callback finalization: %s", async (mode) => {
+  const database = track(
+    await TestPostgresDatabase.create("callback_rollback"),
+  );
+  const schema = `callbacks_${randomUUID().replaceAll("-", "")}`;
+  const table = `"${schema}".bellows_tasks`;
+  const admin = new Client({ connectionString: database.url });
+  await admin.connect();
+  try {
+    await admin.query(`CREATE SCHEMA "${schema}"`);
+    await initializePostgresSchema(database.url, schema);
+    const publisher = track(
+      await PostgresBackend.connect(database.url, { schema }),
+    );
+    const executor = track(
+      await PostgresExecutionBackend.connect(database.url, { schema }),
+    );
+    const singleton = defineSingletonTask<string>("callback_singleton");
+    const expiration = Date.now() + 60_000;
+    const task = mode === "singleton" ? singleton : echoTask;
+    const taskId =
+      mode === "singleton"
+        ? (await executor.claimSingleton(singleton, 17, expiration)).taskId
+        : (await publisher.publish(echoTask, { name: "callback" })).taskId;
+    if (mode !== "singleton") {
+      await executor.claimPublished(echoTask, 17, taskId, expiration);
+    }
+    await admin.query(
+      `UPDATE ${table} SET callback_id = $1 WHERE task_id = $2`,
+      [123, taskId],
+    );
+    const state = async () =>
+      (await admin.query(`SELECT * FROM ${table} WHERE task_id = $1`, [taskId]))
+        .rows;
+    const before = await state();
+    const available = mode === "delete" ? null : expiration;
+    const failingCodecTask = {
+      ...task,
+      callbackCodec: {
+        ...task.callbackCodec,
+        encode: () => {
+          throw new Error("intentional callback serialization failure");
+        },
+      },
+    };
+    await expect(
+      executor.finish(failingCodecTask, 17, taskId, "callback", available),
+    ).rejects.toThrow("intentional callback serialization failure");
+    expect(await state()).toEqual(before);
+    // PostgreSQL rejects oversized NOTIFY payloads. The task mutation must roll back too.
+    await expect(
+      executor.finish(task, 17, taskId, "x".repeat(9000), available),
+    ).rejects.toThrow();
+    expect(await state()).toEqual(before);
+    if (mode === "singleton") {
+      const publishedSameName = definePublishTask<void>(singleton.name);
+      await expect(
+        executor.claimPublished(publishedSameName, 18, taskId, expiration),
+      ).rejects.toBeInstanceOf(TaskNotFoundError);
+      await expect(
+        executor.claimEarliestPublished(publishedSameName, 18, expiration),
+      ).rejects.toEqual(new TaskUnavailableError(null));
+      await expect(
+        executor.finish(publishedSameName, 17, taskId, undefined, null),
+      ).rejects.toBeInstanceOf(LeaseLostError);
+    } else {
+      await expect(
+        executor.finish(singleton, 17, taskId, "callback", null),
+      ).rejects.toBeInstanceOf(LeaseLostError);
+    }
+    expect(await state()).toEqual(before);
+    await executor.finish(task, 17, taskId, 'hello "🦀"', available);
+    if (mode === "delete") {
+      expect(await state()).toEqual([]);
+    } else {
+      expect(await state()).toEqual([
+        {
+          ...before[0],
+          lease_worker_id: null,
+          callback_id: null,
+          available_from_unix_ms: String(expiration),
+        },
+      ]);
+    }
+  } finally {
+    await admin.end();
+  }
+});
+
+test("postgres execution orders claims, skips locked rows, and checks competing owners", async () => {
+  const database = track(await TestPostgresDatabase.create("execution_owners"));
+  const publisher = track(await PostgresBackend.connect(database.url));
+  await publisher.initialize();
+  const executor = track(await PostgresExecutionBackend.connect(database.url));
+  const competitor = track(
+    await PostgresExecutionBackend.connect(database.url),
+  );
+  const admin = new Client({ connectionString: database.url });
+  await admin.connect();
+  let transactionOpen = false;
+  try {
+    const old = await publisher.publishFuture(
+      echoTask,
+      { name: "old" },
+      Date.now() - 1000,
+    );
+    const first = await publisher.publish(echoTask, { name: "first" });
+    const second = await publisher.publish(echoTask, { name: "second" });
+    const expiration = Date.now() + 60_000;
+    await expect(
+      executor.claimPublished(ackTask, 17, first.taskId, expiration),
+    ).rejects.toBeInstanceOf(TaskNotFoundError);
+    await admin.query("BEGIN");
+    transactionOpen = true;
+    await admin.query(
+      "SELECT task_id FROM bellows_tasks WHERE task_id = $1 FOR UPDATE",
+      [first.taskId],
+    );
+    expect(
+      (await executor.claimEarliestPublished(echoTask, 17, expiration)).taskId,
+    ).toBe(second.taskId);
+    await admin.query("ROLLBACK");
+    transactionOpen = false;
+    const claims = await Promise.allSettled([
+      executor.claimPublished(echoTask, 17, first.taskId, expiration),
+      competitor.claimPublished(echoTask, 18, first.taskId, expiration),
+    ]);
+    expect(claims.filter((claim) => claim.status === "fulfilled")).toHaveLength(
+      1,
+    );
+    expect(claims.filter((claim) => claim.status === "rejected")).toEqual([
+      { status: "rejected", reason: expect.any(TaskLeasedError) },
+    ]);
+    expect(
+      (await executor.claimEarliestPublished(echoTask, 19, expiration)).taskId,
+    ).toBe(old.taskId);
+    await admin.query(
+      "UPDATE bellows_tasks SET available_from_unix_ms = 0 WHERE task_id = $1",
+      [first.taskId],
+    );
+    const claimed = await competitor.claimPublished(
+      echoTask,
+      20,
+      first.taskId,
+      expiration,
+    );
+    expect(claimed.taskPayload).toEqual({ name: "first" });
+    for (const owner of [17, 18]) {
+      await expect(
+        executor.renew(owner, first.taskId, expiration),
+      ).rejects.toBeInstanceOf(LeaseLostError);
+      await expect(
+        executor.fail(owner, first.taskId, null),
+      ).rejects.toBeInstanceOf(LeaseLostError);
+      await expect(
+        executor.finish(echoTask, owner, first.taskId, "", null),
+      ).rejects.toBeInstanceOf(LeaseLostError);
+    }
+  } finally {
+    if (transactionOpen) {
+      await admin.query("ROLLBACK");
+    }
+    await admin.end();
+  }
+});
+
 test("postgres schema validation accepts valid names without a length limit", () => {
   for (const schema of ["a", "_", "_tasks_17", "public", "a".repeat(128)]) {
     expect(validatePostgresSchemaName(schema)).toBe(schema);
@@ -585,9 +755,21 @@ test("postgres singleton task dispatch", async () => {
   const secondTaskId = await processed.recv();
   expect(secondTaskId).toBe(firstTaskId);
 
-  const drainPromise = dispatcherHandle.drain();
-  gate.release();
-  await drainPromise;
+  // Drain stops new claims, not a claim already awaiting PostgreSQL.
+  await Promise.all([
+    dispatcherHandle.drain().then(() => processed.close()),
+    (async () => {
+      gate.release();
+      for (
+        let taskId = await processed.recv();
+        taskId !== null;
+        taskId = await processed.recv()
+      ) {
+        expect(taskId).toBe(firstTaskId);
+        gate.release();
+      }
+    })(),
+  ]);
 
   expect(processed.tryRecv()).toBeNull();
 });
@@ -740,9 +922,21 @@ test("successful singleton task can schedule next run", async () => {
   expect(secondTaskId).toBe(firstTaskId);
   expect(attempts).toBe(2);
 
-  const drainPromise = dispatcherHandle.drain();
-  gate.release();
-  await drainPromise;
+  // An already-started claim may succeed when this worker releases ownership.
+  await Promise.all([
+    dispatcherHandle.drain().then(() => processed.close()),
+    (async () => {
+      gate.release();
+      for (
+        let taskId = await processed.recv();
+        taskId !== null;
+        taskId = await processed.recv()
+      ) {
+        expect(taskId).toBe(firstTaskId);
+        gate.release();
+      }
+    })(),
+  ]);
 
   expect(processed.tryRecv()).toBeNull();
 });

@@ -1,4 +1,4 @@
-#![cfg(feature = "postgres")]
+#![cfg(all(not(target_arch = "wasm32"), feature = "postgres"))]
 
 //! Integration tests for the Postgres backend.
 //!
@@ -530,9 +530,23 @@ async fn test_postgres_singleton_task_dispatch() {
         .expect("singleton task should be re-dispatched after finishing");
     assert_eq!(second_task_id, first_task_id);
 
-    let drain_handle = tokio::spawn(dispatcher_handle.drain());
-    release_signal.add_permits(1);
-    drain_handle.await.unwrap();
+    // Drain stops new claims, not a claim already awaiting PostgreSQL. Release those workers
+    // too, until draining drops the factory and closes the collector.
+    tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::join!(
+            biased;
+            dispatcher_handle.drain(),
+            async {
+                release_signal.add_permits(1);
+                while let Some(task_id) = processed_rx.recv().await {
+                    assert_eq!(task_id, first_task_id);
+                    release_signal.add_permits(1);
+                }
+            },
+        );
+    })
+    .await
+    .expect("singleton attempts already in flight should drain");
 
     assert!(processed_rx.try_recv().is_err());
 
@@ -734,9 +748,22 @@ async fn test_successful_singleton_task_can_schedule_next_run() {
     assert_eq!(second_task_id, first_task_id);
     assert_eq!(attempts.load(Ordering::SeqCst), 2);
 
-    let drain_handle = tokio::spawn(dispatcher_handle.drain());
-    release_signal.add_permits(1);
-    drain_handle.await.unwrap();
+    // An already-started claim may succeed when this worker releases ownership.
+    tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::join!(
+            biased;
+            dispatcher_handle.drain(),
+            async {
+                release_signal.add_permits(1);
+                while let Some(task_id) = processed_rx.recv().await {
+                    assert_eq!(task_id, first_task_id);
+                    release_signal.add_permits(1);
+                }
+            },
+        );
+    })
+    .await
+    .expect("rescheduled singleton attempts already in flight should drain");
 
     assert!(processed_rx.try_recv().is_err());
 
@@ -923,7 +950,29 @@ async fn test_postgres_execution_named_schema_without_listener() {
         1,
         "unexpected connections: {connections:?}"
     );
-    drop(backend);
+    backend.close().await.unwrap();
+    backend.clone().close().await.unwrap();
+    assert!(matches!(backend.fail(17, task_id, None).await,
+        Err(FailTaskError::Backend(error))
+        if matches!(error.source().and_then(|source| source.downcast_ref::<sqlx::Error>()),
+            Some(sqlx::Error::PoolClosed))));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let count: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity WHERE application_name = $1",
+            )
+            .bind(&application_name)
+            .fetch_one(&mut admin)
+            .await
+            .unwrap();
+            if count == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("execution pool must close its connections across all clones");
     admin.close().await.unwrap();
     database.cleanup().await;
 }
