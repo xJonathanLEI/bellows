@@ -1,6 +1,6 @@
 [package]
 name = "bellows"
-version = "0.0.14"
+version = "0.0.15"
 authors = ["Jonathan LEI <me@xjonathan.dev>"]
 license = "MIT OR Apache-2.0"
 edition = "2024"
