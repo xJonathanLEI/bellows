@@ -9,14 +9,18 @@
 //! per call, not at construction. It publishes once, retains an exact string receipt, validates
 //! the ID, awaits listener-free backend shutdown, then awaits [`dispatch_task`]. Success confirms
 //! acceptance, not completion. Typed errors retain the first stage/cause, any known receipt, and any
-//! later close failure. Close/dispatch receipts permit trusted redispatch without republishing;
-//! `task-id` receipts are unsupported by the processor. Missing receipts do not prove rollback.
+//! later close failure. Close/dispatch receipts permit trusted redispatch with the original
+//! definition name without republishing; `task-id` receipts are unsupported by the processor.
+//! Missing receipts do not prove rollback.
 //! Applications own HTTP endpoints, business validation, and side-effect clients. Direct
 //! `PostgresPublishingBackend` plus [`dispatch_task`] remains a caller-managed alternative.
 //!
-//! The processor validates before calling your synchronous environment-to-config callback. It owns
-//! a fresh execution backend and awaits the runtime, registered application cleanup, and backend
-//! shutdown. Applications still own business resources. Use `PostgresExecutionBackend` with
+//! Both dispatch hops require `{ taskId, taskName }`, never a payload. The processor selects a typed
+//! registration by exact definition name; names must be non-empty and unique within the registry.
+//! Unknown names return 404 without acquisition; the database claim still checks both ID and name.
+//! The processor validates before calling your synchronous environment-to-config callback. For a
+//! selected registration, it owns a fresh backend and awaits the runtime, application cleanup, and
+//! backend shutdown. Applications still own business resources. Use `PostgresExecutionBackend` with
 //! [`crate::run_task_once`] for lower-level integrations with caller-owned cleanup.
 //!
 //! State is in-memory; the 30-second heartbeat provides no lease renewal, retry, or eviction recovery.
@@ -55,6 +59,7 @@ const MAX_TASK_ID_LENGTH: usize = 200;
 const HEARTBEAT_INTERVAL_MS: i64 = 30_000;
 const MAX_ERROR_LENGTH: usize = 500;
 const INVALID_TASK_ID: &str = "taskId must be a non-empty string no longer than 200 characters";
+const INVALID_TASK_NAME: &str = "taskName must be a non-empty string";
 
 /// An I/O or dispatch error. SDK adapters convert JS errors to Rust messages.
 pub type BoxDispatchError = Box<dyn std::error::Error + Send + Sync + 'static>;
@@ -69,6 +74,14 @@ pub trait ProcessorFetcher: Send + Sync + 'static {
         &self,
         request: Request<String>,
     ) -> impl Future<Output = Result<Response<TextBody>, BoxDispatchError>> + Send;
+}
+
+fn validate_task_name(task_name: &str) -> Result<(), BoxDispatchError> {
+    if task_name.is_empty() {
+        Err(INVALID_TASK_NAME.into())
+    } else {
+        Ok(())
+    }
 }
 
 /// The namespace operation needed by [`dispatch_task`].
@@ -87,19 +100,21 @@ pub trait AlarmStorage {
     ) -> impl Future<Output = Result<(), BoxDispatchError>> + Send;
 }
 
-/// Dispatches an opaque ID of 1–200 UTF-16 code units to object `global`.
+/// Dispatches a definition's exact name and an opaque ID of 1–200 UTF-16 units to object `global`.
 ///
 /// Consumes the full response and propagates errors, limiting HTTP error excerpts to 500 UTF-16 units.
 /// Accepts `worker::ObjectNamespace` directly on wasm.
 pub async fn dispatch_task(
     namespace: &impl DurableObjectNamespaceLike,
+    task_name: &str,
     task_id: &str,
 ) -> Result<(), BoxDispatchError> {
     validate_task_id(task_id)?;
+    validate_task_name(task_name)?;
     let dispatcher = namespace.get_by_name(DISPATCHER_NAME)?;
     consume_response(
         dispatcher
-            .fetch(processor_request(DISPATCH_URL, task_id))
+            .fetch(processor_request(DISPATCH_URL, task_name, task_id))
             .await?,
         "dispatcher",
     )
@@ -187,8 +202,13 @@ impl<S: AlarmStorage, P: ProcessorFetcher> RetainedTaskDispatcher<S, P> {
             .and_then(Value::as_str)
             .ok_or(INVALID_TASK_ID)?;
         validate_task_id(task_id)?;
+        let task_name = object
+            .get("taskName")
+            .and_then(Value::as_str)
+            .ok_or(INVALID_TASK_NAME)?;
+        validate_task_name(task_name)?;
 
-        let duplicate = !self.launch_processor(task_id);
+        let duplicate = !self.launch_processor(task_name, task_id);
         self.schedule_heartbeat().await?;
         Ok(json_response(
             if duplicate {
@@ -200,7 +220,7 @@ impl<S: AlarmStorage, P: ProcessorFetcher> RetainedTaskDispatcher<S, P> {
         ))
     }
 
-    fn launch_processor(&self, task_id: &str) -> bool {
+    fn launch_processor(&self, task_name: &str, task_id: &str) -> bool {
         let mut in_flight = self.in_flight.lock().unwrap();
         if in_flight.contains_key(task_id) {
             return false;
@@ -222,10 +242,15 @@ impl<S: AlarmStorage, P: ProcessorFetcher> RetainedTaskDispatcher<S, P> {
             observed: false,
         };
         let processor = self.processor.clone();
+        let task_name = task_name.to_owned();
         let handle = platform::spawn(async move {
             let result = async {
                 let response = processor
-                    .fetch(processor_request(PROCESSOR_URL, &cleanup.task_id))
+                    .fetch(processor_request(
+                        PROCESSOR_URL,
+                        &task_name,
+                        &cleanup.task_id,
+                    ))
                     .await?;
                 consume_response(response, "processor").await
             }
@@ -281,10 +306,10 @@ impl Drop for AttemptCleanup {
     }
 }
 
-fn processor_request(url: &str, task_id: &str) -> Request<String> {
+fn processor_request(url: &str, task_name: &str, task_id: &str) -> Request<String> {
     Request::post(url)
         .header(CONTENT_TYPE, "application/json")
-        .body(json!({ "taskId": task_id }).to_string())
+        .body(json!({ "taskId": task_id, "taskName": task_name }).to_string())
         .expect("constant dispatch URL and headers are valid")
 }
 

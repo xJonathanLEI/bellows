@@ -49,14 +49,16 @@
 //! 9007199254740991), awaits shutdown, then consumes the complete dispatch response.
 //! Success confirms dispatch acceptance, not processing success. The typed error retains its
 //! stage, cause, optional receipt, and any later close failure. Recover close/dispatch failures
-//! using the retained ID rather than republishing; an unsupported `task-id` receipt needs another
-//! recovery action. No receipt on a publication error does not prove rollback.
+//! using the retained ID and original definition name rather than republishing; a `task-id` receipt
+//! needs another recovery action. No receipt on a publication error does not prove rollback.
 //! Applications own authentication, routing, validation, HTTP responses, and business clients.
 //!
 //! Delegate processor requests to `cloudflare::sdk::PostgresProcessor` with a synchronous
-//! environment-to-config callback and a published task's [`WorkerFactory`]. It validates before
-//! configuration, owns a request-scoped execution backend, and awaits [`run_task_once`], registered
-//! application cleanup, and backend shutdown. HTTP 200 means an attempt ended, not task success.
+//! environment-to-config callback and typed `PostgresProcessorTask` registrations with unique names.
+//! It validates `{ taskId, taskName }` before configuration, rejects unknown names without acquiring
+//! a backend, and awaits [`run_task_once`], registered application cleanup, and backend shutdown.
+//! One request attempts one ID; claims check the persisted name before decoding its typed payload.
+//! HTTP 200 means an attempt ended, not task success.
 //! Applications still own side-effect resources; retain cleanup ownership outside aborted workers.
 //! Direct `PostgresExecutionBackend` plus `run_task_once`, or `PostgresPublishingBackend` plus
 //! `cloudflare::dispatch_task`, remain lower-level integration APIs with caller-owned cleanup.

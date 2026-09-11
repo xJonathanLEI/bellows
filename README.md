@@ -214,7 +214,7 @@ Lower-level Rust receipts retain exact `u64` IDs. TypeScript PostgreSQL receipts
 
 ## Cloudflare Workers (Rust and TypeScript)
 
-Both languages can implement the **producer Worker -> retained Durable Object dispatcher -> service-bound processor Worker** topology. PostgreSQL stores the tasks; the Durable Object only retains outstanding dispatch requests **in memory**. The processor claims a task, executes a Bellows worker using the claimed payload, renews ownership while processing, and awaits failure/completion recording.
+Both languages can implement the **producer Worker -> retained Durable Object dispatcher -> service-bound processor Worker** topology. One processor routes multiple published definitions by name, executing one task ID per request. PostgreSQL stores the tasks; the Durable Object only retains outstanding dispatch requests **in memory**, deduplicated by ID even across different names. The processor claims a task, executes a Bellows worker using the claimed payload, renews ownership while processing, and awaits failure/completion recording.
 
 ### Producer
 
@@ -264,13 +264,13 @@ pub async fn queue_greeting(
 }
 ```
 
-See the [typed TypeScript handler](./bellows-ts/README.md#publisher). Construction performs no I/O. Synchronous configuration runs once per publication, so a delegate can be reused without retaining connections. Each call acquires a fresh listener-free publishing backend, publishes once, retains the ID, validates it, awaits backend shutdown, then awaits the complete `dispatchTask` / `dispatch_task` response from object `global`. Callers must await the operation within the request; it does not extend request lifetime.
+See the [typed TypeScript handler](./bellows-ts/README.md#publisher). Construction performs no I/O. Synchronous configuration runs once per publication, so a delegate can be reused without retaining connections. Each call acquires a fresh listener-free publishing backend, publishes once, retains the ID, validates it, awaits backend shutdown, then awaits the complete `dispatchTask` / `dispatch_task` response from object `global`, supplying the published definition's exact name. Callers must await the operation within the request; it does not extend request lifetime.
 
 Success returns `PostgresPublisherReceipt` (`taskId: string` / `task_id: String`) and confirms **dispatch acceptance, not task completion or business success**. IDs must be canonical positive decimal strings no greater than `9007199254740991`. Callback-bearing definitions support plain publication only, without callback registration; singleton tasks are rejected. Only immediate publication is exposed.
 
 `PostgresPublisherError` retains the first stage and cause, an optional exact receipt, and a separate later backend-close failure. Stages are `configuration`, `acquisition`, `publication`, `task-id`, `backend-close`, and `dispatch`. Top-level messages contain only the stage; underlying causes are available for deliberate inspection, not safe public responses or automatic logging.
 
-- A close or dispatch failure with a receipt means the task was published but acceptance is unconfirmed, not necessarily rejected. Recover through a trusted path using `dispatchTask` / `dispatch_task` with that ID rather than publishing again.
+- A close or dispatch failure with a receipt means the task was published but acceptance is unconfirmed, not necessarily rejected. Receipts remain ID-only: recover through a trusted path using `dispatch_task(namespace, Task::NAME, &receipt.task_id)` or `dispatchTask(namespace, task.name, receipt.taskId)` with the original definition, rather than publishing again.
 - A `task-id` error also retains the exact committed ID, including TypeScript's otherwise unsafe PostgreSQL IDs. That ID is **unsupported by this processor** and needs a different recovery action, not blind redispatch.
 - No receipt on a publication error is an unknown outcome, not proof of rollback. Never automatically republish.
 
@@ -278,9 +278,26 @@ Shutdown is awaited on ordinary error paths after acquisition; dropping/cancelli
 
 ### Processor and deployment
 
-Use `createPostgresProcessor` from the same TypeScript subpath or `bellows::cloudflare::sdk::PostgresProcessor` in Rust. Supply a synchronous environment-to-config callback with the Hyperdrive connection string, optional schema, and your published task's `WorkerFactory`. The delegate owns the `/process` protocol, worker IDs, and a fresh listener-free execution backend for each validated request.
+Use `createPostgresProcessor` from the same TypeScript subpath or `bellows::cloudflare::sdk::PostgresProcessor` in Rust. Supply a synchronous environment-to-config callback with the Hyperdrive connection string, optional schema, and typed task registrations. See the [Rust processor](./bellows/tests/integration/cloudflare/processor/lib.rs) for factory definitions and request-local cleanup:
 
-The delegate awaits the runtime, registered application cleanup, and Bellows backend shutdown before responding, including no-claim and ordinary failure paths. Applications still own their side-effect resources; use separate business connections and register cleanup for work that can outlive the runtime. TypeScript cleanup must drain outstanding business promises after lease loss; Rust cleanup must retain resource ownership outside the aborted worker.
+```rust
+use bellows::cloudflare::sdk::{PostgresProcessorConfig, PostgresProcessorTask};
+
+let config = PostgresProcessorConfig::new(
+    connection_string,
+    options,
+    vec![
+        PostgresProcessorTask::new(greeting_factory),
+        PostgresProcessorTask::new(full_name_factory),
+    ],
+).with_cleanup(cleanup);
+```
+
+See the [TypeScript registration example](./bellows-ts/README.md#processor).
+
+Both dispatch hops require `{ taskId, taskName }`, not a payload. Registrations must be non-empty with unique, non-empty definition names, matched exactly. Claims check both ID and persisted name, preventing decoding with the wrong definition. See the [shared protocol](./bellows-ts/test/integration/cloudflare/README.md#protocol-and-limits) for validation and HTTP responses.
+
+The delegate owns worker IDs and a fresh listener-free execution backend for each selected attempt. It awaits the runtime, registered application cleanup, and Bellows backend shutdown before responding. Cleanup runs once whenever configuration returned, including invalid registries and unknown names; acquired backends always close afterwards, even if cleanup fails. Applications still own their side-effect resources; use separate business connections and register cleanup for work that can outlive the runtime. TypeScript cleanup must drain outstanding business promises after lease loss; Rust cleanup must retain resource ownership outside the aborted worker.
 
 HTTP **200** with `{ taskId, attemptFinished: true }` means an attempt ended, **not that the task succeeded**. It includes no-claim and handled-failure attempts. The adapter adds no automatic retries, durable dispatcher recovery, or protection against abrupt request termination.
 

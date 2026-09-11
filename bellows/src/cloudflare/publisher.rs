@@ -44,7 +44,8 @@ impl fmt::Display for PostgresPublisherStage {
 /// The first lifecycle failure, with causes retained for deliberate inspection.
 ///
 /// A receipt means publication is known; close/dispatch failures can be recovered using that ID
-/// without republishing. A `task-id` receipt is unsupported by the processor, not redispatchable.
+/// and the original definition's name without republishing. A `task-id` receipt is unsupported
+/// by the processor, not redispatchable.
 /// No receipt on a publication failure does not establish rollback. Never retry blindly.
 #[derive(Debug)]
 pub struct PostgresPublisherError {
@@ -149,7 +150,7 @@ pub(super) async fn publish<P: Publisher>(
             return Err(error);
         }
     };
-    dispatch_task(&scope.dispatcher, &receipt.task_id)
+    dispatch_task(&scope.dispatcher, P::Task::NAME, &receipt.task_id)
         .await
         .map_err(|cause| PostgresPublisherError::new(Dispatch, cause, Some(receipt.clone())))?;
     Ok(receipt)

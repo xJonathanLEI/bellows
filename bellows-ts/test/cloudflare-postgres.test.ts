@@ -1,6 +1,11 @@
 import { afterEach, beforeEach, expect, expectTypeOf, test, vi } from "vitest";
 import { PostgresExecutionBackend } from "../src/backends/postgres-execution.js";
-import { createPostgresProcessor } from "../src/cloudflare/postgres.js";
+import {
+  createPostgresProcessor,
+  createPostgresProcessorTask,
+  type PostgresProcessorConfig,
+  type PostgresProcessorTask,
+} from "../src/cloudflare/postgres.js";
 import {
   type ClaimedTask,
   definePublishTask,
@@ -23,11 +28,16 @@ import { Gate } from "./helpers.js";
 const task = definePublishTask<{ name: string }, { greeting: string }>(
   "processor_contract",
 );
+const countTask = definePublishTask<{ count: number }, number[]>(
+  'Count/"\\\n雪🦀',
+);
 const secret = new Error("postgres://user:secret@private/database");
 const canonical = "taskId must be a canonical positive decimal string";
 const safe = "taskId must encode a positive safe integer canonically";
 
 class Execution implements TaskExecutionBackend {
+  persistedName = task.name;
+  persistedPayload = '{"name":"claimed"}';
   claimError: Error | undefined;
   finalizationError: Error | undefined;
   renewalDue = false;
@@ -48,10 +58,11 @@ class Execution implements TaskExecutionBackend {
     taskId: number,
     leaseExpirationMs: number,
   ): Promise<ClaimedTask<TPayload>> {
+    if (definition.name !== this.persistedName) throw new TaskNotFoundError();
     if (this.claimError) throw this.claimError;
     return {
       taskId,
-      taskPayload: definition.codec.decode('{"name":"claimed"}'),
+      taskPayload: definition.codec.decode(this.persistedPayload),
       leaseExpirationMs: this.renewalDue ? Date.now() : leaseExpirationMs,
     };
   }
@@ -105,11 +116,28 @@ function scope() {
     TaskSuccess.done({ greeting: payload.name }),
   );
   const factory = { task, build: vi.fn(() => ({ process })) };
+  const countProcess = vi.fn(async (_id: number, payload: { count: number }) =>
+    TaskSuccess.done([payload.count]),
+  );
+  const countFactory = {
+    task: countTask,
+    build: vi.fn(() => ({ process: countProcess })),
+  };
   const cleanup = vi.fn(async () => {});
-  return { factory, cleanup, process };
+  return {
+    factory,
+    cleanup,
+    process,
+    countFactory,
+    countProcess,
+    tasks: [
+      createPostgresProcessorTask(factory),
+      createPostgresProcessorTask(countFactory),
+    ],
+  };
 }
 
-function fixture() {
+function fixture(single = false) {
   const backend = new Execution();
   const connect = vi
     .spyOn(PostgresExecutionBackend, "connect")
@@ -119,6 +147,7 @@ function fixture() {
     connectionString: env.url,
     schema: env.schema,
     ...application,
+    tasks: single ? application.tasks.slice(0, 1) : application.tasks,
   }));
   return {
     backend,
@@ -129,7 +158,9 @@ function fixture() {
   };
 }
 
-function request(body: unknown = { taskId: "17" }): Request {
+function request(
+  body: unknown = { taskId: "17", taskName: task.name },
+): Request {
   return new Request("https://processor/process", {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -168,7 +199,7 @@ test("application cleanup is optional", async () => {
   const f = fixture();
   const processor = createPostgresProcessor((env: Env) => ({
     connectionString: env.url,
-    factory: f.factory,
+    tasks: [createPostgresProcessorTask(f.factory)],
   }));
   await envelope(await processor.fetch(request(), env), 200, {
     taskId: "17",
@@ -313,9 +344,13 @@ test.each([
 ])("rejects unsafe ID %s", async (taskId) => {
   const f = fixture();
   const rng = random();
-  await envelope(await f.processor.fetch(request({ taskId }), env), 400, {
-    error: safe,
-  });
+  await envelope(
+    await f.processor.fetch(request({ taskName: task.name, taskId }), env),
+    400,
+    {
+      error: safe,
+    },
+  );
   expect(f.configure).not.toHaveBeenCalled();
   expect(rng).not.toHaveBeenCalled();
   expect(f.connect).not.toHaveBeenCalled();
@@ -332,7 +367,11 @@ test.each([
     [0, 0, 0, 0, 0, 0],
     [255, 255, 255, 255, 255, 255],
   ]);
-  const input = request({ taskId, payload: { name: "untrusted" } });
+  const input = request({
+    taskName: task.name,
+    taskId,
+    payload: { name: "untrusted" },
+  });
   input.headers.set("content-type", "Application/JSON; charset=utf-8");
   const { fetch } = f.processor;
   await envelope(await fetch(input, env), 200, {
@@ -369,48 +408,317 @@ test.each([
   expect(console.error).not.toHaveBeenCalled();
 });
 
+test.each([
+  undefined,
+  "",
+  null,
+  17,
+  [],
+  {},
+  false,
+])("rejects task name %j before configuration even with one registration", async (taskName) => {
+  const f = fixture(true);
+  const rng = random();
+  await envelope(
+    await f.processor.fetch(request({ taskId: "17", taskName }), env),
+    400,
+    { error: "taskName must be a non-empty string" },
+  );
+  expect(f.configure).not.toHaveBeenCalled();
+  expect(rng).not.toHaveBeenCalled();
+  expect(f.connect).not.toHaveBeenCalled();
+  expect(f.factory.build).not.toHaveBeenCalled();
+  expect(f.countFactory.build).not.toHaveBeenCalled();
+  expect(f.cleanup).not.toHaveBeenCalled();
+  expect(console.error).not.toHaveBeenCalled();
+});
+
+test.each([
+  "empty",
+  "empty-name",
+  "duplicate",
+  "unrelated-duplicate",
+  "duplicate-unknown",
+  "unknown",
+  "PROCESSOR_CONTRACT",
+  " processor_contract ",
+  "__proto__",
+  "constructor",
+])("cleans up registry resolution %s without acquisition", async (kind) => {
+  for (const cleanupFails of [false, true]) {
+    vi.mocked(console.error).mockClear();
+    const f = fixture();
+    const rng = random();
+    const first = createPostgresProcessorTask(f.factory);
+    const second = createPostgresProcessorTask(f.countFactory);
+    const invalid = [
+      "empty",
+      "empty-name",
+      "duplicate",
+      "unrelated-duplicate",
+      "duplicate-unknown",
+    ].includes(kind);
+    let tasks = [first, second];
+    if (kind === "empty") tasks = [];
+    if (kind === "empty-name") {
+      tasks = [
+        first,
+        createPostgresProcessorTask({
+          ...f.countFactory,
+          task: { ...countTask, name: "" },
+        }),
+      ];
+    }
+    if (kind === "duplicate") tasks = [first, first];
+    if (kind === "unrelated-duplicate" || kind === "duplicate-unknown") {
+      tasks = [first, second, second];
+    }
+    const configure = vi.fn(() => ({
+      connectionString: env.url,
+      tasks,
+      cleanup: f.cleanup,
+    }));
+    if (cleanupFails) f.cleanup.mockRejectedValue(secret);
+    const name = invalid && kind !== "duplicate-unknown" ? task.name : kind;
+    const failed = invalid || cleanupFails;
+    await envelope(
+      await createPostgresProcessor(configure).fetch(
+        request({ taskId: "17", taskName: name }),
+        env,
+      ),
+      failed ? 500 : 404,
+      {
+        error: failed ? "task processing attempt failed" : "unknown task name",
+      },
+    );
+    expect(configure).toHaveBeenCalledTimes(1);
+    expect(rng).not.toHaveBeenCalled();
+    expect(f.connect).not.toHaveBeenCalled();
+    expect(f.factory.build).not.toHaveBeenCalled();
+    expect(f.countFactory.build).not.toHaveBeenCalled();
+    expect(f.backend.claimPublished).not.toHaveBeenCalled();
+    expect(f.cleanup).toHaveBeenCalledTimes(1);
+    expect(f.backend.close).not.toHaveBeenCalled();
+    expect(vi.mocked(console.error).mock.calls).toEqual([
+      ...(invalid ? [["task processing attempt failed 17 configuration"]] : []),
+      ...(cleanupFails
+        ? [["task processing attempt failed 17 application-cleanup"]]
+        : []),
+    ]);
+  }
+});
+
+test.each([
+  "greeting",
+  "count",
+])("routes %s using its own codec, claimed payload and callback", async (kind) => {
+  const f = fixture();
+  random();
+  const count = kind === "count";
+  const definition = count ? countTask : task;
+  const claimed = count ? { count: 42 } : { name: "claimed" };
+  f.backend.persistedName = definition.name;
+  f.backend.persistedPayload = JSON.stringify(claimed);
+  const decode = vi.spyOn(definition.codec, "decode");
+  const otherDecode = vi.spyOn((count ? task : countTask).codec, "decode");
+  await envelope(
+    await f.processor.fetch(
+      request({
+        taskId: "17",
+        taskName: definition.name,
+        payload: { name: "untrusted", count: 99 },
+      }),
+      env,
+    ),
+    200,
+    { taskId: "17", attemptFinished: true },
+  );
+  expect(f.backend.claimPublished).toHaveBeenCalledExactlyOnceWith(
+    definition,
+    23,
+    17,
+    Date.now() + 20_000,
+  );
+  expect(decode).toHaveBeenCalledExactlyOnceWith(JSON.stringify(claimed));
+  expect(otherDecode).not.toHaveBeenCalled();
+  expect(
+    (count ? f.countFactory : f.factory).build,
+  ).toHaveBeenCalledExactlyOnceWith(23);
+  expect((count ? f.factory : f.countFactory).build).not.toHaveBeenCalled();
+  expect(count ? f.countProcess : f.process).toHaveBeenCalledExactlyOnceWith(
+    17,
+    claimed,
+  );
+  expect(count ? f.process : f.countProcess).not.toHaveBeenCalled();
+  expect(f.backend.finish).toHaveBeenCalledExactlyOnceWith(
+    definition,
+    23,
+    17,
+    count ? [42] : { greeting: "claimed" },
+    null,
+  );
+  expect(f.cleanup).toHaveBeenCalledTimes(1);
+  expect(f.backend.close).toHaveBeenCalledTimes(1);
+  expect(console.error).not.toHaveBeenCalled();
+});
+
+test.each([
+  false,
+  true,
+])("awaits cleanup before a registry rejection (invalid=%s)", async (invalid) => {
+  const f = fixture();
+  const rng = random();
+  const started = new Gate();
+  const cleaning = new Gate();
+  f.cleanup.mockImplementation(async () => {
+    started.release();
+    await cleaning.wait();
+  });
+  const task = createPostgresProcessorTask(f.factory);
+  const processor = createPostgresProcessor(() => ({
+    connectionString: env.url,
+    tasks: invalid ? [task, task] : [task],
+    cleanup: f.cleanup,
+  }));
+  const response = processor.fetch(
+    request({ taskId: "17", taskName: "unknown" }),
+    env,
+  );
+  const stillPending = pending(response);
+  await started.wait();
+  stillPending();
+  expect(rng).not.toHaveBeenCalled();
+  expect(f.connect).not.toHaveBeenCalled();
+  cleaning.release();
+  await envelope(await response, invalid ? 500 : 404, {
+    error: invalid ? "task processing attempt failed" : "unknown task name",
+  });
+  expect(f.cleanup).toHaveBeenCalledTimes(1);
+  expect(f.backend.close).not.toHaveBeenCalled();
+});
+
+test("a persisted-name mismatch cannot decode or build either worker", async () => {
+  const f = fixture();
+  random();
+  f.backend.persistedName = countTask.name;
+  f.backend.persistedPayload = '{"count":42}';
+  const decode = vi.spyOn(task.codec, "decode");
+  const otherDecode = vi.spyOn(countTask.codec, "decode");
+  await envelope(await f.processor.fetch(request(), env), 200, {
+    taskId: "17",
+    attemptFinished: true,
+  });
+  expect(f.backend.claimPublished).toHaveBeenCalledExactlyOnceWith(
+    task,
+    23,
+    17,
+    Date.now() + 20_000,
+  );
+  expect(decode).not.toHaveBeenCalled();
+  expect(otherDecode).not.toHaveBeenCalled();
+  expect(f.factory.build).not.toHaveBeenCalled();
+  expect(f.countFactory.build).not.toHaveBeenCalled();
+  expect(f.backend.finish).not.toHaveBeenCalled();
+  expect(f.backend.fail).not.toHaveBeenCalled();
+  expect(f.cleanup).toHaveBeenCalledTimes(1);
+  expect(f.backend.close).toHaveBeenCalledTimes(1);
+  expect(console.error).not.toHaveBeenCalled();
+});
+
+test.each([
+  "__proto__",
+  "constructor",
+  " ",
+  "雪".repeat(300),
+])("matches the exact registered name %s safely", async (name) => {
+  const f = fixture();
+  random();
+  const definition = { ...task, name };
+  f.backend.persistedName = name;
+  const processor = createPostgresProcessor(() => ({
+    connectionString: env.url,
+    tasks: [createPostgresProcessorTask({ ...f.factory, task: definition })],
+    cleanup: f.cleanup,
+  }));
+  await envelope(
+    await processor.fetch(request({ taskId: "17", taskName: name }), env),
+    200,
+    { taskId: "17", attemptFinished: true },
+  );
+  expect(f.factory.build).toHaveBeenCalledExactlyOnceWith(23);
+  expect(f.backend.claimPublished).toHaveBeenCalledExactlyOnceWith(
+    definition,
+    23,
+    17,
+    Date.now() + 20_000,
+  );
+  expect(f.cleanup).toHaveBeenCalledTimes(1);
+  expect(f.backend.close).toHaveBeenCalledTimes(1);
+  expect(console.error).not.toHaveBeenCalled();
+});
+
 test("annotated environments infer task payload and callback types", () => {
   const factory: WorkerFactory<typeof task> = scope().factory;
+  const countFactory: WorkerFactory<typeof countTask> = scope().countFactory;
+  const tasks = [
+    createPostgresProcessorTask(factory),
+    createPostgresProcessorTask(countFactory),
+  ] as const satisfies readonly PostgresProcessorTask[];
   const processor = createPostgresProcessor((env: Env) => ({
     connectionString: env.url,
-    factory,
+    tasks,
   }));
   expectTypeOf(processor.fetch).parameters.toEqualTypeOf<[Request, Env]>();
   expectTypeOf(factory.build(1).process).returns.resolves.toEqualTypeOf<
     TaskResult<{ greeting: string }>
   >();
+  expectTypeOf(countFactory.build(1).process).returns.resolves.toEqualTypeOf<
+    TaskResult<number[]>
+  >();
   createPostgresProcessor((env: Env) => ({
     connectionString: env.url,
-    factory: {
-      task,
-      build() {
-        return {
+    tasks: [
+      createPostgresProcessorTask({
+        task,
+        build() {
+          return {
+            async process(id, payload) {
+              expectTypeOf(id).toEqualTypeOf<number>();
+              expectTypeOf(payload).toEqualTypeOf<{ name: string }>();
+              return TaskSuccess.done({ greeting: payload.name });
+            },
+          };
+        },
+      }),
+      createPostgresProcessorTask({
+        task: countTask,
+        build: () => ({
           async process(id, payload) {
             expectTypeOf(id).toEqualTypeOf<number>();
-            expectTypeOf(payload).toEqualTypeOf<{ name: string }>();
-            return TaskSuccess.done({ greeting: payload.name });
+            expectTypeOf(payload).toEqualTypeOf<{ count: number }>();
+            return TaskSuccess.done([payload.count]);
           },
-        };
-      },
-    },
+        }),
+      }),
+    ],
   }));
   const singleton = { task: defineSingletonTask("singleton"), build: vi.fn() };
   // @ts-expect-error A wire ID must never be interpreted as singleton activation.
-  createPostgresProcessor((env: Env) => ({
+  createPostgresProcessorTask(singleton);
+  createPostgresProcessorTask({
+    task,
+    build: () => ({
+      // @ts-expect-error The worker payload must match the task definition.
+      process: async (_id: number, _payload: { wrong: boolean }) =>
+        TaskSuccess.done({ greeting: "done" }),
+    }),
+  });
+  const oldConfig: PostgresProcessorConfig = {
     connectionString: env.url,
-    factory: singleton,
-  }));
-  // @ts-expect-error The worker payload must match the task definition.
-  createPostgresProcessor((env: Env) => ({
-    connectionString: env.url,
-    factory: {
-      task,
-      build: () => ({
-        process: async (_id: number, _payload: { wrong: boolean }) =>
-          TaskSuccess.done({ greeting: "done" }),
-      }),
-    },
-  }));
+    // @ts-expect-error Single-factory configuration is not supported.
+    factory,
+  };
+  expect(oldConfig).toBeDefined();
 });
 
 test.each([
@@ -464,7 +772,7 @@ test.each([
   });
   const response = createPostgresProcessor((env: Env) => ({
     connectionString: env.url,
-    factory,
+    tasks: [createPostgresProcessorTask(factory)],
     cleanup,
   })).fetch(request(), env);
   const stillPending = pending(response);
@@ -509,7 +817,7 @@ test.each([
   await envelope(
     await createPostgresProcessor((env: Env) => ({
       connectionString: env.url,
-      factory,
+      tasks: [createPostgresProcessorTask(factory)],
       cleanup: f.cleanup,
     })).fetch(request(), env),
     200,
@@ -575,6 +883,8 @@ test("reports every failure without skipping shutdown", async () => {
 
 test("fresh concurrent scopes and backends do not share cleanup", async () => {
   const backends = [new Execution(), new Execution()];
+  backends[1].persistedName = countTask.name;
+  backends[1].persistedPayload = '{"count":42}';
   const scopes = [scope(), scope()];
   const gates = [new Gate(), new Gate()];
   for (const [i, backend] of backends.entries()) backend.closeGate = gates[i];
@@ -594,7 +904,10 @@ test("fresh concurrent scopes and backends do not share cleanup", async () => {
     [0, 0, 0, 0, 0, 2],
   ]);
   const first = processor.fetch(request(), { url: "first" });
-  const second = processor.fetch(request({ taskId: "18" }), { url: "second" });
+  const second = processor.fetch(
+    request({ taskName: countTask.name, taskId: "18" }),
+    { url: "second" },
+  );
   const firstPending = pending(first);
   const secondPending = pending(second);
   await Promise.all(backends.map((backend) => backend.closing.wait()));
@@ -611,7 +924,18 @@ test("fresh concurrent scopes and backends do not share cleanup", async () => {
     ["second", { schema: undefined }],
   ]);
   for (const [i, application] of scopes.entries()) {
-    expect(application.factory.build).toHaveBeenCalledExactlyOnceWith(i + 1);
+    expect(
+      (i === 0 ? application.factory : application.countFactory).build,
+    ).toHaveBeenCalledExactlyOnceWith(i + 1);
+    expect(
+      (i === 0 ? application.countFactory : application.factory).build,
+    ).not.toHaveBeenCalled();
+    expect(backends[i].claimPublished).toHaveBeenCalledExactlyOnceWith(
+      i === 0 ? task : countTask,
+      i + 1,
+      17 + i,
+      Date.now() + 20_000,
+    );
     expect(application.cleanup).toHaveBeenCalledTimes(1);
     expect(backends[i].close).toHaveBeenCalledTimes(1);
   }
@@ -631,23 +955,25 @@ test("renewal loss does not cancel business work; registered cleanup drains it",
   });
   const processor = createPostgresProcessor((env: Env) => ({
     connectionString: env.url,
-    factory: {
-      task,
-      build: () => ({
-        process: () => {
-          operation = (async () => {
-            started.release();
-            try {
-              await businessGate.wait();
-              return TaskSuccess.done({ greeting: "drained" });
-            } finally {
-              businessFinished = true;
-            }
-          })();
-          return operation;
-        },
+    tasks: [
+      createPostgresProcessorTask({
+        task,
+        build: () => ({
+          process: () => {
+            operation = (async () => {
+              started.release();
+              try {
+                await businessGate.wait();
+                return TaskSuccess.done({ greeting: "drained" });
+              } finally {
+                businessFinished = true;
+              }
+            })();
+            return operation;
+          },
+        }),
       }),
-    },
+    ],
     cleanup,
   }));
   const response = processor.fetch(request(), env);

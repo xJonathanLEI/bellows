@@ -8,25 +8,23 @@ mod task;
 use bellows::{
     TaskFailure, TaskResult, TaskSuccess, Worker, WorkerFactory,
     backends::postgres_execution::PostgresBackendOptions,
-    cloudflare::sdk::{PostgresProcessor, PostgresProcessorConfig},
+    cloudflare::sdk::{PostgresProcessor, PostgresProcessorConfig, PostgresProcessorTask},
 };
 use std::sync::Arc;
-use task::{GreetingPayload, GreetingTask};
+use task::{FullNamePayload, FullNameTask, GreetingPayload, GreetingTask};
 use tokio::sync::Mutex;
 use tokio_postgres::types::Type;
 use worker::*;
 
-struct GreetingWorker {
+#[derive(Clone)]
+struct SideEffect {
     hyperdrive_url: String,
     schema: String,
     side_effect: Arc<Mutex<Option<db::Connection>>>,
 }
 
-impl Worker for GreetingWorker {
-    type Task = GreetingTask;
-
-    #[worker::send]
-    async fn process(self, task_id: u64, payload: GreetingPayload) -> TaskResult<()> {
+impl SideEffect {
+    async fn record(&self, task_id: u64, name: String) -> TaskResult<()> {
         let result = async {
             // Only a successful claim opens this separate business connection.
             let mut side_effect = self.side_effect.lock().await;
@@ -41,7 +39,7 @@ impl Worker for GreetingWorker {
                     SET name = EXCLUDED.name, execution_count = processed.execution_count + 1"#,
                     self.schema
                 ),
-                &[(&task_id, Type::INT8), (&payload.name, Type::TEXT)],
+                &[(&task_id, Type::INT8), (&name, Type::TEXT)],
             ).await.map_err(|_| "side effect failed");
             let closed = connection.close().await;
             effect?;
@@ -53,21 +51,50 @@ impl Worker for GreetingWorker {
     }
 }
 
-struct GreetingFactory {
-    hyperdrive_url: String,
-    schema: String,
-    side_effect: Arc<Mutex<Option<db::Connection>>>,
+struct GreetingWorker(SideEffect);
+
+impl Worker for GreetingWorker {
+    type Task = GreetingTask;
+
+    #[worker::send]
+    async fn process(self, task_id: u64, payload: GreetingPayload) -> TaskResult<()> {
+        self.0.record(task_id, payload.name).await
+    }
 }
+
+struct GreetingFactory(SideEffect);
 
 impl WorkerFactory for GreetingFactory {
     type Worker = GreetingWorker;
 
     fn build(&self, _worker_id: u64) -> Self::Worker {
-        GreetingWorker {
-            hyperdrive_url: self.hyperdrive_url.clone(),
-            schema: self.schema.clone(),
-            side_effect: self.side_effect.clone(),
-        }
+        GreetingWorker(self.0.clone())
+    }
+}
+
+struct FullNameWorker(SideEffect);
+
+impl Worker for FullNameWorker {
+    type Task = FullNameTask;
+
+    #[worker::send]
+    async fn process(self, task_id: u64, payload: FullNamePayload) -> TaskResult<()> {
+        self.0
+            .record(
+                task_id,
+                format!("{} {}", payload.first_name, payload.last_name),
+            )
+            .await
+    }
+}
+
+struct FullNameFactory(SideEffect);
+
+impl WorkerFactory for FullNameFactory {
+    type Worker = FullNameWorker;
+
+    fn build(&self, _worker_id: u64) -> Self::Worker {
+        FullNameWorker(self.0.clone())
     }
 }
 
@@ -77,16 +104,20 @@ pub async fn fetch(request: Request, env: Env, _ctx: Context) -> Result<Response
         let url = env.hyperdrive("HYPERDRIVE")?.connection_string();
         let schema = env.var("BELLOWS_SCHEMA")?.to_string();
         let side_effect = Arc::new(Mutex::new(None));
+        let effect = SideEffect {
+            hyperdrive_url: url.clone(),
+            schema: schema.clone(),
+            side_effect: side_effect.clone(),
+        };
         Ok(PostgresProcessorConfig::new(
-            url.clone(),
+            url,
             PostgresBackendOptions {
-                schema: Some(schema.clone()),
+                schema: Some(schema),
             },
-            GreetingFactory {
-                hyperdrive_url: url,
-                schema,
-                side_effect: side_effect.clone(),
-            },
+            vec![
+                PostgresProcessorTask::new(GreetingFactory(effect.clone())),
+                PostgresProcessorTask::new(FullNameFactory(effect)),
+            ],
         )
         .with_cleanup(async move {
             // Retain the driver outside the worker so cleanup survives lease-loss aborts.

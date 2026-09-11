@@ -28,6 +28,7 @@ export interface AlarmStorage {
 
 interface DispatchRequest {
   readonly taskId?: unknown;
+  readonly taskName?: unknown;
 }
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -67,7 +68,16 @@ function parseTaskId(value: unknown): string {
   return value;
 }
 
-async function parseDispatchRequest(request: Request): Promise<string> {
+function parseTaskName(value: unknown): string {
+  if (typeof value !== "string" || value.length === 0) {
+    throw new Error("taskName must be a non-empty string");
+  }
+  return value;
+}
+
+async function parseDispatchRequest(
+  request: Request,
+): Promise<{ taskId: string; taskName: string }> {
   const contentType = request.headers.get("content-type") ?? "";
   if (!contentType.toLowerCase().includes("application/json")) {
     throw new Error("request content-type must be application/json");
@@ -78,25 +88,31 @@ async function parseDispatchRequest(request: Request): Promise<string> {
     throw new Error("request body must be a JSON object");
   }
 
-  return parseTaskId(body.taskId);
+  return {
+    taskId: parseTaskId(body.taskId),
+    taskName: parseTaskName(body.taskName),
+  };
 }
 
 async function consumeResponse(response: Response): Promise<string> {
   return await response.text();
 }
 
+/** Dispatches the definition's exact name and opaque ID, consuming the full response. */
 export async function dispatchTask(
   namespace: DurableObjectNamespaceLike,
+  taskName: string,
   taskId: string,
 ): Promise<void> {
   const validTaskId = parseTaskId(taskId);
+  const validTaskName = parseTaskName(taskName);
   const dispatcher = namespace.getByName(DISPATCHER_NAME);
   const response = await dispatcher.fetch(DISPATCH_PATH, {
     method: "POST",
     headers: {
       "content-type": "application/json",
     },
-    body: JSON.stringify({ taskId: validTaskId }),
+    body: JSON.stringify({ taskId: validTaskId, taskName: validTaskName }),
   });
   const responseBody = await consumeResponse(response);
 
@@ -115,13 +131,13 @@ export class RetainedTaskDispatcher {
     private readonly processor: ProcessorFetcher,
   ) {}
 
-  private async runProcessor(taskId: string): Promise<void> {
+  private async runProcessor(taskName: string, taskId: string): Promise<void> {
     const response = await this.processor.fetch(PROCESSOR_PATH, {
       method: "POST",
       headers: {
         "content-type": "application/json",
       },
-      body: JSON.stringify({ taskId }),
+      body: JSON.stringify({ taskId, taskName }),
     });
     const responseBody = await consumeResponse(response);
 
@@ -132,13 +148,13 @@ export class RetainedTaskDispatcher {
     }
   }
 
-  private launchProcessor(taskId: string): void {
+  private launchProcessor(taskName: string, taskId: string): void {
     if (this.inFlight.has(taskId)) {
       return;
     }
 
     let retainedRuntime!: Promise<void>;
-    retainedRuntime = this.runProcessor(taskId)
+    retainedRuntime = this.runProcessor(taskName, taskId)
       .catch((error: unknown) => {
         console.error("task processor failed", taskId, errorMessage(error));
       })
@@ -165,14 +181,14 @@ export class RetainedTaskDispatcher {
   }
 
   private async dispatch(request: Request): Promise<Response> {
-    const taskId = await parseDispatchRequest(request);
+    const { taskId, taskName } = await parseDispatchRequest(request);
 
     if (this.inFlight.has(taskId)) {
       await this.scheduleHeartbeat();
       return jsonResponse({ duplicate: true, ok: true, taskId });
     }
 
-    this.launchProcessor(taskId);
+    this.launchProcessor(taskName, taskId);
     await this.scheduleHeartbeat();
 
     return jsonResponse({ ok: true, taskId });

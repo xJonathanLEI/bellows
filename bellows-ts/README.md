@@ -140,13 +140,13 @@ export async function queueGreeting(
 
 The annotated synchronous callback infers environment and payload types and runs once per publication, not at construction. The delegate can be reused; connections, receipts, and failures are local to each call. `publish` also works detached from the returned object. Its only operation is immediate publication; callback-bearing definitions publish without callback registration or an awaitable result, and singleton definitions are rejected.
 
-Bellows acquires a fresh listener-free `PostgresPublishingBackend`, publishes exactly once, retains the string ID, validates it, awaits `close()`, then calls `dispatchTask` for object `global`. Success waits for complete response-body consumption and returns readonly `PostgresPublisherReceipt.taskId: string`. It confirms **dispatch acceptance, not processing or business success**.
+Bellows acquires a fresh listener-free `PostgresPublishingBackend`, publishes exactly once, retains the string ID, validates it, awaits `close()`, then calls `dispatchTask` for object `global` with the published definition's exact name. Success waits for complete response-body consumption and returns readonly `PostgresPublisherReceipt.taskId: string`. It confirms **dispatch acceptance, not processing or business success**.
 
 Both PostgreSQL processors require canonical positive decimal IDs up to `9007199254740991`. Lower-level TypeScript PostgreSQL receipts remain `{ taskId: number }` for exact safe integers. Their `PostgresPublishedTaskIdError` preserves an unsupported committed ID as a string; the adapter turns it into a `task-id` failure without rounding or deleting the row. Rust's lower-level receipts remain exact `u64` values.
 
 `PostgresPublisherError` exposes `stage`, `cause`, optional `receipt`, and optional `backendCloseError: { cause: unknown }`. Stages are `configuration`, `acquisition`, `publication`, `task-id`, `backend-close`, and `dispatch`. The first failure stays primary even if closing later fails; arbitrary thrown values, including `undefined`, remain failures. A connection failure on the first pool query can be a `publication` failure; stages identify adapter operations rather than driver network categories.
 
-- A close or dispatch error with a receipt means publication is known but acceptance is unconfirmed, not necessarily rejected. Explicitly call `dispatchTask(env.DISPATCHER, error.receipt.taskId)` through a trusted recovery path instead of republishing.
+- A close or dispatch error with a receipt means publication is known but acceptance is unconfirmed, not necessarily rejected. Receipts remain ID-only: explicitly call `dispatchTask(env.DISPATCHER, greetingTask.name, error.receipt.taskId)` with the original published definition through a trusted recovery path instead of republishing.
 - A `task-id` receipt is exact but **not supported by the current processor**. It requires another recovery action, not ordinary redispatch.
 - A publication error without a receipt does not prove rollback. Do not automatically retry publication.
 
@@ -156,11 +156,14 @@ Publication and dispatch are not atomic. There is no outbox, durable recovery, a
 
 #### Processor
 
-Default-export `createPostgresProcessor` for one published task and explicit IDs. The annotated environment infers the factory's payload and callback types.
+Default-export `createPostgresProcessor` with typed task registrations to route multiple published definitions through one Worker. The annotated configuration callback infers the environment.
 
 ```ts
 import { definePublishTask, TaskSuccess } from "@xjonathanlei/bellows";
-import { createPostgresProcessor } from "@xjonathanlei/bellows/cloudflare/postgres";
+import {
+  createPostgresProcessor,
+  createPostgresProcessorTask,
+} from "@xjonathanlei/bellows/cloudflare/postgres";
 
 interface Env {
   HYPERDRIVE: { connectionString: string };
@@ -168,33 +171,47 @@ interface Env {
 }
 
 const greetingTask = definePublishTask<{ name: string }>("cloudflare_greeting");
+const fullNameTask = definePublishTask<{ firstName: string; lastName: string }>(
+  "cloudflare_full_name",
+);
 
 export default createPostgresProcessor((env: Env) => ({
   connectionString: env.HYPERDRIVE.connectionString,
   schema: env.BELLOWS_SCHEMA,
-  factory: {
-    task: greetingTask,
-    build() {
-      return {
+  tasks: [
+    createPostgresProcessorTask({
+      task: greetingTask,
+      build: () => ({
         async process(taskId, payload) {
           console.log(taskId, payload.name);
           return TaskSuccess.done(undefined);
         },
-      };
-    },
-  },
+      }),
+    }),
+    createPostgresProcessorTask({
+      task: fullNameTask,
+      build: () => ({
+        async process(taskId, payload) {
+          console.log(taskId, `${payload.firstName} ${payload.lastName}`);
+          return TaskSuccess.done(undefined);
+        },
+      }),
+    }),
+  ],
 }));
 ```
 
-Configuration is synchronous and runs once per validated request, not at construction. Bellows generates the worker ID, acquires a fresh listener-free backend, and claims the task before building your worker. Only the database's claimed payload reaches `process`. An existing router can instead retain the delegate and return `processor.fetch(request, env)`; `fetch` does not depend on `this`.
+Both dispatch hops require `{ taskId, taskName }`, not a payload. Registrations must be non-empty with unique, non-empty definition names, matched exactly. See the [shared protocol](./test/integration/cloudflare/README.md#protocol-and-limits) for validation and HTTP responses.
 
-The response waits for the runtime, optional `cleanup: () => Promise<void>`, and backend shutdown, even if application cleanup fails. Cleanup runs once whenever configuration returned, including acquisition failure and no claim. Applications still own arbitrary side-effect resources. Keep business connections separate and drain any tracked business promise in cleanup: lease loss does **not** cancel a pending TypeScript promise. The [SQL processor](./test/integration/cloudflare/workers/processor.ts) demonstrates this with a request-scoped operation and an awaited `pg.Client` shutdown.
+Configuration is synchronous and runs once per validated request, not at construction. Bellows generates the worker ID, acquires a fresh listener-free backend, and claims by **ID and persisted definition name** before building your worker. Only the database's claimed payload reaches `process`. An existing router can instead retain the delegate and return `processor.fetch(request, env)`; `fetch` does not depend on `this`.
 
-HTTP **200** with `{ taskId, attemptFinished: true }` means an attempt ended, including no claim or handled failure, not business success. The adapter adds no retries or protection against abrupt request termination. PostgreSQL stores tasks; the retained Durable Object map is only in-memory dispatch state, not durable recovery. Its 30-second heartbeat is not lease renewal, retry, or eviction recovery. This topology does not provide daemon-equivalent discovery or exactly-once side effects.
+The response waits for the runtime, optional `cleanup: () => Promise<void>`, and backend shutdown, even if application cleanup fails. Cleanup runs once whenever configuration returned, including invalid registries, unknown names, acquisition failure, and no claim. Applications still own arbitrary side-effect resources. Keep business connections separate and drain any tracked business promise in cleanup: lease loss does **not** cancel a pending TypeScript promise. The [SQL processor](./test/integration/cloudflare/workers/processor.ts) demonstrates this with a request-scoped operation and an awaited `pg.Client` shutdown.
+
+HTTP **200** with `{ taskId, attemptFinished: true }` means an attempt ended, including no claim or handled failure, not business success. The adapter adds no retries or protection against abrupt request termination. PostgreSQL stores tasks; the retained Durable Object map is only in-memory dispatch state, deduplicated by ID even across different names, not durable recovery. Its 30-second heartbeat is not lease renewal, retry, or eviction recovery. This topology does not provide daemon-equivalent discovery or exactly-once side effects.
 
 Keep the processor private, initialize schemas separately through an administrative connection, and use the Hyperdrive connection string with query caching disabled and verified origin TLS. TypeScript requires `nodejs_compat` for `pg`; Rust must omit it. Do not construct the listening `PostgresBackend` in a Worker. Direct `PostgresExecutionBackend` from `@xjonathanlei/bellows/backends/postgres-execution` with `runTaskOnce()` remains the lower-level option for custom integrations, which must await their own backend shutdown. Generic root/`cloudflare` imports do not load PostgreSQL or Node modules; the PostgreSQL subpath retains its `pg` compatibility requirements without loading the full listening backend or Bellows's Node randomness module.
 
-The [TypeScript Cloudflare–Postgres guide](./test/integration/cloudflare/README.md) exercises publication, claims, side effects, and completion. `pnpm --dir bellows-ts test:cloudflare` runs **16 cases** without Rust tools: ten topology scenarios, four direct publishing-backend contracts, and two publisher-adapter contracts. They also run in the package's normal tests. The independent [Rust harness](../bellows/tests/integration/cloudflare/README.md) owns **31 cases**, while the [interop suite](../interop-tests/cloudflare/README.md) owns **20** across both mixed directions. Root `pnpm test` runs all **67 Cloudflare cases** once.
+The [TypeScript Cloudflare–Postgres guide](./test/integration/cloudflare/README.md) exercises heterogeneous publication, routing, claims, side effects, and completion. `pnpm --dir bellows-ts test:cloudflare` runs **19 cases** without Rust tools: thirteen topology scenarios, four direct publishing-backend contracts, and two publisher-adapter contracts. They also run in the package's normal tests. The independent [Rust harness](../bellows/tests/integration/cloudflare/README.md) owns **34 cases**, while the [interop suite](../interop-tests/cloudflare/README.md) owns **26** across both mixed directions. Root `pnpm test` runs all **79 Cloudflare cases** once.
 
 ## Tasks
 

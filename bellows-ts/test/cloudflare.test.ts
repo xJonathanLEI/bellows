@@ -102,13 +102,13 @@ class RecordingNamespace implements DurableObjectNamespaceLike {
   }
 }
 
-function dispatchRequest(taskId: string): Request {
+function dispatchRequest(taskId: string, taskName = "contract"): Request {
   return new Request("https://dispatcher/dispatch", {
     method: "POST",
     headers: {
       "content-type": "application/json",
     },
-    body: JSON.stringify({ taskId }),
+    body: JSON.stringify({ taskId, taskName }),
   });
 }
 
@@ -198,7 +198,7 @@ test("dispatchTask targets the global object and consumes the response", async (
   const control = controlledResponse();
   namespace.stub.response = control.response;
   let accepted = false;
-  const dispatch = dispatchTask(namespace, "123").then(() => {
+  const dispatch = dispatchTask(namespace, "contract", "123").then(() => {
     accepted = true;
   });
   await waitFor(() => control.response.bodyUsed);
@@ -215,7 +215,10 @@ test("dispatchTask targets the global object and consumes the response", async (
   expect(namespace.stub.requests[0]?.headers.get("content-type")).toBe(
     "application/json",
   );
-  expect(await namespace.stub.requests[0]?.json()).toEqual({ taskId: "123" });
+  expect(await namespace.stub.requests[0]?.json()).toEqual({
+    taskId: "123",
+    taskName: "contract",
+  });
   expect(namespace.stub.response.bodyUsed).toBe(true);
 });
 
@@ -224,10 +227,12 @@ test("dispatchTask consumes an error response before rejecting", async () => {
   const control = controlledResponse(503);
   namespace.stub.response = control.response;
   let ended = false;
-  const dispatch = dispatchTask(namespace, "123").catch((error: unknown) => {
-    ended = true;
-    return error;
-  });
+  const dispatch = dispatchTask(namespace, "contract", "123").catch(
+    (error: unknown) => {
+      ended = true;
+      return error;
+    },
+  );
   await waitFor(() => control.response.bodyUsed);
   expect(ended).toBe(false);
   control.finish("dispatcher unavailable");
@@ -258,9 +263,10 @@ test("retained dispatch accepts before processor completion and observes its res
   );
   expect(await processor.calls[0]?.request.json()).toEqual({
     taskId: "task-1",
+    taskName: "contract",
   });
 
-  const duplicate = await dispatcher.fetch(dispatchRequest("task-1"));
+  const duplicate = await dispatcher.fetch(dispatchRequest("task-1", "other"));
   expect(duplicate.status).toBe(200);
   expect(await duplicate.json()).toEqual({
     duplicate: true,
@@ -292,13 +298,19 @@ test("different task IDs can retain concurrent processor requests", async () => 
 
   const firstAcceptance = dispatcher.fetch(dispatchRequest("task-1"));
   await waitFor(() => processor.calls.length === 1);
-  const secondAcceptance = dispatcher.fetch(dispatchRequest("task-2"));
+  const secondAcceptance = dispatcher.fetch(dispatchRequest("task-2", "other"));
   await waitFor(() => processor.calls.length === 2);
 
   await Promise.all([firstAcceptance, secondAcceptance]);
   expect(processor.calls.map(({ request }) => request.url)).toEqual([
     "https://processor/process",
     "https://processor/process",
+  ]);
+  expect(
+    await Promise.all(processor.calls.map(({ request }) => request.json())),
+  ).toEqual([
+    { taskId: "task-1", taskName: "contract" },
+    { taskId: "task-2", taskName: "other" },
   ]);
 
   await Promise.all([finish(processor, 0), finish(processor, 1)]);
@@ -333,14 +345,16 @@ test("dispatch and alarm schedule the 30-second heartbeat", async () => {
   ]);
 });
 
-test("processor failures are observed and release the task ID", async () => {
+test.each([
+  404, 500,
+])("processor HTTP %s failures are observed and release the task ID", async (status) => {
   const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
   const storage = new FakeAlarmStorage();
   const processor = new DeferredProcessor();
   const dispatcher = new RetainedTaskDispatcher(storage, processor);
 
-  await dispatcher.fetch(dispatchRequest("task-1"));
-  const control = controlledResponse(500);
+  await dispatcher.fetch(dispatchRequest("task-1", "unknown"));
+  const control = controlledResponse(status);
   processor.calls[0]?.response.resolve(control.response);
   await waitFor(() => control.response.bodyUsed);
   expect(log).not.toHaveBeenCalled();
@@ -349,13 +363,14 @@ test("processor failures are observed and release the task ID", async () => {
     ok: true,
     taskId: "task-1",
   });
-  control.finish("failed");
+  const message = status === 404 ? '{"error":"unknown task name"}' : "failed";
+  control.finish(message);
   await control.consumed;
   await waitFor(() => log.mock.calls.length === 1);
   expect(log).toHaveBeenCalledWith(
     "task processor failed",
     "task-1",
-    "task processor returned HTTP 500: failed",
+    `task processor returned HTTP ${status}: ${message}`,
   );
 
   await expectReleased(dispatcher, "task-1");
@@ -366,7 +381,7 @@ test("processor failures are observed and release the task ID", async () => {
 test("generic IDs use UTF-16 limits and round trip without numeric parsing", async () => {
   for (const id of ["", "a".repeat(201), `${"😀".repeat(100)}a`]) {
     const namespace = new RecordingNamespace();
-    await expect(dispatchTask(namespace, id)).rejects.toThrow(
+    await expect(dispatchTask(namespace, "contract", id)).rejects.toThrow(
       "taskId must be a non-empty string no longer than 200 characters",
     );
     expect(namespace.names).toEqual([]);
@@ -380,9 +395,9 @@ test("generic IDs use UTF-16 limits and round trip without numeric parsing", asy
     `${"a".repeat(198)}😀`,
   ]) {
     const namespace = new RecordingNamespace();
-    await dispatchTask(namespace, taskId);
+    await dispatchTask(namespace, "contract", taskId);
     const body = await namespace.stub.requests[0]?.text();
-    expect(JSON.parse(body ?? "")).toEqual({ taskId });
+    expect(JSON.parse(body ?? "")).toEqual({ taskId, taskName: "contract" });
     const processor = new DeferredProcessor();
     const dispatcher = new RetainedTaskDispatcher(
       new FakeAlarmStorage(),
@@ -514,6 +529,69 @@ test("heartbeat preserves only future alarms no later than the next heartbeat", 
   }
 });
 
+test.each([
+  undefined,
+  "",
+  null,
+  17,
+  [],
+  {},
+  false,
+])("rejects task name %j before lookup, launch, or alarm", async (taskName) => {
+  const namespace = new RecordingNamespace();
+  await expect(
+    dispatchTask(namespace, taskName as string, "17"),
+  ).rejects.toThrow("taskName must be a non-empty string");
+  await expect(dispatchTask(namespace, taskName as string, "")).rejects.toThrow(
+    "taskId must be a non-empty string no longer than 200 characters",
+  );
+  expect(namespace.names).toEqual([]);
+  const storage = new FakeAlarmStorage();
+  const processor = new DeferredProcessor();
+  const dispatcher = new RetainedTaskDispatcher(storage, processor);
+  const input = new Request("https://dispatcher/dispatch", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ taskId: "17", taskName }),
+  });
+  await expectJson(await dispatcher.fetch(input), 400, {
+    error: "taskName must be a non-empty string",
+    ok: false,
+  });
+  expect(processor.calls).toHaveLength(0);
+  expect(storage.scheduledAlarms).toEqual([]);
+});
+
+test.each([
+  "contract",
+  " ",
+  'Name/"\\\n雪🦀',
+  "x".repeat(1000),
+])("forwards exact name %s through both hops without a payload", async (taskName) => {
+  const namespace = new RecordingNamespace();
+  await dispatchTask(namespace, taskName, "opaque");
+  const body = await namespace.stub.requests[0]?.json();
+  expect(body).toEqual({ taskId: "opaque", taskName });
+  const processor = new DeferredProcessor();
+  const dispatcher = new RetainedTaskDispatcher(
+    new FakeAlarmStorage(),
+    processor,
+  );
+  await expectJson(
+    await dispatcher.fetch(
+      new Request("https://dispatcher/dispatch", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ ...body, payload: { untrusted: true } }),
+      }),
+    ),
+    200,
+    { ok: true, taskId: "opaque" },
+  );
+  expect(await processor.calls[0]?.request.json()).toEqual(body);
+  await finish(processor, 0);
+});
+
 test("rejected processor fetches and body reads are observed and release the ID", async () => {
   const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
   for (const status of [null, 200, 503]) {
@@ -548,7 +626,9 @@ test("rejected processor fetches and body reads are observed and release the ID"
 test("dispatchTask propagates namespace, fetch, and body-read errors", async () => {
   const namespace = new RecordingNamespace();
   namespace.error = new Error("namespace unavailable");
-  await expect(dispatchTask(namespace, "id")).rejects.toBe(namespace.error);
+  await expect(dispatchTask(namespace, "contract", "id")).rejects.toBe(
+    namespace.error,
+  );
   for (const status of [null, 200, 503]) {
     const namespace = new RecordingNamespace();
     const error = new Error("transport or body failed");
@@ -559,7 +639,7 @@ test("dispatchTask propagates namespace, fetch, and body-read errors", async () 
       namespace.stub.response = control.response;
       control.fail(error);
     }
-    await expect(dispatchTask(namespace, "id")).rejects.toBe(error);
+    await expect(dispatchTask(namespace, "contract", "id")).rejects.toBe(error);
   }
 });
 
@@ -573,7 +653,7 @@ test("diagnostic truncation is Unicode-safe and never limits body consumption", 
     const namespace = new RecordingNamespace();
     const control = controlledResponse(503);
     namespace.stub.response = control.response;
-    const dispatch = dispatchTask(namespace, "id");
+    const dispatch = dispatchTask(namespace, "contract", "id");
     control.finish(text);
     await expect(dispatch).rejects.toEqual(
       new Error(`task dispatcher returned HTTP 503: ${expected}`),

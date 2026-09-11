@@ -203,7 +203,10 @@ export function rustContracts(configPath: URL): void {
         drained: number;
       };
     const dispatch = async (taskId: string) => {
-      const response = await consume("/dispatch", json({ taskId }));
+      const response = await consume(
+        "/dispatch",
+        json({ taskId, taskName: "body_contract" }),
+      );
       expect(response.status, response.body).toBe(200);
       return JSON.parse(response.body) as {
         ok: boolean;

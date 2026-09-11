@@ -36,7 +36,8 @@ export type PostgresPublisherStage =
  * The first lifecycle failure, with causes retained for deliberate inspection.
  *
  * A receipt means publication is known; close/dispatch failures can be recovered using that ID
- * without republishing. A `task-id` receipt is unsupported by the processor, not redispatchable.
+ * and the original definition's name without republishing. A `task-id` receipt is unsupported
+ * by the processor, not redispatchable.
  * No receipt on a publication failure does not establish rollback. Never retry blindly.
  */
 export class PostgresPublisherError extends Error {
@@ -53,7 +54,7 @@ export class PostgresPublisherError extends Error {
 }
 
 /**
- * Publishes one task, awaits listener-free backend shutdown, then dispatches its exact ID.
+ * Publishes one task, awaits backend shutdown, then dispatches its exact ID and definition name.
  *
  * Construction performs no I/O. Synchronous configuration runs once per call; connections and
  * failures are never shared between calls. Callback-bearing definitions are plain publication,
@@ -140,7 +141,11 @@ export function createPostgresPublisher<
       // A successful publication always retained its receipt before closing.
       const published = receipt as PostgresPublisherReceipt;
       try {
-        await dispatchTask(config.dispatcher, published.taskId);
+        await dispatchTask(
+          config.dispatcher,
+          config.task.name,
+          published.taskId,
+        );
       } catch (cause) {
         throw new PostgresPublisherError("dispatch", cause, published);
       }

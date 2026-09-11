@@ -58,9 +58,13 @@ pub async fn fetch(mut request: Request, env: &Env) -> Result<Response> {
         "/publisher/redispatch" => {
             let body: Value = request.json().await?;
             let task_id = body["taskId"].as_str().unwrap();
-            dispatch_task(&env.durable_object("DISPATCHER")?, task_id)
-                .await
-                .map_err(|_| Error::from("contract redispatch failed"))?;
+            dispatch_task(
+                &env.durable_object("DISPATCHER")?,
+                PublisherTask::NAME,
+                task_id,
+            )
+            .await
+            .map_err(|_| Error::from("contract redispatch failed"))?;
             Response::from_json(&json!({ "taskId": task_id }))
         }
         _ => {

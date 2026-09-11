@@ -1,9 +1,9 @@
-use std::pin::Pin;
+use std::{collections::BTreeSet, pin::Pin};
 
 use http::{Request, Response, StatusCode, header::CONTENT_TYPE};
 use serde_json::{Value, json};
 
-use super::{BoxDispatchError, TextBody, json_response};
+use super::{BoxDispatchError, INVALID_TASK_NAME, TextBody, json_response, validate_task_name};
 use crate::{
     PublishActivationStrategy, PublishDispatchToken, TaskDefinition, TaskExecutionBackend, Worker,
     WorkerFactory, run_task_once,
@@ -11,23 +11,52 @@ use crate::{
 
 pub(super) type Cleanup = Pin<Box<dyn Future<Output = Result<(), BoxDispatchError>>>>;
 
-pub(super) struct Scope<S, F> {
+type Attempt = Pin<Box<dyn Future<Output = ()>>>;
+
+// Erase the factory only after checking its own published definition and callback types.
+pub(super) struct ProcessorTask<B> {
+    name: &'static str,
+    execute: Box<dyn FnOnce(B, u64, u64) -> Attempt>,
+}
+
+impl<B: TaskExecutionBackend + 'static> ProcessorTask<B> {
+    pub fn new<F>(factory: F) -> Self
+    where
+        F: WorkerFactory + 'static,
+        <F::Worker as Worker>::Task: TaskDefinition<
+            Trigger: PublishActivationStrategy<DispatchToken = PublishDispatchToken>,
+        >,
+    {
+        Self {
+            name: <F::Worker as Worker>::Task::NAME,
+            execute: Box::new(move |backend, worker_id, task_id| {
+                Box::pin(run_task_once(
+                    backend,
+                    factory,
+                    worker_id,
+                    PublishDispatchToken::Task(task_id),
+                ))
+            }),
+        }
+    }
+
+    pub async fn run(self, backend: B, worker_id: u64, task_id: u64) {
+        (self.execute)(backend, worker_id, task_id).await;
+    }
+}
+
+pub(super) struct Scope<S, B> {
     pub settings: S,
-    pub factory: F,
+    pub tasks: Vec<ProcessorTask<B>>,
     pub cleanup: Option<Cleanup>,
 }
 
 // Private acquisition/closing seam: native contracts use the real runtime without PostgreSQL.
-pub(super) trait Processor
-where
-    <<Self::Factory as WorkerFactory>::Worker as Worker>::Task:
-        TaskDefinition<Trigger: PublishActivationStrategy<DispatchToken = PublishDispatchToken>>,
-{
+pub(super) trait Processor {
     type Settings;
-    type Factory: WorkerFactory + 'static;
     type Backend: TaskExecutionBackend + Clone + 'static;
 
-    fn configure(&self) -> Result<Scope<Self::Settings, Self::Factory>, BoxDispatchError>;
+    fn configure(&self) -> Result<Scope<Self::Settings, Self::Backend>, BoxDispatchError>;
     fn random_bytes(&self) -> Result<[u8; 6], BoxDispatchError>;
     async fn acquire(&self, settings: Self::Settings) -> Result<Self::Backend, BoxDispatchError>;
     async fn close(&self, backend: Self::Backend) -> Result<(), BoxDispatchError>;
@@ -35,17 +64,11 @@ where
     async fn attempt(
         &self,
         backend: Self::Backend,
-        factory: Self::Factory,
+        task: ProcessorTask<Self::Backend>,
         worker_id: u64,
         task_id: u64,
     ) -> Result<(), BoxDispatchError> {
-        run_task_once(
-            backend,
-            factory,
-            worker_id,
-            PublishDispatchToken::Task(task_id),
-        )
-        .await;
+        task.run(backend, worker_id, task_id).await;
         Ok(())
     }
 
@@ -60,18 +83,14 @@ where
 pub(super) async fn fetch<P: Processor>(
     processor: &P,
     request: Request<TextBody>,
-) -> Response<String>
-where
-    <<P::Factory as WorkerFactory>::Worker as Worker>::Task:
-        TaskDefinition<Trigger: PublishActivationStrategy<DispatchToken = PublishDispatchToken>>,
-{
-    let (task_id, id) = match validate(request).await {
+) -> Response<String> {
+    let (task_id, id, task_name) = match validate(request).await {
         Ok(id) => id,
         Err(response) => return response,
     };
     let Scope {
         settings,
-        factory,
+        tasks,
         cleanup,
     } = match processor.configure() {
         Ok(scope) => scope,
@@ -86,6 +105,17 @@ where
 
     let mut backend = None;
     let attempt = async {
+        let mut names = BTreeSet::new();
+        if tasks.is_empty()
+            || tasks
+                .iter()
+                .any(|task| task.name.is_empty() || !names.insert(task.name))
+        {
+            return Err("configuration");
+        }
+        let Some(task) = tasks.into_iter().find(|task| task.name == task_name) else {
+            return Ok(false);
+        };
         let worker_id = random_worker_id(|| processor.random_bytes()).map_err(|_| "worker-id")?;
         let acquired = processor
             .acquire(settings)
@@ -93,9 +123,10 @@ where
             .map_err(|_| "acquisition")?;
         backend = Some(acquired.clone());
         processor
-            .attempt(acquired, factory, worker_id, id)
+            .attempt(acquired, task, worker_id, id)
             .await
-            .map_err(|_| "attempt")
+            .map_err(|_| "attempt")?;
+        Ok(true)
     }
     .await;
     let mut failed = false;
@@ -121,6 +152,8 @@ where
             StatusCode::INTERNAL_SERVER_ERROR,
             "task processing attempt failed",
         )
+    } else if attempt == Ok(false) {
+        error(StatusCode::NOT_FOUND, "unknown task name")
     } else {
         json_response(
             json!({ "taskId": task_id, "attemptFinished": true }),
@@ -144,7 +177,7 @@ fn random_worker_id(
 
 // Keep validation responses inline; this private result never crosses a task boundary.
 #[allow(clippy::result_large_err)]
-async fn validate(request: Request<TextBody>) -> Result<(String, u64), Response<String>> {
+async fn validate(request: Request<TextBody>) -> Result<(String, u64, String), Response<String>> {
     if request.uri().path() != "/process" {
         return Err(error(StatusCode::NOT_FOUND, "not-found"));
     }
@@ -193,7 +226,12 @@ async fn validate(request: Request<TextBody>) -> Result<(String, u64), Response<
             "taskId must encode a positive safe integer canonically",
         ));
     }
-    Ok((task_id.to_owned(), id))
+    let task_name = body
+        .get("taskName")
+        .and_then(Value::as_str)
+        .ok_or_else(|| error(StatusCode::BAD_REQUEST, INVALID_TASK_NAME))?;
+    validate_task_name(task_name).map_err(|_| error(StatusCode::BAD_REQUEST, INVALID_TASK_NAME))?;
+    Ok((task_id.to_owned(), id, task_name.to_owned()))
 }
 
 fn error(status: StatusCode, message: &str) -> Response<String> {

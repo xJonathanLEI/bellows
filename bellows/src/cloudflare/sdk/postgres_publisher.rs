@@ -38,7 +38,7 @@ impl PostgresPublisherConfig {
     }
 }
 
-/// Publishes one task, awaits listener-free backend shutdown, then dispatches its exact ID.
+/// Publishes one task, awaits backend shutdown, then dispatches its exact ID and definition name.
 ///
 /// Construction performs no I/O. Synchronous configuration runs once per call; connections and
 /// failures are never shared between calls. Callback-bearing definitions are plain publication,

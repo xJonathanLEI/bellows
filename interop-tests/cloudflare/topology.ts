@@ -54,9 +54,9 @@ export function cloudflareTopology(
     }
   }, 10_000);
 
-  async function publish(name: string): Promise<string> {
+  async function publish(path: string, payload: unknown): Promise<string> {
     const response = await fixture.consume(
-      fixture.server.fetch("/tasks", json({ name })),
+      fixture.server.fetch(path, json(payload)),
       "producer acceptance and complete response body while processing is gated",
     );
     expect(response.status, response.body).toBe(202);
@@ -65,10 +65,13 @@ export function cloudflareTopology(
     return response.body;
   }
 
-  async function dispatch(taskId: string) {
+  async function dispatch(taskName: string, taskId: string) {
     const dispatcher = await fixture.dispatcher();
     const response = await fixture.consume(
-      dispatcher.fetch("https://dispatcher/dispatch", json({ taskId })),
+      dispatcher.fetch(
+        "https://dispatcher/dispatch",
+        json({ taskId, taskName }),
+      ),
       `Durable Object acceptance for ${taskId}`,
     );
     expect(response.status, response.body).toBe(200);
@@ -81,16 +84,20 @@ export function cloudflareTopology(
     return body;
   }
 
-  async function redispatch(taskId: string) {
+  async function redispatch(taskName: string, taskId: string) {
     const response = await poll(
       `dispatcher to release the previous attempt for ${taskId}`,
-      () => dispatch(taskId),
+      () => dispatch(taskName, taskId),
       (body) => body.duplicate !== true,
     );
     expect(response).toEqual({ ok: true, taskId });
   }
 
-  async function claimed(taskId: string, name: string) {
+  async function claimed(
+    taskId: string,
+    taskName: string,
+    payloadJson: string,
+  ) {
     const state = await poll(
       `task ${taskId} to acquire a real lease`,
       () => fixture.state(),
@@ -102,8 +109,8 @@ export function cloudflareTopology(
     const task = state.tasks.find((row) => row.task_id === taskId);
     expect(task).toMatchObject({
       task_id: taskId,
-      task_name: "cloudflare_greeting",
-      payload_json: JSON.stringify({ name }),
+      task_name: taskName,
+      payload_json: payloadJson,
       task_unique_key: null,
       callback_id: null,
     });
@@ -132,12 +139,22 @@ export function cloudflareTopology(
     await fixture.waitForIdle();
   }
 
+  async function seed(taskName: string, payload: unknown): Promise<string> {
+    const { rows } = await fixture.admin.query<{ task_id: string }>(
+      `INSERT INTO ${fixture.table} (task_name, payload_json)
+       VALUES ($1, $2) RETURNING task_id`,
+      [taskName, JSON.stringify(payload)],
+    );
+    return rows[0].task_id;
+  }
+
   test("commits publication and fully acknowledges before claimed processing completes", async () => {
     const gate = await fixture.gate();
-    const taskId = await publish("Alice");
+    const payload = { name: "Alice" };
+    const taskId = await publish("/tasks", payload);
     // publish() has consumed the whole 202 body. The transaction still holds the
     // write gate, so neither an unconsumed response nor a sleep can keep work alive.
-    await claimed(taskId, "Alice");
+    await claimed(taskId, "cloudflare_greeting", JSON.stringify(payload));
     await gate.blocked(1);
     // Only lease operations + side effects remain. The producer client already closed.
     expect(await fixture.activeRequestClients()).toHaveLength(2);
@@ -175,7 +192,7 @@ export function cloudflareTopology(
     await fixture.admin.query(
       `ALTER TABLE ${fixture.table} DROP CONSTRAINT reject_insert`,
     );
-    const taskId = await publish("After repair");
+    const taskId = await publish("/tasks", { name: "After repair" });
     expect(taskId).toBe("2");
     await completed([{ taskId, name: "After repair" }]);
   }, 10_000);
@@ -190,9 +207,10 @@ export function cloudflareTopology(
   test("accepts and processes publication at the maximum safe ID", async () => {
     await nextTaskId("9007199254740991");
     const gate = await fixture.gate();
-    const taskId = await publish("Maximum safe ID");
+    const payload = { name: "Maximum safe ID" };
+    const taskId = await publish("/tasks", payload);
     expect(taskId).toBe("9007199254740991");
-    await claimed(taskId, "Maximum safe ID");
+    await claimed(taskId, "cloudflare_greeting", JSON.stringify(payload));
     await gate.blocked(1);
     expect(await fixture.activeRequestClients()).toHaveLength(2);
     await gate.release();
@@ -246,51 +264,121 @@ export function cloudflareTopology(
     }, 10_000);
   }
 
-  test("suppresses an outstanding duplicate while distinct tasks execute concurrently", async () => {
+  test("suppresses duplicate IDs across names while heterogeneous tasks execute concurrently", async () => {
     const gate = await fixture.gate();
-    const firstId = await publish("Alice");
-    const firstOwner = await claimed(firstId, "Alice");
-    expect(await dispatch(firstId)).toEqual({
+    const greeting = { name: "Alice" };
+    const fullName = { firstName: "Bob", lastName: "Smith" };
+    const firstId = await publish("/tasks", greeting);
+    const firstOwner = await claimed(
+      firstId,
+      "cloudflare_greeting",
+      JSON.stringify(greeting),
+    );
+    expect(await dispatch("cloudflare_greeting", firstId)).toEqual({
       ok: true,
       taskId: firstId,
       duplicate: true,
     });
 
-    const secondId = await publish("Bob");
+    const secondId = await publish("/full-names", fullName);
     expect(secondId).not.toBe(firstId);
-    const secondOwner = await claimed(secondId, "Bob");
+    const secondOwner = await claimed(
+      secondId,
+      "cloudflare_full_name",
+      JSON.stringify(fullName),
+    );
     expect(secondOwner).not.toBe(firstOwner);
+    // Both complete 202 bodies have been consumed; the single service-bound
+    // processor is still blocked on two independent business connections.
     await gate.blocked(2);
     for (const taskId of [firstId, secondId]) {
-      expect(await dispatch(taskId)).toEqual({
-        ok: true,
-        taskId,
-        duplicate: true,
-      });
+      for (const taskName of ["cloudflare_greeting", "cloudflare_full_name"]) {
+        expect(await dispatch(taskName, taskId)).toEqual({
+          ok: true,
+          taskId,
+          duplicate: true,
+        });
+      }
     }
     await gate.blocked(2);
     expect(await fixture.activeRequestClients()).toHaveLength(4);
     await gate.release();
     await completed([
       { taskId: firstId, name: "Alice" },
-      { taskId: secondId, name: "Bob" },
+      { taskId: secondId, name: "Bob Smith" },
     ]);
+  }, 10_000);
+
+  test("cannot claim a persisted full-name task under the registered greeting name", async () => {
+    const payload = { firstName: "Ada", lastName: "Lovelace" };
+    const taskId = await seed("cloudflare_full_name", payload);
+    const unclaimed = await fixture.state();
+    expect(unclaimed).toEqual({
+      tasks: [
+        {
+          task_id: taskId,
+          task_name: "cloudflare_full_name",
+          payload_json: JSON.stringify(payload),
+          task_unique_key: null,
+          callback_id: null,
+          lease_worker_id: null,
+          available_from_unix_ms: null,
+        },
+      ],
+      processed: [],
+    });
+    const response = await fixture.consume(
+      fixture.processor.fetch(
+        "/process",
+        json({
+          taskId,
+          taskName: "cloudflare_greeting",
+          payload: { name: "Not the persisted definition or payload" },
+        }),
+      ),
+      "mismatched definition attempt and complete backend shutdown",
+    );
+    assertAttempt(response, taskId);
+    expect(await fixture.state()).toEqual(unclaimed);
+    expect(await fixture.activeRequestClients()).toHaveLength(0);
+
+    const gate = await fixture.gate();
+    expect(await dispatch("cloudflare_full_name", taskId)).toEqual({
+      ok: true,
+      taskId,
+    });
+    await claimed(taskId, "cloudflare_full_name", JSON.stringify(payload));
+    await gate.blocked(1);
+    expect(await fixture.activeRequestClients()).toHaveLength(2);
+    await gate.release();
+    await completed([{ taskId, name: "Ada Lovelace" }]);
   }, 10_000);
 
   test("preserves database ownership and harmlessly redelivers a completed ID", async () => {
     const gate = await fixture.gate();
-    const taskId = await publish("Claimed payload");
-    const owner = await claimed(taskId, "Claimed payload");
+    const payload = { name: "Claimed payload" };
+    const taskId = await publish("/tasks", payload);
+    const owner = await claimed(
+      taskId,
+      "cloudflare_greeting",
+      JSON.stringify(payload),
+    );
     await gate.blocked(1);
     const competing = await fixture.consume(
       fixture.processor.fetch(
         "/process",
-        json({ taskId, payload: { name: "Not the claimed payload" } }),
+        json({
+          taskId,
+          taskName: "cloudflare_greeting",
+          payload: { name: "Not the claimed payload" },
+        }),
       ),
       "competing processor attempt to finish without claiming or writing",
     );
     assertAttempt(competing, taskId);
-    expect(await claimed(taskId, "Claimed payload")).toBe(owner);
+    expect(
+      await claimed(taskId, "cloudflare_greeting", JSON.stringify(payload)),
+    ).toBe(owner);
     await gate.blocked(1);
     // The no-claim competitor has also awaited its request-scoped driver shutdown.
     expect(await fixture.activeRequestClients()).toHaveLength(2);
@@ -302,7 +390,7 @@ export function cloudflareTopology(
     // redelivery reached Postgres and ended, rather than asserting immediately
     // after another acceptance response. No live task row is locked.
     const redeliveryGate = await fixture.gate("bellows_tasks");
-    await redispatch(taskId);
+    await redispatch("cloudflare_greeting", taskId);
     const redeliveryPids = await redeliveryGate.blocked(1);
     await redeliveryGate.release();
     await fixture.waitForClientExit(redeliveryPids);
@@ -315,8 +403,9 @@ ALTER TABLE ${fixture.processedTable}
 ADD CONSTRAINT reject_retry_name CHECK (name <> 'Retry after repair')
     `);
     const gate = await fixture.gate();
-    const taskId = await publish("Retry after repair");
-    await claimed(taskId, "Retry after repair");
+    const payload = { name: "Retry after repair" };
+    const taskId = await publish("/tasks", payload);
+    await claimed(taskId, "cloudflare_greeting", JSON.stringify(payload));
     await gate.blocked(1);
     await gate.release();
 
@@ -339,7 +428,11 @@ ADD CONSTRAINT reject_retry_name CHECK (name <> 'Retry after repair')
     const retry = await fixture.consume(
       fixture.processor.fetch(
         "/process",
-        json({ taskId, payload: { name: "Not the claimed payload" } }),
+        json({
+          taskId,
+          taskName: "cloudflare_greeting",
+          payload: { name: "Not the claimed payload" },
+        }),
       ),
       "handled constraint failure to finalize and drain before responding",
     );
@@ -350,7 +443,7 @@ ADD CONSTRAINT reject_retry_name CHECK (name <> 'Retry after repair')
     await fixture.admin.query(
       `ALTER TABLE ${fixture.processedTable} DROP CONSTRAINT reject_retry_name`,
     );
-    await redispatch(taskId);
+    await redispatch("cloudflare_greeting", taskId);
     await completed([{ taskId, name: "Retry after repair" }]);
   }, 10_000);
 
@@ -424,7 +517,12 @@ ADD CONSTRAINT reject_retry_name CHECK (name <> 'Retry after repair')
         "99999999999999999",
       ].map(
         (taskId) =>
-          ["/process", json({ taskId }), 400, canonicalError] as const,
+          [
+            "/process",
+            json({ taskId, taskName: "cloudflare_greeting" }),
+            400,
+            canonicalError,
+          ] as const,
       ),
       [
         "/process",
@@ -447,7 +545,11 @@ ADD CONSTRAINT reject_retry_name CHECK (name <> 'Retry after repair')
       const noClaim = await fixture.consume(
         fixture.processor.fetch(
           "/process",
-          json({ taskId, payload: { name: "Ignored" } }),
+          json({
+            taskId,
+            taskName: "cloudflare_greeting",
+            payload: { name: "Ignored" },
+          }),
         ),
         `safe-integer boundary ${taskId} with no task to claim`,
       );
@@ -463,7 +565,10 @@ ADD CONSTRAINT reject_retry_name CHECK (name <> 'Retry after repair')
         `task processor failed ${taskId} task processor returned HTTP 400: ` +
         '{"error":"taskId must be a canonical positive decimal string"}',
     };
-    expect(await dispatch(taskId)).toEqual({ ok: true, taskId });
+    expect(await dispatch("cloudflare_greeting", taskId)).toEqual({
+      ok: true,
+      taskId,
+    });
     await poll(
       "captured real processor rejection",
       () => fixture.server.getLogs(),
@@ -472,7 +577,7 @@ ADD CONSTRAINT reject_retry_name CHECK (name <> 'Retry after repair')
     expectedLogs.push(expectedError);
     expect(fixture.server.getLogs()[0]).toMatchObject(expectedError);
 
-    await redispatch(taskId);
+    await redispatch("cloudflare_greeting", taskId);
     await poll(
       "second rejected processor fetch to be consumed and logged",
       () => fixture.server.getLogs(),
@@ -481,5 +586,133 @@ ADD CONSTRAINT reject_retry_name CHECK (name <> 'Retry after repair')
     expectedLogs.push(expectedError);
     expect(fixture.server.getLogs()[1]).toMatchObject(expectedError);
     expect(await fixture.state()).toEqual({ tasks: [], processed: [] });
+  }, 10_000);
+
+  test("rejects malformed and unknown task names and releases downstream rejection for named redispatch", async () => {
+    const payload = { firstName: "Grace", lastName: "Hopper" };
+    const taskId = await seed("cloudflare_full_name", payload);
+    const unclaimed = await fixture.state();
+    const dispatcher = await fixture.dispatcher();
+    for (const taskName of [undefined, "", null, 1, [], {}]) {
+      for (const [target, path] of [
+        [dispatcher, "https://dispatcher/dispatch"],
+        [fixture.processor, "/process"],
+      ] as const) {
+        const response = await fixture.consume(
+          target.fetch(path, json({ taskId, taskName })),
+          `invalid task name ${JSON.stringify(taskName)} at ${path}`,
+        );
+        expect(response.status, response.body).toBe(400);
+        expect(JSON.parse(response.body)).toEqual({
+          error: "taskName must be a non-empty string",
+          ...(target === dispatcher ? { ok: false } : {}),
+        });
+        expect(await fixture.state()).toEqual(unclaimed);
+        expect(await fixture.activeRequestClients()).toHaveLength(0);
+      }
+    }
+    for (const taskName of [
+      "cloudflare_unknown",
+      "Cloudflare_full_name",
+      "cloudflare_full_name ",
+      "__proto__",
+    ]) {
+      const response = await fixture.consume(
+        fixture.processor.fetch("/process", json({ taskId, taskName })),
+        `unknown task name ${taskName}`,
+      );
+      expect(response.status, response.body).toBe(404);
+      expect(JSON.parse(response.body)).toEqual({
+        error: "unknown task name",
+      });
+      expect(await fixture.state()).toEqual(unclaimed);
+      expect(await fixture.activeRequestClients()).toHaveLength(0);
+    }
+
+    expect(await dispatch("cloudflare_unknown", taskId)).toEqual({
+      ok: true,
+      taskId,
+    });
+    const expectedError = {
+      level: "error",
+      message:
+        `task processor failed ${taskId} task processor returned HTTP 404: ` +
+        '{"error":"unknown task name"}',
+    };
+    await poll(
+      "unknown-name response to be consumed and logged",
+      () => fixture.server.getLogs(),
+      (logs) => logs.length === 1,
+    );
+    expectedLogs.push(expectedError);
+    expect(fixture.server.getLogs()[0]).toMatchObject(expectedError);
+    expect(await fixture.state()).toEqual(unclaimed);
+    expect(await fixture.activeRequestClients()).toHaveLength(0);
+
+    const gate = await fixture.gate();
+    await redispatch("cloudflare_full_name", taskId);
+    await claimed(taskId, "cloudflare_full_name", JSON.stringify(payload));
+    await gate.blocked(1);
+    expect(await fixture.activeRequestClients()).toHaveLength(2);
+    await gate.release();
+    await completed([{ taskId, name: "Grace Hopper" }]);
+  }, 10_000);
+
+  test("validates full-name payloads and preserves exact components at the UTF-16 limit", async () => {
+    const payloadError =
+      "body must be an object with non-blank firstName and lastName of at most 200 characters each";
+    for (const [init, status, error] of [
+      [{ method: "GET" }, 405, "method-not-allowed"],
+      [
+        { method: "POST", body: "{}" },
+        415,
+        "content-type must be application/json",
+      ],
+      [{ ...json({}), body: "{" }, 400, "invalid JSON"],
+      ...[null, [], "Alice", {}, { name: "Alice" }].map(
+        (body) => [json(body), 400, payloadError] as const,
+      ),
+      ...[
+        undefined,
+        null,
+        1,
+        [],
+        {},
+        "",
+        " ",
+        "\ufeff",
+        "a".repeat(201),
+        "🦀".repeat(101),
+      ].flatMap(
+        (value) =>
+          [
+            [json({ firstName: value, lastName: "Smith" }), 400, payloadError],
+            [json({ firstName: "Alice", lastName: value }), 400, payloadError],
+          ] as const,
+      ),
+    ] as const) {
+      const response = await fixture.consume(
+        fixture.server.fetch("/full-names", init),
+        "invalid full-name producer request",
+      );
+      expect(response.status, response.body).toBe(status);
+      expect(JSON.parse(response.body)).toEqual({ error });
+    }
+    expect(await fixture.state()).toEqual({ tasks: [], processed: [] });
+    expect(await fixture.activeRequestClients()).toHaveLength(0);
+
+    const payload = {
+      firstName: "🦀".repeat(100),
+      lastName: ` ${"é".repeat(198)} `,
+    };
+    const gate = await fixture.gate();
+    const taskId = await publish("/full-names", payload);
+    await claimed(taskId, "cloudflare_full_name", JSON.stringify(payload));
+    await gate.blocked(1);
+    expect(await fixture.activeRequestClients()).toHaveLength(2);
+    await gate.release();
+    await completed([
+      { taskId, name: `${payload.firstName} ${payload.lastName}` },
+    ]);
   }, 10_000);
 }

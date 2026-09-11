@@ -25,7 +25,7 @@ export function publisherContracts(
       const response = await consume("/publisher/state");
       expect(response.status, response.body).toBe(200);
       return JSON.parse(response.body) as {
-        dispatches: Array<{ taskId: string }>;
+        dispatches: Array<{ taskId: string; taskName: string }>;
         drained: number;
       };
     };
@@ -93,8 +93,9 @@ export function publisherContracts(
           (value) => value.dispatches.length === 1,
         );
         const receipt = { taskId: "1" };
+        const dispatch = { ...receipt, taskName: "publisher_contract" };
         expect(await state()).toEqual({
-          dispatches: [receipt],
+          dispatches: [dispatch],
           drained: 0,
         });
         await fixture.waitForClientExit(pids);
@@ -132,7 +133,7 @@ export function publisherContracts(
               },
         );
         expect(result.body).not.toContain("fixture-secret");
-        expect(await state()).toEqual({ dispatches: [receipt], drained: 1 });
+        expect(await state()).toEqual({ dispatches: [dispatch], drained: 1 });
         expect(await fixture.state()).toEqual(committed);
 
         if (status === 503) {
@@ -152,7 +153,7 @@ export function publisherContracts(
             (value) => value.dispatches.length === 2,
           );
           expect(await state()).toEqual({
-            dispatches: [receipt, receipt],
+            dispatches: [dispatch, dispatch],
             drained: 1,
           });
           expect(await fixture.activeRequestClients()).toHaveLength(0);
@@ -162,7 +163,7 @@ export function publisherContracts(
           expect(recovered.status, recovered.body).toBe(200);
           expect(JSON.parse(recovered.body)).toEqual(receipt);
           expect(await state()).toEqual({
-            dispatches: [receipt, receipt],
+            dispatches: [dispatch, dispatch],
             drained: 2,
           });
         }

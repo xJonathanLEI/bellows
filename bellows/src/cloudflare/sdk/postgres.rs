@@ -8,34 +8,50 @@ use crate::{
     backends::postgres_execution::{PostgresBackendOptions, PostgresExecutionBackend},
     cloudflare::{
         BoxDispatchError,
-        processor::{self, Processor, Scope},
+        processor::{self, Processor, ProcessorTask, Scope},
     },
 };
 
+/// A typed published factory registered under its definition's exact name.
+pub struct PostgresProcessorTask(ProcessorTask<PostgresExecutionBackend>);
+
+impl PostgresProcessorTask {
+    pub fn new<F>(factory: F) -> Self
+    where
+        F: WorkerFactory + 'static,
+        <F::Worker as Worker>::Task: TaskDefinition<
+            Trigger: PublishActivationStrategy<DispatchToken = PublishDispatchToken>,
+        >,
+    {
+        Self(ProcessorTask::new(factory))
+    }
+}
+
 /// Configuration owned by one validated processor request.
-pub struct PostgresProcessorConfig<F> {
+pub struct PostgresProcessorConfig {
     /// Obtain this URL from the request's Hyperdrive binding.
     pub connection_string: String,
     pub options: PostgresBackendOptions,
-    pub factory: F,
+    /// Non-empty registrations with unique, non-empty definition names.
+    pub tasks: Vec<PostgresProcessorTask>,
     cleanup: Option<Pin<Box<dyn Future<Output = worker::Result<()>>>>>,
 }
 
-impl<F> PostgresProcessorConfig<F> {
+impl PostgresProcessorConfig {
     pub fn new(
         connection_string: impl Into<String>,
         options: PostgresBackendOptions,
-        factory: F,
+        tasks: Vec<PostgresProcessorTask>,
     ) -> Self {
         Self {
             connection_string: connection_string.into(),
             options,
-            factory,
+            tasks,
             cleanup: None,
         }
     }
 
-    /// Registers owned application cleanup, awaited once even after acquisition failure or no claim.
+    /// Registers cleanup, awaited once whenever configuration returned, even for unknown names.
     ///
     /// Keep abort-safe side-effect connection ownership outside the worker in this future.
     /// Bellows always awaits its own backend shutdown afterwards, even if cleanup fails.
@@ -48,8 +64,9 @@ impl<F> PostgresProcessorConfig<F> {
     }
 }
 
-/// A request-scoped PostgreSQL processor delegate for one published task definition.
+/// A request-scoped PostgreSQL processor routing exact names to typed published factories.
 ///
+/// Unknown names return 404 without acquisition; claims still check the persisted definition name.
 /// The synchronous callback reads bindings only after validation. Construction performs no I/O.
 /// If configuration fails before returning, it owns its partially created resources.
 /// Connections are never retained between requests. HTTP 200 means an attempt ended, not task
@@ -58,18 +75,16 @@ pub struct PostgresProcessor<C> {
     configure: C,
 }
 
-impl<C, F> PostgresProcessor<C>
+impl<C> PostgresProcessor<C>
 where
-    C: Fn(&Env) -> worker::Result<PostgresProcessorConfig<F>>,
-    F: WorkerFactory + 'static,
-    <F::Worker as Worker>::Task:
-        TaskDefinition<Trigger: PublishActivationStrategy<DispatchToken = PublishDispatchToken>>,
+    C: Fn(&Env) -> worker::Result<PostgresProcessorConfig>,
 {
     pub fn new(configure: C) -> Self {
         Self { configure }
     }
 
-    /// Delegates POST `/process`, awaiting the runtime, registered cleanup, and backend shutdown.
+    /// Delegates POST `/process` with `{ taskId, taskName }`.
+    /// Awaits the runtime, registered cleanup, and backend shutdown.
     pub async fn fetch_worker(&self, request: Request, env: &Env) -> worker::Result<Response> {
         let processor = RequestProcessor {
             configure: &self.configure,
@@ -84,22 +99,18 @@ struct RequestProcessor<'a, C> {
     env: &'a Env,
 }
 
-impl<C, F> Processor for RequestProcessor<'_, C>
+impl<C> Processor for RequestProcessor<'_, C>
 where
-    C: Fn(&Env) -> worker::Result<PostgresProcessorConfig<F>>,
-    F: WorkerFactory + 'static,
-    <F::Worker as Worker>::Task:
-        TaskDefinition<Trigger: PublishActivationStrategy<DispatchToken = PublishDispatchToken>>,
+    C: Fn(&Env) -> worker::Result<PostgresProcessorConfig>,
 {
     type Settings = (String, PostgresBackendOptions);
-    type Factory = F;
     type Backend = PostgresExecutionBackend;
 
-    fn configure(&self) -> Result<Scope<Self::Settings, F>, BoxDispatchError> {
+    fn configure(&self) -> Result<Scope<Self::Settings, Self::Backend>, BoxDispatchError> {
         let config = (self.configure)(self.env).map_err(sdk_error)?;
         Ok(Scope {
             settings: (config.connection_string, config.options),
-            factory: config.factory,
+            tasks: config.tasks.into_iter().map(|task| task.0).collect(),
             cleanup: config.cleanup.map(|cleanup| -> processor::Cleanup {
                 Box::pin(async move { cleanup.await.map_err(sdk_error) })
             }),

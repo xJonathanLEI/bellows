@@ -12,14 +12,15 @@
 //! and causes; do not flatten it into a Worker error before inspecting its receipt.
 //!
 //! For a processor Worker, delegate to [`PostgresProcessor::fetch_worker`]. Its synchronous
-//! configuration callback maps request bindings to [`PostgresProcessorConfig`] for one published
-//! task's factory, after validation. Construction performs no I/O; the delegate owns a fresh
-//! listener-free execution backend for each request.
+//! configuration callback maps request bindings to [`PostgresProcessorConfig`] with typed
+//! [`PostgresProcessorTask`] registrations, after validation. Construction performs no I/O; the delegate
+//! owns a fresh listener-free execution backend for each selected attempt. Names come from each
+//! definition and must be unique; claims check both the dispatched ID and persisted definition name.
 //!
 //! Register owned application cleanup with [`PostgresProcessorConfig::with_cleanup`], retaining
 //! business-connection ownership outside the spawned worker to survive lease-loss aborts. Cleanup
-//! runs once whenever configuration returned, even after acquisition failure or no claim. Backend
-//! shutdown is always awaited afterwards if acquired, even when application cleanup fails.
+//! runs once whenever configuration returned, even for invalid registrations or unknown names.
+//! Backend shutdown is always awaited afterwards if acquired, even when application cleanup fails.
 //! HTTP 200 reports an ended attempt, not business success. Applications still own arbitrary
 //! side-effect resources.
 //!
@@ -42,7 +43,7 @@ use super::{
 
 mod postgres;
 mod postgres_publisher;
-pub use postgres::{PostgresProcessor, PostgresProcessorConfig};
+pub use postgres::{PostgresProcessor, PostgresProcessorConfig, PostgresProcessorTask};
 pub use postgres_publisher::{
     PostgresPublisher, PostgresPublisherConfig, PostgresPublisherError, PostgresPublisherReceipt,
     PostgresPublisherStage,

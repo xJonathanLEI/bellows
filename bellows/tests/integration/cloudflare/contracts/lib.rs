@@ -47,7 +47,7 @@ pub async fn fetch(request: Request, env: Env, _ctx: Context) -> Result<Response
         return Response::from_json(&runtime::run(mode).await);
     }
     if let Some(task_id) = path.strip_prefix("/dispatch-task/") {
-        let result = dispatch_task(&env.durable_object("BODY")?, task_id).await;
+        let result = dispatch_task(&env.durable_object("BODY")?, "body_contract", task_id).await;
         return Response::from_json(&match result {
             Ok(()) => json!({ "ok": true }),
             Err(error) => json!({ "error": error.to_string() }),

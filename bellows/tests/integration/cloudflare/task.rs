@@ -13,3 +13,18 @@ impl TaskDefinition for GreetingTask {
     type Callback = ();
     type Trigger = PublishTrigger<GreetingPayload>;
 }
+
+pub struct FullNameTask;
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FullNamePayload {
+    pub first_name: String,
+    pub last_name: String,
+}
+
+impl TaskDefinition for FullNameTask {
+    const NAME: &'static str = "cloudflare_full_name";
+    type Callback = ();
+    type Trigger = PublishTrigger<FullNamePayload>;
+}

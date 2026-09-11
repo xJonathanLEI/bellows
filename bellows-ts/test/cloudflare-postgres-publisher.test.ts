@@ -20,7 +20,7 @@ import {
 import { Gate } from "./helpers.js";
 
 const task = definePublishTask<{ name: string }, { greeting: string }>(
-  "publisher_contract",
+  'publisher_contract/"\\\n雪🦀',
 );
 const secret = new Error("postgres://user:secret@private/database");
 const closeSecret = new Error("private shutdown failure");
@@ -179,7 +179,7 @@ test("construction is inert; detached publication forwards configuration, task a
     {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: '{"taskId":"17"}',
+      body: JSON.stringify({ taskId: "17", taskName: task.name }),
     },
   );
   expect(f.backend.events).toEqual([
@@ -213,6 +213,12 @@ test("void payloads and custom codecs use plain publication", async () => {
   expect(f.backend.encoded).toEqual(["null", "ADA"]);
   expect(custom.codec.encode).toHaveBeenCalledExactlyOnceWith(payload);
   expect(custom.codec.decode).not.toHaveBeenCalled();
+  expect(
+    f.fetch.mock.calls.map(([, init]) => JSON.parse(String(init?.body))),
+  ).toEqual([
+    { taskId: "17", taskName: voidTask.name },
+    { taskId: "17", taskName: custom.name },
+  ]);
 });
 
 test("environment, payload, callback-bearing task and error types remain precise", () => {
@@ -270,7 +276,7 @@ test.each([
     taskId: String(taskId),
   });
   expect(f.fetch.mock.calls[0][1]?.body).toBe(
-    JSON.stringify({ taskId: String(taskId) }),
+    JSON.stringify({ taskId: String(taskId), taskName: task.name }),
   );
 });
 

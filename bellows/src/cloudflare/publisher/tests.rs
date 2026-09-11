@@ -30,7 +30,7 @@ struct Payload {
 
 struct Task;
 impl TaskDefinition for Task {
-    const NAME: &'static str = "publisher_contract";
+    const NAME: &'static str = "publisher_contract/\"\\\n雪🦀";
     type Trigger = PublishTrigger<Payload>;
     // Its failing codec must never be used by plain publication.
     type Callback = BadPayload;
@@ -311,7 +311,7 @@ fn assert_error(error: &PostgresPublisherError, stage: PostgresPublisherStage, i
     ));
 }
 
-fn assert_dispatch(state: &State, id: &str) {
+fn assert_dispatch(state: &State, name: &str, id: &str) {
     assert_eq!(*state.names.lock().unwrap(), ["global"]);
     let requests = state.requests.lock().unwrap();
     assert_eq!(requests.len(), 1);
@@ -320,7 +320,7 @@ fn assert_dispatch(state: &State, id: &str) {
     assert_eq!(requests[0].headers()["content-type"], "application/json");
     assert_eq!(
         serde_json::from_str::<Value>(requests[0].body()).unwrap(),
-        json!({ "taskId": id })
+        json!({ "taskId": id, "taskName": name })
     );
 }
 
@@ -336,7 +336,7 @@ async fn construction_is_inert_and_publication_forwards_the_bound_task_and_paylo
         *state.publications.lock().unwrap(),
         [(Task::NAME.into(), json!({ "name": "Ada" }))]
     );
-    assert_dispatch(&state, "17");
+    assert_dispatch(&state, Task::NAME, "17");
     assert_eq!(
         *state.events.lock().unwrap(),
         [
@@ -358,6 +358,7 @@ async fn unit_payload_is_plain_publication() {
     let state = Arc::new(State::default());
     let publisher = harness::<UnitTask>(vec![state.clone()]);
     assert_eq!(publish(&publisher, ()).await.unwrap().task_id, "17");
+    assert_dispatch(&state, UnitTask::NAME, "17");
     assert_eq!(
         *state.publications.lock().unwrap(),
         [(UnitTask::NAME.into(), Value::Null)]
@@ -375,7 +376,7 @@ async fn safe_ids_dispatch_exactly() {
         let publisher = harness::<Task>(vec![state.clone()]);
         let receipt = publish(&publisher, payload("Ada")).await.unwrap();
         assert_eq!(receipt.task_id, id.to_string());
-        assert_dispatch(&state, &receipt.task_id);
+        assert_dispatch(&state, Task::NAME, &receipt.task_id);
     }
 }
 
@@ -454,7 +455,7 @@ async fn publication_close_and_full_success_or_error_body_are_awaited_in_order()
         assert_eq!(state.count("body-end"), 1);
         assert_eq!(state.count("publish"), 1);
         assert_eq!(state.count("close"), 1);
-        assert_dispatch(&state, "17");
+        assert_dispatch(&state, Task::NAME, "17");
     }
 }
 

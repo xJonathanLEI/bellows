@@ -13,7 +13,7 @@ use bellows::{
     },
 };
 use serde_json::json;
-use task::{GreetingPayload, GreetingTask};
+use task::{FullNamePayload, FullNameTask, GreetingPayload, GreetingTask};
 use worker::*;
 
 // ECMAScript String.trim whitespace, including BOM (Rust's str::trim differs).
@@ -25,37 +25,62 @@ fn blank(name: &str) -> bool {
     })
 }
 
+fn name(value: Option<&serde_json::Value>) -> Option<&str> {
+    value
+        .and_then(serde_json::Value::as_str)
+        .filter(|name| !blank(name) && name.encode_utf16().count() <= 200)
+}
+
+fn publisher_config(env: &Env) -> Result<PostgresPublisherConfig> {
+    Ok(PostgresPublisherConfig::new(
+        env.hyperdrive("HYPERDRIVE")?.connection_string(),
+        PostgresBackendOptions {
+            schema: Some(env.var("BELLOWS_SCHEMA")?.to_string()),
+        },
+        env.durable_object("DISPATCHER")?,
+    ))
+}
+
 #[event(fetch)]
 pub async fn fetch(mut request: Request, env: Env, _ctx: Context) -> Result<Response> {
-    let body = match http::body(&mut request, "/tasks").await {
+    let path = request.path();
+    if path != "/tasks" && path != "/full-names" {
+        return http::error(404, "not-found");
+    }
+    let body = match http::body(&mut request, &path).await {
         Ok(body) => body,
         Err(response) => return Ok(response),
     };
-    let Some(name) = body
-        .as_object()
-        .and_then(|body| body.get("name"))
-        .and_then(serde_json::Value::as_str)
-        .filter(|name| !blank(name) && name.encode_utf16().count() <= 200)
-    else {
-        return http::error(
-            400,
-            "body must be an object with a non-blank name of at most 200 characters",
-        );
+    let publication = if path == "/tasks" {
+        let Some(name) = name(body.get("name")) else {
+            return http::error(
+                400,
+                "body must be an object with a non-blank name of at most 200 characters",
+            );
+        };
+        PostgresPublisher::<GreetingTask, _>::new(publisher_config)
+            .publish(&env, GreetingPayload { name: name.into() })
+            .await
+    } else {
+        let (Some(first_name), Some(last_name)) =
+            (name(body.get("firstName")), name(body.get("lastName")))
+        else {
+            return http::error(
+                400,
+                "body must be an object with non-blank firstName and lastName of at most 200 characters each",
+            );
+        };
+        PostgresPublisher::<FullNameTask, _>::new(publisher_config)
+            .publish(
+                &env,
+                FullNamePayload {
+                    first_name: first_name.into(),
+                    last_name: last_name.into(),
+                },
+            )
+            .await
     };
-
-    let publisher = PostgresPublisher::<GreetingTask, _>::new(|env: &Env| {
-        Ok(PostgresPublisherConfig::new(
-            env.hyperdrive("HYPERDRIVE")?.connection_string(),
-            PostgresBackendOptions {
-                schema: Some(env.var("BELLOWS_SCHEMA")?.to_string()),
-            },
-            env.durable_object("DISPATCHER")?,
-        ))
-    });
-    let receipt = match publisher
-        .publish(&env, GreetingPayload { name: name.into() })
-        .await
-    {
+    let receipt = match publication {
         Ok(receipt) => receipt,
         Err(error) => {
             return Ok(Response::from_json(&match error.receipt {

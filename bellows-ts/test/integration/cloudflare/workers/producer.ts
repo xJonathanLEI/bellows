@@ -2,9 +2,10 @@ import { DurableObject } from "cloudflare:workers";
 import {
   createPostgresPublisher,
   PostgresPublisherError,
+  type PostgresPublisherReceipt,
 } from "../../../../src/cloudflare/postgres.js";
 import { RetainedTaskDispatcher } from "../../../../src/cloudflare.js";
-import { greetingTask } from "../task.js";
+import { fullNameTask, greetingTask } from "../task.js";
 
 interface ProducerEnv {
   HYPERDRIVE: Hyperdrive;
@@ -13,16 +14,30 @@ interface ProducerEnv {
   PROCESSOR: Fetcher;
 }
 
-const publisher = createPostgresPublisher((env: ProducerEnv) => ({
+const publisherConfig = (env: ProducerEnv) => ({
   connectionString: env.HYPERDRIVE.connectionString,
   schema: env.BELLOWS_SCHEMA,
-  task: greetingTask,
   dispatcher: env.DISPATCHER,
+});
+const greetingPublisher = createPostgresPublisher((env: ProducerEnv) => ({
+  ...publisherConfig(env),
+  task: greetingTask,
 }));
+const fullNamePublisher = createPostgresPublisher((env: ProducerEnv) => ({
+  ...publisherConfig(env),
+  task: fullNameTask,
+}));
+
+function validName(value: unknown): value is string {
+  return (
+    typeof value === "string" && value.trim().length > 0 && value.length <= 200
+  );
+}
 
 export default {
   async fetch(request, env): Promise<Response> {
-    if (new URL(request.url).pathname !== "/tasks") {
+    const path = new URL(request.url).pathname;
+    if (path !== "/tasks" && path !== "/full-names") {
       return Response.json({ error: "not-found" }, { status: 404 });
     }
     if (request.method !== "POST") {
@@ -49,30 +64,50 @@ export default {
     } catch {
       return Response.json({ error: "invalid JSON" }, { status: 400 });
     }
-    if (
-      body === null ||
-      typeof body !== "object" ||
-      Array.isArray(body) ||
-      !("name" in body) ||
-      typeof body.name !== "string" ||
-      body.name.trim().length === 0 ||
-      body.name.length > 200
-    ) {
-      return Response.json(
-        {
-          error:
-            "body must be an object with a non-blank name of at most 200 characters",
-        },
-        { status: 400 },
-      );
-    }
-
     try {
-      const { taskId } = await publisher.publish(env, {
-        name: body.name,
-      });
+      let receipt: PostgresPublisherReceipt;
+      if (path === "/tasks") {
+        if (
+          body === null ||
+          typeof body !== "object" ||
+          Array.isArray(body) ||
+          !("name" in body) ||
+          !validName(body.name)
+        ) {
+          return Response.json(
+            {
+              error:
+                "body must be an object with a non-blank name of at most 200 characters",
+            },
+            { status: 400 },
+          );
+        }
+        receipt = await greetingPublisher.publish(env, { name: body.name });
+      } else {
+        if (
+          body === null ||
+          typeof body !== "object" ||
+          Array.isArray(body) ||
+          !("firstName" in body) ||
+          !validName(body.firstName) ||
+          !("lastName" in body) ||
+          !validName(body.lastName)
+        ) {
+          return Response.json(
+            {
+              error:
+                "body must be an object with non-blank firstName and lastName of at most 200 characters each",
+            },
+            { status: 400 },
+          );
+        }
+        receipt = await fullNamePublisher.publish(env, {
+          firstName: body.firstName,
+          lastName: body.lastName,
+        });
+      }
       // Acceptance is not completion; the processor may still be running.
-      return new Response(taskId, {
+      return new Response(receipt.taskId, {
         status: 202,
         headers: {
           "content-type": "text/plain; charset=utf-8",

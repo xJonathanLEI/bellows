@@ -45,7 +45,7 @@ export default {
     }
     if (path === "/publisher/redispatch") {
       const { taskId } = await request.json<{ taskId: string }>();
-      await dispatchTask(env.DISPATCHER, taskId);
+      await dispatchTask(env.DISPATCHER, task.name, taskId);
       return Response.json({ taskId });
     }
     return env.DISPATCHER.getByName("global").fetch(request);

@@ -163,9 +163,15 @@ fn response(status: u16, body: TextBody) -> Response<TextBody> {
 }
 
 fn dispatch_request(task_id: &str) -> Request<TextBody> {
+    named_request("contract", task_id)
+}
+
+fn named_request(task_name: &str, task_id: &str) -> Request<TextBody> {
     Request::post("https://dispatcher/dispatch")
         .header("content-type", "application/json")
-        .body(text_body(json!({ "taskId": task_id }).to_string()))
+        .body(text_body(
+            json!({ "taskId": task_id, "taskName": task_name }).to_string(),
+        ))
         .unwrap()
 }
 
@@ -243,7 +249,7 @@ async fn dispatch_targets_global_and_fully_consumes_the_response() {
     namespace.stub.0.lock().unwrap().response = Some(Ok(response(200, body)));
     let dispatch = tokio::spawn({
         let namespace = namespace.clone();
-        async move { dispatch_task(namespace.as_ref(), "123").await }
+        async move { dispatch_task(namespace.as_ref(), "contract", "123").await }
     });
     wait_for(|| control.started.load(Ordering::SeqCst)).await;
     assert!(!dispatch.is_finished());
@@ -258,7 +264,7 @@ async fn dispatch_targets_global_and_fully_consumes_the_response() {
         assert_eq!(request.headers()["content-type"], "application/json");
         assert_eq!(
             serde_json::from_str::<Value>(request.body()).unwrap(),
-            json!({ "taskId": "123" })
+            json!({ "taskId": "123", "taskName": "contract" })
         );
     }
     control.sender.send(Ok("accepted".into())).unwrap();
@@ -273,7 +279,7 @@ async fn dispatch_consumes_an_error_response_before_rejecting() {
     namespace.stub.0.lock().unwrap().response = Some(Ok(response(503, body)));
     let dispatch = tokio::spawn({
         let namespace = namespace.clone();
-        async move { dispatch_task(namespace.as_ref(), "123").await }
+        async move { dispatch_task(namespace.as_ref(), "contract", "123").await }
     });
     wait_for(|| control.started.load(Ordering::SeqCst)).await;
     assert!(!dispatch.is_finished());
@@ -307,12 +313,12 @@ async fn retained_dispatch_accepts_early_and_suppresses_duplicates_through_body_
         assert_eq!(request.headers()["content-type"], "application/json");
         assert_eq!(
             serde_json::from_str::<Value>(request.body()).unwrap(),
-            json!({ "taskId": "task-1" })
+            json!({ "taskId": "task-1", "taskName": "contract" })
         );
     }
     let duplicate = json!({ "duplicate": true, "ok": true, "taskId": "task-1" });
     assert_json(
-        dispatcher.fetch(dispatch_request("task-1")).await,
+        dispatcher.fetch(named_request("other", "task-1")).await,
         200,
         duplicate.clone(),
     );
@@ -344,7 +350,7 @@ async fn different_task_ids_retain_concurrent_processor_requests() {
         RetainedTaskDispatcher::with_clock(FakeAlarmStorage::default(), processor.clone(), now);
     let (first, second) = tokio::join!(
         dispatcher.fetch(dispatch_request("task-1")),
-        dispatcher.fetch(dispatch_request("task-2")),
+        dispatcher.fetch(named_request("other", "task-2")),
     );
     assert_json(first, 200, json!({ "ok": true, "taskId": "task-1" }));
     assert_json(second, 200, json!({ "ok": true, "taskId": "task-2" }));
@@ -357,6 +363,15 @@ async fn different_task_ids_retain_concurrent_processor_requests() {
             .iter()
             .all(|call| call.request.uri() == "https://processor/process")
     );
+    let bodies: Vec<Value> = processor
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|call| serde_json::from_str(call.request.body()).unwrap())
+        .collect();
+    assert!(bodies.contains(&json!({ "taskId": "task-1", "taskName": "contract" })));
+    assert!(bodies.contains(&json!({ "taskId": "task-2", "taskName": "other" })));
     finish(&processor, 0).await;
     finish(&processor, 1).await;
 }
@@ -386,37 +401,42 @@ async fn dispatch_and_alarm_schedule_the_30_second_heartbeat_even_when_idle() {
 
 #[tokio::test]
 async fn processor_http_failures_are_consumed_observed_and_release_the_id() {
-    let logs = Logs::default();
-    let _subscriber = tracing::subscriber::set_default(logs.clone());
-    let processor = DeferredProcessor::default();
-    let dispatcher =
-        RetainedTaskDispatcher::with_clock(FakeAlarmStorage::default(), processor.clone(), now);
-    dispatcher.fetch(dispatch_request("task-1")).await;
-    wait_for(|| processor.count() == 1).await;
-    let (body, control) = controlled_body();
-    processor.complete(0, Ok(response(500, body)));
-    wait_for(|| control.started.load(Ordering::SeqCst)).await;
-    assert!(logs.0.lock().unwrap().is_empty());
-    assert_json(
-        dispatcher.fetch(dispatch_request("task-1")).await,
-        200,
-        json!({ "duplicate": true, "ok": true, "taskId": "task-1" }),
-    );
-    control.sender.send(Ok("failed".into())).unwrap();
-    wait_for(|| logs.0.lock().unwrap().len() == 1).await;
-    {
-        let logs = logs.0.lock().unwrap();
-        assert_eq!(logs[0]["message"], "task processor failed");
-        assert_eq!(logs[0]["task_id"], "task-1");
-        assert_eq!(logs[0]["error"], "task processor returned HTTP 500: failed");
+    for (status, message) in [(500, "failed"), (404, r#"{"error":"unknown task name"}"#)] {
+        let logs = Logs::default();
+        let _subscriber = tracing::subscriber::set_default(logs.clone());
+        let processor = DeferredProcessor::default();
+        let dispatcher =
+            RetainedTaskDispatcher::with_clock(FakeAlarmStorage::default(), processor.clone(), now);
+        dispatcher.fetch(named_request("unknown", "task-1")).await;
+        wait_for(|| processor.count() == 1).await;
+        let (body, control) = controlled_body();
+        processor.complete(0, Ok(response(status, body)));
+        wait_for(|| control.started.load(Ordering::SeqCst)).await;
+        assert!(logs.0.lock().unwrap().is_empty());
+        assert_json(
+            dispatcher.fetch(dispatch_request("task-1")).await,
+            200,
+            json!({ "duplicate": true, "ok": true, "taskId": "task-1" }),
+        );
+        control.sender.send(Ok(message.into())).unwrap();
+        wait_for(|| logs.0.lock().unwrap().len() == 1).await;
+        {
+            let logs = logs.0.lock().unwrap();
+            assert_eq!(logs[0]["message"], "task processor failed");
+            assert_eq!(logs[0]["task_id"], "task-1");
+            assert_eq!(
+                logs[0]["error"],
+                format!("task processor returned HTTP {status}: {message}")
+            );
+        }
+        assert!(control.finished.load(Ordering::SeqCst));
+        assert_json(
+            dispatcher.fetch(dispatch_request("task-1")).await,
+            200,
+            json!({ "ok": true, "taskId": "task-1" }),
+        );
+        finish(&processor, 1).await;
     }
-    assert!(control.finished.load(Ordering::SeqCst));
-    assert_json(
-        dispatcher.fetch(dispatch_request("task-1")).await,
-        200,
-        json!({ "ok": true, "taskId": "task-1" }),
-    );
-    finish(&processor, 1).await;
 }
 
 #[tokio::test]
@@ -424,7 +444,7 @@ async fn generic_ids_use_utf16_limits_and_round_trip_without_numeric_parsing() {
     for id in ["".into(), "a".repeat(201), format!("{}a", "😀".repeat(100))] {
         let namespace = RecordingNamespace::default();
         assert_eq!(
-            dispatch_task(&namespace, &id)
+            dispatch_task(&namespace, "contract", &id)
                 .await
                 .unwrap_err()
                 .to_string(),
@@ -442,11 +462,11 @@ async fn generic_ids_use_utf16_limits_and_round_trip_without_numeric_parsing() {
     ] {
         let namespace = RecordingNamespace::default();
         namespace.stub.0.lock().unwrap().response = Some(Ok(response(200, text_body("accepted"))));
-        dispatch_task(&namespace, &id).await.unwrap();
+        dispatch_task(&namespace, "contract", &id).await.unwrap();
         let encoded = namespace.stub.0.lock().unwrap().requests[0].body().clone();
         assert_eq!(
             serde_json::from_str::<Value>(&encoded).unwrap(),
-            json!({ "taskId": id })
+            json!({ "taskId": id, "taskName": "contract" })
         );
         let processor = DeferredProcessor::default();
         let dispatcher =
@@ -547,6 +567,93 @@ async fn invalid_routes_and_inputs_do_not_launch_work_or_schedule_alarms() {
 }
 
 #[tokio::test]
+async fn invalid_names_reject_before_lookup_launch_or_alarm() {
+    let namespace = RecordingNamespace::default();
+    assert_eq!(
+        dispatch_task(&namespace, "", "17")
+            .await
+            .unwrap_err()
+            .to_string(),
+        "taskName must be a non-empty string"
+    );
+    assert_eq!(
+        dispatch_task(&namespace, "", "")
+            .await
+            .unwrap_err()
+            .to_string(),
+        "taskId must be a non-empty string no longer than 200 characters"
+    );
+    assert!(namespace.names.lock().unwrap().is_empty());
+    let processor = DeferredProcessor::default();
+    let storage = FakeAlarmStorage::default();
+    let dispatcher = RetainedTaskDispatcher::with_clock(storage.clone(), processor.clone(), now);
+    let mut bodies = vec![json!({ "taskId": "17" })];
+    bodies.extend(
+        [
+            json!(""),
+            json!(null),
+            json!(17),
+            json!([]),
+            json!({}),
+            json!(false),
+        ]
+        .map(|name| json!({ "taskId": "17", "taskName": name })),
+    );
+    for body in bodies {
+        let request = Request::post("/dispatch")
+            .header("content-type", "application/json")
+            .body(text_body(body.to_string()))
+            .unwrap();
+        assert_json(
+            dispatcher.fetch(request).await,
+            400,
+            json!({
+                "error": "taskName must be a non-empty string", "ok": false
+            }),
+        );
+    }
+    assert_eq!(processor.count(), 0);
+    assert!(storage.0.lock().unwrap().scheduled.is_empty());
+}
+
+#[tokio::test]
+async fn exact_names_round_trip_both_hops_without_forwarding_payloads() {
+    for name in [
+        "contract".to_owned(),
+        " ".to_owned(),
+        "Name/\"\\\n雪🦀".to_owned(),
+        "x".repeat(1000),
+    ] {
+        let namespace = RecordingNamespace::default();
+        namespace.stub.0.lock().unwrap().response = Some(Ok(response(200, text_body("accepted"))));
+        dispatch_task(&namespace, &name, "opaque").await.unwrap();
+        let body: Value =
+            serde_json::from_str(namespace.stub.0.lock().unwrap().requests[0].body()).unwrap();
+        assert_eq!(body, json!({ "taskId": "opaque", "taskName": name }));
+        let mut incoming = body.clone();
+        incoming["payload"] = json!({ "untrusted": true });
+        let processor = DeferredProcessor::default();
+        let dispatcher =
+            RetainedTaskDispatcher::with_clock(FakeAlarmStorage::default(), processor.clone(), now);
+        let request = Request::post("/dispatch")
+            .header("content-type", "application/json")
+            .body(text_body(incoming.to_string()))
+            .unwrap();
+        assert_json(
+            dispatcher.fetch(request).await,
+            200,
+            json!({ "ok": true, "taskId": "opaque" }),
+        );
+        wait_for(|| processor.count() == 1).await;
+        assert_eq!(
+            serde_json::from_str::<Value>(processor.0.lock().unwrap()[0].request.body()).unwrap(),
+            body
+        );
+        finish(&processor, 0).await;
+    }
+}
+
+#[tokio::test]
 async fn heartbeat_preserves_only_future_alarms_no_later_than_the_next_heartbeat() {
     for alarm in [
         None,
@@ -625,7 +732,7 @@ async fn dispatch_propagates_namespace_fetch_and_body_read_errors() {
         ..Default::default()
     };
     assert_eq!(
-        dispatch_task(&namespace, "id")
+        dispatch_task(&namespace, "contract", "id")
             .await
             .unwrap_err()
             .to_string(),
@@ -639,7 +746,9 @@ async fn dispatch_propagates_namespace_fetch_and_body_read_errors() {
         } else {
             Err(error)
         });
-        let error = dispatch_task(&namespace, "id").await.unwrap_err();
+        let error = dispatch_task(&namespace, "contract", "id")
+            .await
+            .unwrap_err();
         assert_eq!(error.to_string(), "transport or body failed");
         assert!(error.downcast_ref::<std::io::Error>().is_some());
     }
@@ -658,7 +767,7 @@ async fn diagnostic_truncation_is_unicode_safe_and_never_limits_body_consumption
         namespace.stub.0.lock().unwrap().response = Some(Ok(response(503, body)));
         control.sender.send(Ok(text)).unwrap();
         assert_eq!(
-            dispatch_task(&namespace, "id")
+            dispatch_task(&namespace, "contract", "id")
                 .await
                 .unwrap_err()
                 .to_string(),

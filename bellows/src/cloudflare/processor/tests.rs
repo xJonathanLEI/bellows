@@ -35,7 +35,11 @@ async fn application_cleanup_is_optional() {
     let mut harness = Harness::new(vec![state.clone()]);
     harness.omit_cleanup = true;
     envelope(
-        fetch(&harness, request(json!({ "taskId": "17" }))).await,
+        fetch(
+            &harness,
+            request(json!({ "taskName": Task::NAME, "taskId": "17" })),
+        )
+        .await,
         200,
         json!({ "taskId": "17", "attemptFinished": true }),
     );
@@ -50,6 +54,44 @@ impl TaskDefinition for Task {
     const NAME: &str = "processor_contract";
     type Trigger = PublishTrigger<Payload>;
     type Callback = String;
+}
+
+#[derive(Serialize, Deserialize)]
+struct CountPayload {
+    count: u32,
+}
+
+struct CountTask;
+
+impl TaskDefinition for CountTask {
+    const NAME: &str = "Count/\"\\\n雪🦀";
+    type Trigger = PublishTrigger<CountPayload>;
+    type Callback = Vec<u32>;
+}
+
+struct EmptyNameTask;
+struct EmptyNameFactory;
+
+impl TaskDefinition for EmptyNameTask {
+    const NAME: &str = "";
+    type Trigger = PublishTrigger<()>;
+    type Callback = ();
+}
+
+impl WorkerFactory for EmptyNameFactory {
+    type Worker = Self;
+
+    fn build(&self, _: u64) -> Self {
+        panic!("invalid registrations must not build a worker")
+    }
+}
+
+impl Worker for EmptyNameFactory {
+    type Task = EmptyNameTask;
+
+    async fn process(self, _: u64, _: ()) -> TaskResult<()> {
+        panic!("invalid registrations must not execute")
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -76,6 +118,9 @@ struct State {
     builds: Mutex<Vec<u64>>,
     payloads: Mutex<Vec<(u64, String)>>,
     callbacks: Mutex<Vec<Value>>,
+    decoded: Mutex<Vec<&'static str>>,
+    persisted_name: &'static str,
+    persisted_payload: Value,
     claim: Claim,
     outcome: Outcome,
     finalization_error: bool,
@@ -106,6 +151,9 @@ impl Default for State {
             builds: Mutex::default(),
             payloads: Mutex::default(),
             callbacks: Mutex::default(),
+            decoded: Mutex::default(),
+            persisted_name: Task::NAME,
+            persisted_payload: json!({ "name": "claimed" }),
             claim: Claim::Found,
             outcome: Outcome::Success,
             finalization_error: false,
@@ -193,6 +241,33 @@ impl Drop for BusinessWorker {
     }
 }
 
+struct CountFactory(Arc<State>);
+struct CountWorker(Arc<State>);
+
+impl WorkerFactory for CountFactory {
+    type Worker = CountWorker;
+
+    fn build(&self, worker_id: u64) -> CountWorker {
+        self.0.event("count-build");
+        self.0.builds.lock().unwrap().push(worker_id);
+        CountWorker(self.0.clone())
+    }
+}
+
+impl Worker for CountWorker {
+    type Task = CountTask;
+
+    async fn process(self, id: u64, payload: CountPayload) -> TaskResult<Vec<u32>> {
+        self.0.event("count-process");
+        self.0
+            .payloads
+            .lock()
+            .unwrap()
+            .push((id, payload.count.to_string()));
+        Ok(TaskSuccess::done(vec![payload.count]))
+    }
+}
+
 #[derive(Clone)]
 struct Execution(Arc<State>);
 
@@ -212,6 +287,9 @@ impl TaskExecutionBackend for Execution {
             .lock()
             .unwrap()
             .push((T::NAME.to_owned(), worker_id, task_id));
+        if T::NAME != self.0.persisted_name {
+            return Err(ClaimTaskError::TaskNotFound);
+        }
         match self.0.claim {
             Claim::Missing => return Err(ClaimTaskError::TaskNotFound),
             Claim::Leased => {
@@ -227,9 +305,10 @@ impl TaskExecutionBackend for Execution {
             Claim::Error => return Err(ClaimTaskError::Backend(SECRET.into())),
             Claim::Found => {}
         }
+        self.0.decoded.lock().unwrap().push(T::NAME);
         Ok(ClaimedTask {
             task_id,
-            task_payload: serde_json::from_value(json!({ "name": "claimed" })).unwrap(),
+            task_payload: serde_json::from_value(self.0.persisted_payload.clone()).unwrap(),
             lease_expiration: if self.0.renewal_loss {
                 Instant::now()
             } else {
@@ -305,6 +384,17 @@ impl TaskExecutionBackend for Execution {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+enum Registry {
+    #[default]
+    Both,
+    One,
+    Empty,
+    EmptyName,
+    Duplicate,
+    UnrelatedDuplicate,
+}
+
 struct Harness {
     scopes: Mutex<VecDeque<Arc<State>>>,
     configured: AtomicUsize,
@@ -312,6 +402,7 @@ struct Harness {
     samples: Mutex<VecDeque<Result<[u8; 6], BoxDispatchError>>>,
     configuration_error: bool,
     omit_cleanup: bool,
+    registry: Registry,
     logs: Mutex<Vec<(String, &'static str)>>,
 }
 
@@ -324,6 +415,7 @@ impl Harness {
             samples: Mutex::new(VecDeque::from([Ok([0, 0, 0, 0, 0, 23])])),
             configuration_error: false,
             omit_cleanup: false,
+            registry: Registry::Both,
             logs: Mutex::default(),
         }
     }
@@ -331,10 +423,9 @@ impl Harness {
 
 impl Processor for Harness {
     type Settings = Arc<State>;
-    type Factory = Factory;
     type Backend = Execution;
 
-    fn configure(&self) -> Result<Scope<Arc<State>, Factory>, BoxDispatchError> {
+    fn configure(&self) -> Result<Scope<Arc<State>, Execution>, BoxDispatchError> {
         self.configured.fetch_add(1, Ordering::SeqCst);
         if self.configuration_error {
             return Err(SECRET.into());
@@ -347,9 +438,19 @@ impl Processor for Harness {
             .expect("one scope per request");
         state.event("configure");
         let cleanup = state.clone();
+        let first = || ProcessorTask::new(Factory(state.clone()));
+        let second = || ProcessorTask::new(CountFactory(state.clone()));
+        let tasks = match self.registry {
+            Registry::Both => vec![first(), second()],
+            Registry::One => vec![first()],
+            Registry::Empty => vec![],
+            Registry::EmptyName => vec![first(), ProcessorTask::new(EmptyNameFactory)],
+            Registry::Duplicate => vec![first(), first()],
+            Registry::UnrelatedDuplicate => vec![first(), second(), second()],
+        };
         let mut scope = Scope {
             settings: state.clone(),
-            factory: Factory(state),
+            tasks,
             cleanup: Some(Box::pin(async move {
                 cleanup.event("cleanup");
                 // Lock acquisition waits for worker abort to release its application resource.
@@ -395,7 +496,7 @@ impl Processor for Harness {
     async fn attempt(
         &self,
         backend: Execution,
-        factory: Factory,
+        task: ProcessorTask<Execution>,
         worker_id: u64,
         task_id: u64,
     ) -> Result<(), BoxDispatchError> {
@@ -403,13 +504,7 @@ impl Processor for Harness {
         if backend.0.attempt_error {
             return Err(SECRET.into());
         }
-        run_task_once(
-            backend,
-            factory,
-            worker_id,
-            PublishDispatchToken::Task(task_id),
-        )
-        .await;
+        task.run(backend, worker_id, task_id).await;
         Ok(())
     }
 
@@ -617,7 +712,11 @@ async fn unsafe_ids_reject_before_configuration() {
         let state = Arc::new(State::default());
         let harness = Harness::new(vec![state.clone()]);
         envelope(
-            fetch(&harness, request(json!({ "taskId": task_id }))).await,
+            fetch(
+                &harness,
+                request(json!({ "taskName": Task::NAME, "taskId": task_id })),
+            )
+            .await,
             400,
             json!({ "error": SAFE }),
         );
@@ -631,7 +730,9 @@ async fn boundary_ids_use_explicit_tokens_and_only_claimed_payloads() {
         let state = Arc::new(State::default());
         let harness = Harness::new(vec![state.clone()]);
         *harness.samples.lock().unwrap() = VecDeque::from([Ok([0; 6]), Ok([255; 6])]);
-        let mut input = request(json!({ "taskId": task_id, "payload": { "name": "untrusted" } }));
+        let mut input = request(
+            json!({ "taskName": Task::NAME, "taskId": task_id, "payload": { "name": "untrusted" } }),
+        );
         input.headers_mut().insert(
             CONTENT_TYPE,
             "Application/JSON; charset=utf-8".parse().unwrap(),
@@ -672,6 +773,199 @@ async fn boundary_ids_use_explicit_tokens_and_only_claimed_payloads() {
 }
 
 #[tokio::test]
+async fn invalid_names_reject_even_with_one_registration_before_configuration() {
+    let mut bodies = vec![json!({ "taskId": "17" })];
+    bodies.extend(
+        [
+            json!(""),
+            json!(null),
+            json!(17),
+            json!([]),
+            json!({}),
+            json!(false),
+        ]
+        .map(|name| json!({ "taskId": "17", "taskName": name })),
+    );
+    for body in bodies {
+        let state = Arc::new(State::default());
+        let mut harness = Harness::new(vec![state.clone()]);
+        harness.registry = Registry::One;
+        envelope(
+            fetch(&harness, request(body)).await,
+            400,
+            json!({ "error": INVALID_TASK_NAME }),
+        );
+        untouched(&harness, &state);
+    }
+}
+
+#[tokio::test]
+async fn registry_validation_and_unknown_names_cleanup_without_acquisition() {
+    for (registry, name, invalid) in [
+        (Registry::Empty, Task::NAME, true),
+        (Registry::EmptyName, Task::NAME, true),
+        (Registry::Duplicate, Task::NAME, true),
+        (Registry::UnrelatedDuplicate, Task::NAME, true),
+        (Registry::UnrelatedDuplicate, "unknown", true),
+        (Registry::Both, "unknown", false),
+        (Registry::Both, "PROCESSOR_CONTRACT", false),
+        (Registry::Both, " processor_contract ", false),
+        (Registry::Both, "__proto__", false),
+    ] {
+        for cleanup_error in [false, true] {
+            let state = Arc::new(State {
+                cleanup_error,
+                ..State::default()
+            });
+            let mut harness = Harness::new(vec![state.clone()]);
+            harness.registry = registry;
+            let failed = invalid || cleanup_error;
+            envelope(
+                fetch(
+                    &harness,
+                    request(json!({ "taskId": "17", "taskName": name })),
+                )
+                .await,
+                if failed { 500 } else { 404 },
+                json!({ "error": if failed { "task processing attempt failed" } else { "unknown task name" } }),
+            );
+            assert_eq!(harness.configured.load(Ordering::SeqCst), 1);
+            assert_eq!(harness.random_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(*state.events.lock().unwrap(), ["configure", "cleanup"]);
+            assert!(state.claims.lock().unwrap().is_empty());
+            assert!(state.builds.lock().unwrap().is_empty());
+            let mut stages = vec![];
+            if invalid {
+                stages.push(("17".to_owned(), "configuration"));
+            }
+            if cleanup_error {
+                stages.push(("17".to_owned(), "application-cleanup"));
+            }
+            assert_eq!(*harness.logs.lock().unwrap(), stages);
+        }
+    }
+}
+
+#[tokio::test]
+async fn heterogeneous_routing_uses_each_definition_and_its_claimed_payload() {
+    for (name, payload, recorded, callback, build) in [
+        (
+            Task::NAME,
+            json!({ "name": "claimed" }),
+            "claimed",
+            json!("claimed"),
+            "build",
+        ),
+        (
+            CountTask::NAME,
+            json!({ "count": 42 }),
+            "42",
+            json!([42]),
+            "count-build",
+        ),
+    ] {
+        let state = Arc::new(State {
+            persisted_name: name,
+            persisted_payload: payload,
+            ..State::default()
+        });
+        let harness = Harness::new(vec![state.clone()]);
+        envelope(
+            fetch(&harness, request(json!({
+                "taskId": "17", "taskName": name, "payload": { "name": "untrusted", "count": 99 }
+            }))).await,
+            200, json!({ "taskId": "17", "attemptFinished": true }),
+        );
+        assert_eq!(*state.claims.lock().unwrap(), [(name.to_owned(), 23, 17)]);
+        assert_eq!(*state.decoded.lock().unwrap(), [name]);
+        assert_eq!(*state.builds.lock().unwrap(), [23]);
+        assert_eq!(state.count(build), 1);
+        assert_eq!(
+            state.count(if build == "build" {
+                "count-build"
+            } else {
+                "build"
+            }),
+            0
+        );
+        assert_eq!(*state.payloads.lock().unwrap(), [(17, recorded.to_owned())]);
+        assert_eq!(*state.callbacks.lock().unwrap(), [callback]);
+        assert_eq!(state.count("finish"), 1);
+        assert_eq!(state.count("cleanup"), 1);
+        assert_eq!(state.count("close"), 1);
+        assert!(harness.logs.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn registry_rejections_await_owned_cleanup_before_responding() {
+    for invalid in [false, true] {
+        let cleanup = gate();
+        let state = Arc::new(State {
+            cleanup_gate: Some(cleanup.clone()),
+            ..State::default()
+        });
+        let mut harness = Harness::new(vec![state.clone()]);
+        if invalid {
+            harness.registry = Registry::Duplicate;
+        }
+        let response = fetch(
+            &harness,
+            request(json!({ "taskId": "17", "taskName": "unknown" })),
+        );
+        tokio::pin!(response);
+        tokio::select! {
+            _ = &mut response => panic!("registry rejection before application cleanup"),
+            _ = wait(&state.cleaning) => {}
+        }
+        assert_eq!(harness.random_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(state.count("acquire"), 0);
+        cleanup.add_permits(1);
+        envelope(
+            response.await,
+            if invalid { 500 } else { 404 },
+            json!({
+                "error": if invalid { "task processing attempt failed" } else { "unknown task name" }
+            }),
+        );
+        assert_eq!(state.count("cleanup"), 1);
+        assert_eq!(state.count("close"), 0);
+    }
+}
+
+#[tokio::test]
+async fn persisted_name_mismatch_never_decodes_or_builds_either_worker() {
+    let state = Arc::new(State {
+        persisted_name: CountTask::NAME,
+        persisted_payload: json!({ "count": 42 }),
+        ..State::default()
+    });
+    let harness = Harness::new(vec![state.clone()]);
+    envelope(
+        fetch(
+            &harness,
+            request(json!({ "taskId": "17", "taskName": Task::NAME })),
+        )
+        .await,
+        200,
+        json!({ "taskId": "17", "attemptFinished": true }),
+    );
+    assert_eq!(
+        *state.claims.lock().unwrap(),
+        [(Task::NAME.to_owned(), 23, 17)]
+    );
+    assert!(state.decoded.lock().unwrap().is_empty());
+    assert!(state.builds.lock().unwrap().is_empty());
+    assert!(state.payloads.lock().unwrap().is_empty());
+    assert!(state.callbacks.lock().unwrap().is_empty());
+    assert_eq!(
+        *state.events.lock().unwrap(),
+        ["configure", "acquire", "cleanup", "close"]
+    );
+    assert!(harness.logs.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn no_claim_and_swallowed_claim_errors_still_cleanup_normally() {
     for claim in [
         Claim::Missing,
@@ -685,7 +979,11 @@ async fn no_claim_and_swallowed_claim_errors_still_cleanup_normally() {
         });
         let harness = Harness::new(vec![state.clone()]);
         envelope(
-            fetch(&harness, request(json!({ "taskId": "17" }))).await,
+            fetch(
+                &harness,
+                request(json!({ "taskName": Task::NAME, "taskId": "17" })),
+            )
+            .await,
             200,
             json!({ "taskId": "17", "attemptFinished": true }),
         );
@@ -714,7 +1012,10 @@ async fn attempt_finalization_cleanup_and_close_each_hold_the_response() {
             ..State::default()
         });
         let harness = Harness::new(vec![state.clone()]);
-        let response = fetch(&harness, request(json!({ "taskId": "17" })));
+        let response = fetch(
+            &harness,
+            request(json!({ "taskName": Task::NAME, "taskId": "17" })),
+        );
         tokio::pin!(response);
         tokio::select! {
             _ = &mut response => panic!("response before worker completion"),
@@ -767,7 +1068,11 @@ async fn swallowed_finalization_errors_keep_normal_attempt_semantics() {
         });
         let harness = Harness::new(vec![state.clone()]);
         envelope(
-            fetch(&harness, request(json!({ "taskId": "17" }))).await,
+            fetch(
+                &harness,
+                request(json!({ "taskName": Task::NAME, "taskId": "17" })),
+            )
+            .await,
             200,
             json!({ "taskId": "17", "attemptFinished": true }),
         );
@@ -800,7 +1105,11 @@ async fn infrastructure_failures_are_sanitized_and_cleanup_owned_resources() {
             *harness.samples.lock().unwrap() = VecDeque::from([Err(SECRET.into())]);
         }
         envelope(
-            fetch(&harness, request(json!({ "taskId": "17" }))).await,
+            fetch(
+                &harness,
+                request(json!({ "taskName": Task::NAME, "taskId": "17" })),
+            )
+            .await,
             500,
             json!({ "error": "task processing attempt failed" }),
         );
@@ -826,7 +1135,11 @@ async fn multiple_failures_do_not_skip_shutdown_or_diagnostics() {
     });
     let harness = Harness::new(vec![state.clone()]);
     envelope(
-        fetch(&harness, request(json!({ "taskId": "17" }))).await,
+        fetch(
+            &harness,
+            request(json!({ "taskName": Task::NAME, "taskId": "17" })),
+        )
+        .await,
         500,
         json!({ "error": "task processing attempt failed" }),
     );
@@ -850,14 +1163,22 @@ async fn concurrent_requests_have_fresh_scopes_and_backends() {
     });
     let second = Arc::new(State {
         close_gate: Some(second_gate.clone()),
+        persisted_name: CountTask::NAME,
+        persisted_payload: json!({ "count": 42 }),
         ..State::default()
     });
     let harness = Harness::new(vec![first.clone(), second.clone()]);
     *harness.samples.lock().unwrap() =
         VecDeque::from([Ok([0, 0, 0, 0, 0, 1]), Ok([0, 0, 0, 0, 0, 2])]);
     assert_eq!(harness.configured.load(Ordering::SeqCst), 0);
-    let first_response = fetch(&harness, request(json!({ "taskId": "17" })));
-    let second_response = fetch(&harness, request(json!({ "taskId": "18" })));
+    let first_response = fetch(
+        &harness,
+        request(json!({ "taskName": Task::NAME, "taskId": "17" })),
+    );
+    let second_response = fetch(
+        &harness,
+        request(json!({ "taskName": CountTask::NAME, "taskId": "18" })),
+    );
     tokio::pin!(first_response, second_response);
     tokio::select! {
         biased;
@@ -878,6 +1199,16 @@ async fn concurrent_requests_have_fresh_scopes_and_backends() {
     );
     assert_eq!(*first.builds.lock().unwrap(), [1]);
     assert_eq!(*second.builds.lock().unwrap(), [2]);
+    assert_eq!(first.count("count-build"), 0);
+    assert_eq!(second.count("build"), 0);
+    assert_eq!(
+        *first.claims.lock().unwrap(),
+        [(Task::NAME.to_owned(), 1, 17)]
+    );
+    assert_eq!(
+        *second.claims.lock().unwrap(),
+        [(CountTask::NAME.to_owned(), 2, 18)]
+    );
     assert_eq!(harness.configured.load(Ordering::SeqCst), 2);
     for state in [first, second] {
         assert_eq!(state.count("configure"), 1);
@@ -897,7 +1228,10 @@ async fn renewal_loss_aborts_worker_but_retains_and_awaits_application_cleanup()
         ..State::default()
     });
     let harness = Harness::new(vec![state.clone()]);
-    let response = fetch(&harness, request(json!({ "taskId": "17" })));
+    let response = fetch(
+        &harness,
+        request(json!({ "taskName": Task::NAME, "taskId": "17" })),
+    );
     tokio::pin!(response);
     tokio::select! {
         _ = &mut response => panic!("response before lease loss"),
