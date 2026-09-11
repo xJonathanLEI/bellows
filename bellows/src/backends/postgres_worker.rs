@@ -4,7 +4,7 @@ use std::{error::Error as StdError, fmt, io, num::TryFromIntError, sync::Arc};
 
 use tokio::sync::{MappedMutexGuard, Mutex, MutexGuard};
 use tokio_postgres::{
-    Client, Config, Row,
+    Client, Config, GenericClient, Row, Transaction,
     config::{Host, SslNegotiation, TargetSessionAttrs},
     types::{ToSql, Type},
 };
@@ -12,20 +12,21 @@ use tokio_postgres::{
 use crate::{
     ActivationStrategy, ActivationStrategyKind, PublishActivationStrategy, TaskDefinition,
     backends::{
-        ClaimTaskError, ClaimedTask, FailTaskError, FailedTask, FinishTaskError, FinishedTask,
-        PublishTaskError, PublishedTask, RenewTaskError, RenewedTaskLease,
+        BoxBackendError, ClaimTaskError, ClaimedTask, FailTaskError, FailedTask, FinishTaskError,
+        FinishedTask, PublishTaskError, PublishedTask, RenewTaskError, RenewedTaskLease,
     },
     platform,
     time::clock::{Instant, SystemTime},
 };
 
 use super::postgres_common::{
-    NOTIFY_CHANNEL, NOTIFY_SQL, NotificationPayload, PostgresBackendOptions, claim_earliest_sql,
-    claim_published_sql, claim_singleton_sql, earliest_availability_sql, fail_sql,
-    finish_published_sql, finish_rescheduled_sql, finish_singleton_sql, instant_to_unix_ms,
-    publish_sql, published_state_sql, renew_sql, singleton_state_sql, unix_ms_to_instant,
-    unix_timestamp_ms,
+    NOTIFY_CHANNEL, NOTIFY_SQL, NotificationPayload, PostgresBackendOptions, PreparedPublication,
+    claim_earliest_sql, claim_published_sql, claim_singleton_sql, earliest_availability_sql,
+    fail_sql, finish_published_sql, finish_rescheduled_sql, finish_singleton_sql,
+    instant_to_unix_ms, published_state_sql, published_task, renew_sql, singleton_state_sql,
+    unix_ms_to_instant, unix_timestamp_ms,
 };
+use super::postgres_publishing::{PostgresPublishQuery, PostgresPublishingExecutor};
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 #[path = "postgres_worker_tests.rs"]
@@ -97,6 +98,50 @@ impl StdError for PostgresWorkerError {
 impl From<tokio_postgres::Error> for PostgresWorkerError {
     fn from(error: tokio_postgres::Error) -> Self {
         Self::Postgres(Arc::new(error))
+    }
+}
+
+async fn query_task_id(
+    client: &(impl GenericClient + Sync),
+    query: PostgresPublishQuery<'_>,
+) -> Result<i64, tokio_postgres::Error> {
+    client
+        .query_typed_one(
+            query.sql,
+            &[
+                (&query.task_name, Type::TEXT),
+                (&query.payload_json, Type::TEXT),
+                (&query.callback_id, Type::INT8),
+                (&query.available_from_unix_ms, Type::INT8),
+            ],
+        )
+        .await?
+        .try_get("task_id")
+}
+
+fn publishing_query_error(error: tokio_postgres::Error) -> BoxBackendError {
+    Box::new(PostgresWorkerError::from(error))
+}
+
+impl PostgresPublishingExecutor for Client {
+    async fn query_task_id(
+        &mut self,
+        query: PostgresPublishQuery<'_>,
+    ) -> Result<i64, BoxBackendError> {
+        query_task_id(self, query)
+            .await
+            .map_err(publishing_query_error)
+    }
+}
+
+impl PostgresPublishingExecutor for Transaction<'_> {
+    async fn query_task_id(
+        &mut self,
+        query: PostgresPublishQuery<'_>,
+    ) -> Result<i64, BoxBackendError> {
+        query_task_id(self, query)
+            .await
+            .map_err(publishing_query_error)
     }
 }
 
@@ -285,28 +330,17 @@ impl PostgresTaskOperations {
         T: TaskDefinition,
         T::Trigger: PublishActivationStrategy,
     {
-        let payload_json = serde_json::to_string(&payload).map_err(|error| {
+        let publication =
+            PreparedPublication::new::<T>(&self.table_name, payload, callback_id, available_from);
+        let publication = publication.map_err(|error| {
             publish_error(PostgresWorkerError::PayloadSerialization(Arc::new(error)))
         })?;
-        let now_system = SystemTime::now();
-        let available_from_unix_ms =
-            available_from.map(|available_from| instant_to_unix_ms(available_from, now_system));
         let client = self.client().await.map_err(publish_error)?;
-        let row = client
-            .query_typed_one(
-                &publish_sql(&self.table_name),
-                &[
-                    (&T::NAME, Type::TEXT),
-                    (&payload_json, Type::TEXT),
-                    (&callback_id, Type::INT8),
-                    (&available_from_unix_ms, Type::INT8),
-                ],
-            )
+        let task_id = query_task_id(&*client, publication.query())
             .await
             .map_err(publish_error)?;
-        let task_id = u64::try_from(row.try_get::<_, i64>("task_id").map_err(publish_error)?)
-            .map_err(|error| publish_error(PostgresWorkerError::InvalidTaskId(error)))?;
-        Ok(PublishedTask { task_id })
+        published_task(task_id)
+            .map_err(|error| publish_error(PostgresWorkerError::InvalidTaskId(error)))
     }
 
     pub(super) async fn claim_published<T>(

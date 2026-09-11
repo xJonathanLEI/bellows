@@ -19,12 +19,20 @@ use crate::{
     backends::{
         postgres::{PostgresBackend, initialize_postgres_schema},
         postgres_execution::PostgresExecutionBackend,
+        postgres_publishing::PostgresPublishingBackend,
     },
 };
 
 const DATABASE_URL: &str = "postgres://postgres:postgres@localhost:5432/postgres";
 const LIMIT: Duration = Duration::from_secs(5);
 static NEXT_FIXTURE: AtomicU32 = AtomicU32::new(0);
+
+#[test]
+fn publishing_executors_support_caller_clients_and_borrowed_transactions() {
+    fn accepts<E: PostgresPublishingExecutor>() {}
+    accepts::<Client>();
+    accepts::<Transaction<'_>>();
+}
 
 struct Echo;
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -171,6 +179,18 @@ impl Fixture {
         )
         .await
         .unwrap()
+    }
+
+    async fn caller_connection(
+        &self,
+    ) -> (
+        Client,
+        tokio::task::JoinHandle<Result<(), tokio_postgres::Error>>,
+    ) {
+        let (config, host, port) = connection_config(&self.url()).unwrap();
+        let socket = TcpStream::connect((host.as_str(), port)).await.unwrap();
+        let (client, connection) = config.connect_raw(socket, NoTls).await.unwrap();
+        (client, tokio::spawn(connection))
     }
 
     async fn insert(&self, name: &str, payload: &str, available: Option<i64>) -> u64 {
@@ -589,6 +609,334 @@ async fn publication_errors_preserve_sources_and_do_not_retry_or_undo_committed_
         );
     }
     ops.close().await.unwrap();
+    f.cleanup().await;
+}
+
+#[tokio::test]
+async fn publication_caller_client_and_transactions_retain_the_connection_driver() {
+    let f = Fixture::new().await;
+    let business = format!("\"{}\".business", f.schema);
+    f.admin
+        .batch_execute(&format!("CREATE TABLE {business} (value INT)"))
+        .await
+        .unwrap();
+    let options = PostgresBackendOptions {
+        schema: Some(f.schema.clone()),
+    };
+    let (mut client, driver) = f.caller_connection().await;
+    let pid: i32 = client
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .unwrap()
+        .get(0);
+    let standalone =
+        PostgresPublishingBackend::publish_with_executor::<Other>(&mut client, (), options.clone())
+            .await
+            .unwrap();
+    assert_eq!(f.state(standalone.task_id).await.unwrap().payload, "null");
+    let connections: i64 = f
+        .admin
+        .query_one(
+            "SELECT count(*) FROM pg_stat_activity WHERE application_name = $1",
+            &[&f.schema],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(connections, 1, "only the caller's connection should exist");
+    let listeners: i64 = client
+        .query_one("SELECT count(*) FROM pg_listening_channels()", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(listeners, 0);
+    for commit in [false, true] {
+        let mut transaction = client.transaction().await.unwrap();
+        transaction
+            .batch_execute(&format!("INSERT INTO {business} VALUES (1)"))
+            .await
+            .unwrap();
+        let deadline_ms = unix_timestamp_ms(SystemTime::now()) + 60_000;
+        let deadline = expiration();
+        let payload = || Payload {
+            name: "caller \"🦀\"\n".into(),
+        };
+        let receipts = [
+            PostgresPublishingBackend::publish_with_executor::<Echo>(
+                &mut transaction,
+                payload(),
+                options.clone(),
+            )
+            .await
+            .unwrap(),
+            PostgresPublishingBackend::publish_future_with_executor::<Echo>(
+                &mut transaction,
+                payload(),
+                deadline,
+                options.clone(),
+            )
+            .await
+            .unwrap(),
+        ];
+        let count_sql = format!("SELECT count(*) FROM {business}");
+        assert_eq!(
+            transaction
+                .query_one(&count_sql, &[])
+                .await
+                .unwrap()
+                .get::<_, i64>(0),
+            1
+        );
+        assert_eq!(
+            f.admin
+                .query_one(&count_sql, &[])
+                .await
+                .unwrap()
+                .get::<_, i64>(0),
+            0
+        );
+        for (index, receipt) in receipts.iter().enumerate() {
+            assert!(f.state(receipt.task_id).await.is_none());
+            let row = transaction
+                .query_one(
+                    &format!("SELECT * FROM {} WHERE task_id = $1", f.table),
+                    &[&(receipt.task_id as i64)],
+                )
+                .await
+                .unwrap();
+            assert_eq!(row.get::<_, String>("task_name"), Echo::NAME);
+            assert_eq!(
+                row.get::<_, String>("payload_json"),
+                serde_json::to_string(&payload()).unwrap()
+            );
+            assert_eq!(row.get::<_, Option<String>>("task_unique_key"), None);
+            assert_eq!(row.get::<_, Option<i64>>("callback_id"), None);
+            assert_eq!(row.get::<_, Option<i64>>("lease_worker_id"), None);
+            let available: Option<i64> = row.get("available_from_unix_ms");
+            if index == 0 {
+                assert_eq!(available, None);
+            } else {
+                assert!((available.unwrap() - deadline_ms).abs() <= 100);
+            }
+        }
+        assert!(!driver.is_finished());
+        if commit {
+            transaction.commit().await.unwrap();
+        } else {
+            transaction.rollback().await.unwrap();
+        }
+        for receipt in receipts {
+            assert_eq!(f.state(receipt.task_id).await.is_some(), commit);
+        }
+        assert_eq!(
+            f.admin
+                .query_one(&count_sql, &[])
+                .await
+                .unwrap()
+                .get::<_, i64>(0),
+            i64::from(commit),
+        );
+        assert_eq!(
+            client
+                .query_one("SELECT pg_backend_pid()", &[])
+                .await
+                .unwrap()
+                .get::<_, i32>(0),
+            pid,
+        );
+        assert!(!client.is_closed());
+        assert!(!driver.is_finished());
+    }
+    PostgresPublishingBackend::publish_with_executor::<Other>(&mut client, (), options)
+        .await
+        .unwrap();
+    drop(client);
+    timeout(LIMIT, driver).await.unwrap().unwrap().unwrap();
+    f.cleanup().await;
+}
+
+#[tokio::test]
+async fn publication_caller_transaction_errors_never_finalize_or_close_the_driver() {
+    let f = Fixture::new().await;
+    let business = format!("\"{}\".business", f.schema);
+    let sequence = format!("\"{}\".bellows_tasks_task_id_seq", f.schema);
+    f.admin
+        .batch_execute(&format!(
+            "CREATE TABLE {business} (value INT UNIQUE DEFERRABLE INITIALLY DEFERRED)"
+        ))
+        .await
+        .unwrap();
+    let options = PostgresBackendOptions {
+        schema: Some(f.schema.clone()),
+    };
+    let (mut client, driver) = f.caller_connection().await;
+    let mut transaction = client.transaction().await.unwrap();
+    transaction
+        .batch_execute(&format!("INSERT INTO {business} VALUES (1)"))
+        .await
+        .unwrap();
+    for future in [false, true] {
+        let result = if future {
+            PostgresPublishingBackend::publish_future_with_executor::<RejectedPayloadTask>(
+                &mut transaction,
+                RejectedPayload,
+                expiration(),
+                options.clone(),
+            )
+            .await
+        } else {
+            PostgresPublishingBackend::publish_with_executor::<RejectedPayloadTask>(
+                &mut transaction,
+                RejectedPayload,
+                options.clone(),
+            )
+            .await
+        };
+        let PublishTaskError::Backend(error) = result.unwrap_err();
+        assert!(error.source().unwrap().is::<serde_json::Error>());
+        assert!(
+            error
+                .to_string()
+                .contains("intentional payload serialization failure")
+        );
+    }
+    assert!(
+        !transaction
+            .query_one(&format!("SELECT is_called FROM {sequence}"), &[])
+            .await
+            .unwrap()
+            .get::<_, bool>(0)
+    );
+    assert_eq!(
+        transaction
+            .query_one(&format!("SELECT count(*) FROM {business}"), &[])
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        1
+    );
+    transaction.rollback().await.unwrap();
+
+    f.admin
+        .batch_execute(&format!(
+            "ALTER TABLE {} ADD CONSTRAINT reject_insert CHECK (false)",
+            f.table,
+        ))
+        .await
+        .unwrap();
+    let mut transaction = client.transaction().await.unwrap();
+    transaction
+        .batch_execute(&format!("INSERT INTO {business} VALUES (1)"))
+        .await
+        .unwrap();
+    let PublishTaskError::Backend(error) =
+        PostgresPublishingBackend::publish_with_executor::<Other>(
+            &mut transaction,
+            (),
+            options.clone(),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error.downcast_ref(),
+        Some(PostgresWorkerError::Postgres(_))
+    ));
+    let source = error
+        .source()
+        .unwrap()
+        .downcast_ref::<tokio_postgres::Error>()
+        .unwrap();
+    assert_eq!(source.code().unwrap().code(), "23514");
+    assert_eq!(
+        source.as_db_error().unwrap().constraint(),
+        Some("reject_insert")
+    );
+    let aborted = transaction.query_one("SELECT 1", &[]).await.unwrap_err();
+    assert_eq!(aborted.code().unwrap().code(), "25P02");
+    assert!(!driver.is_finished());
+    transaction.rollback().await.unwrap();
+    assert_eq!(
+        client
+            .query_one(&format!("SELECT last_value FROM {sequence}"), &[])
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        1
+    );
+    assert_eq!(
+        f.admin
+            .query_one(&format!("SELECT count(*) FROM {business}"), &[])
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        0
+    );
+    f.admin
+        .batch_execute(&format!(
+            "ALTER TABLE {} DROP CONSTRAINT reject_insert; \
+         ALTER SEQUENCE {sequence} MINVALUE -1 RESTART WITH -1",
+            f.table,
+        ))
+        .await
+        .unwrap();
+
+    let mut transaction = client.transaction().await.unwrap();
+    let PublishTaskError::Backend(error) =
+        PostgresPublishingBackend::publish_future_with_executor::<Other>(
+            &mut transaction,
+            (),
+            expiration(),
+            options.clone(),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.source().unwrap().is::<TryFromIntError>());
+    let ids_sql = format!("SELECT task_id FROM {}", f.table);
+    assert_eq!(
+        transaction
+            .query_one(&ids_sql, &[])
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        -1
+    );
+    assert!(f.admin.query(&ids_sql, &[]).await.unwrap().is_empty());
+    transaction.rollback().await.unwrap();
+    assert!(f.admin.query(&ids_sql, &[]).await.unwrap().is_empty());
+
+    f.admin
+        .batch_execute(&format!(
+            "ALTER SEQUENCE {sequence} RESTART WITH 9007199254740992",
+        ))
+        .await
+        .unwrap();
+    let mut transaction = client.transaction().await.unwrap();
+    transaction
+        .batch_execute(&format!("INSERT INTO {business} VALUES (1), (1)"))
+        .await
+        .unwrap();
+    let receipt =
+        PostgresPublishingBackend::publish_with_executor::<Other>(&mut transaction, (), options)
+            .await
+            .unwrap();
+    assert_eq!(receipt.task_id, 9_007_199_254_740_992);
+    assert!(f.state(receipt.task_id).await.is_none());
+    let commit_error = transaction.commit().await.unwrap_err();
+    assert_eq!(commit_error.code().unwrap().code(), "23505");
+    assert!(f.state(receipt.task_id).await.is_none());
+    assert_eq!(
+        f.admin
+            .query_one(&format!("SELECT count(*) FROM {business}"), &[])
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        0
+    );
+    client.query_one("SELECT 1", &[]).await.unwrap();
+    assert!(!client.is_closed());
+    assert!(!driver.is_finished());
+    drop(client);
+    timeout(LIMIT, driver).await.unwrap().unwrap().unwrap();
     f.cleanup().await;
 }
 

@@ -4,7 +4,13 @@ use std::{io, sync::Arc, time::Duration};
 
 use serde::{Deserialize, Serialize};
 
-use crate::time::clock::{Instant, SystemTime, UNIX_EPOCH};
+use crate::{
+    PublishActivationStrategy, TaskDefinition,
+    backends::PublishedTask,
+    time::clock::{Instant, SystemTime, UNIX_EPOCH},
+};
+
+use super::postgres_publishing::PostgresPublishQuery;
 
 pub(super) const NOTIFY_CHANNEL: &str = "bellows_tasks";
 pub(super) const NOTIFY_SQL: &str = "SELECT pg_notify($1, $2)";
@@ -64,6 +70,54 @@ VALUES ($1, NULL, $2, $3, NULL, $4)
 RETURNING task_id
 "#
     )
+}
+
+pub(super) struct PreparedPublication {
+    sql: String,
+    task_name: &'static str,
+    payload_json: String,
+    callback_id: Option<i64>,
+    available_from_unix_ms: Option<i64>,
+}
+
+impl PreparedPublication {
+    pub(super) fn new<T>(
+        table_name: &str,
+        payload: <<T as TaskDefinition>::Trigger as PublishActivationStrategy>::Payload,
+        callback_id: Option<i64>,
+        available_from: Option<Instant>,
+    ) -> Result<Self, serde_json::Error>
+    where
+        T: TaskDefinition,
+        T::Trigger: PublishActivationStrategy,
+    {
+        let payload_json = serde_json::to_string(&payload)?;
+        let now_system = SystemTime::now();
+        Ok(Self {
+            sql: publish_sql(table_name),
+            task_name: T::NAME,
+            payload_json,
+            callback_id,
+            available_from_unix_ms: available_from
+                .map(|available_from| instant_to_unix_ms(available_from, now_system)),
+        })
+    }
+
+    pub(super) fn query(&self) -> PostgresPublishQuery<'_> {
+        PostgresPublishQuery {
+            sql: &self.sql,
+            task_name: self.task_name,
+            payload_json: &self.payload_json,
+            callback_id: self.callback_id,
+            available_from_unix_ms: self.available_from_unix_ms,
+        }
+    }
+}
+
+pub(super) fn published_task(task_id: i64) -> Result<PublishedTask, std::num::TryFromIntError> {
+    Ok(PublishedTask {
+        task_id: u64::try_from(task_id)?,
+    })
 }
 
 pub(super) fn claim_published_sql(table_name: &str) -> String {

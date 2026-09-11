@@ -1049,6 +1049,1034 @@ impl TaskDefinition for RejectedPayloadTask {
     type Trigger = PublishTrigger<RejectedPayload>;
 }
 
+mod publishing_executor_contracts {
+    use std::{
+        cell::Cell,
+        error::Error,
+        fmt,
+        task::{Context, Poll, Waker},
+    };
+
+    use bellows::backends::{
+        BoxBackendError,
+        postgres::PostgresBackendError,
+        postgres_publishing::{PostgresPublishQuery, PostgresPublishingExecutor},
+    };
+
+    use super::*;
+
+    #[derive(Debug)]
+    struct RecordedQuery {
+        sql: String,
+        task_name: String,
+        payload_json: String,
+        callback_id: Option<i64>,
+        available_from_unix_ms: Option<i64>,
+    }
+
+    #[derive(Default)]
+    struct State {
+        queries: Vec<RecordedQuery>,
+        // Send but not Sync: the public contract must not require shared ownership.
+        pending: Cell<bool>,
+        drops: usize,
+    }
+
+    struct RecordingExecutor<'a> {
+        state: &'a mut State,
+        result: Option<Result<i64, BoxBackendError>>,
+    }
+
+    impl<'a> RecordingExecutor<'a> {
+        fn new(state: &'a mut State) -> Self {
+            Self {
+                state,
+                result: Some(Ok(17)),
+            }
+        }
+    }
+
+    impl Drop for RecordingExecutor<'_> {
+        fn drop(&mut self) {
+            self.state.drops += 1;
+        }
+    }
+
+    impl PostgresPublishingExecutor for RecordingExecutor<'_> {
+        async fn query_task_id(
+            &mut self,
+            query: PostgresPublishQuery<'_>,
+        ) -> Result<i64, BoxBackendError> {
+            self.state.queries.push(RecordedQuery {
+                sql: query.sql.into(),
+                task_name: query.task_name.into(),
+                payload_json: query.payload_json.into(),
+                callback_id: query.callback_id,
+                available_from_unix_ms: query.available_from_unix_ms,
+            });
+            if self.state.pending.get() {
+                std::future::pending::<()>().await;
+            }
+            self.result.take().expect("one query per publication")
+        }
+    }
+
+    #[test]
+    fn native_adapters_support_pools_connections_and_borrowed_transactions() {
+        fn accepts<E: PostgresPublishingExecutor>() {}
+        accepts::<sqlx::PgPool>();
+        accepts::<&sqlx::PgPool>();
+        accepts::<PgConnection>();
+        accepts::<sqlx::Transaction<'_, sqlx::Postgres>>();
+    }
+
+    #[tokio::test]
+    async fn immediate_and_future_use_one_encoded_parameterized_insert() {
+        for schema in [None, Some("app_tasks")] {
+            for future in [false, true] {
+                let mut state = State::default();
+                let mut executor = RecordingExecutor::new(&mut state);
+                let options = PostgresBackendOptions {
+                    schema: schema.map(str::to_owned),
+                };
+                let payload = EchoTaskPayload {
+                    name: "hello \"🦀\"\n".into(),
+                };
+                let expected_json = serde_json::to_string(&payload).unwrap();
+                let before = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis();
+                let result = if future {
+                    PostgresPublishingBackend::publish_future_with_executor::<EchoTaskSpec>(
+                        &mut executor,
+                        payload,
+                        Instant::now() + Duration::from_secs(60),
+                        options,
+                    )
+                    .await
+                } else {
+                    PostgresPublishingBackend::publish_with_executor::<EchoTaskSpec>(
+                        &mut executor,
+                        payload,
+                        options,
+                    )
+                    .await
+                };
+                assert_eq!(result.unwrap().task_id, 17);
+                assert_eq!(executor.state.queries.len(), 1);
+                let query = &executor.state.queries[0];
+                let table = schema.map_or_else(
+                    || "bellows_tasks".to_owned(),
+                    |schema| format!("\"{schema}\".\"bellows_tasks\""),
+                );
+                assert!(
+                    query
+                        .sql
+                        .trim_start()
+                        .starts_with(&format!("INSERT INTO {table} AS tasks"))
+                );
+                assert!(query.sql.contains("VALUES ($1, NULL, $2, $3, NULL, $4)"));
+                assert!(query.sql.trim_end().ends_with("RETURNING task_id"));
+                assert_eq!(query.sql.matches("INSERT INTO").count(), 1);
+                assert!(!query.sql.contains(&expected_json));
+                assert_eq!(query.task_name, EchoTaskSpec::NAME);
+                assert_eq!(query.payload_json, expected_json);
+                assert_eq!(
+                    query.callback_id, None,
+                    "plain publication registers no callback"
+                );
+                if future {
+                    let after = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis();
+                    let available = u128::try_from(query.available_from_unix_ms.unwrap()).unwrap();
+                    assert!((before + 59_999..=after + 60_001).contains(&available));
+                } else {
+                    assert_eq!(query.available_from_unix_ms, None);
+                }
+                assert_eq!(executor.state.drops, 0);
+                drop(executor);
+                assert_eq!(state.drops, 1, "only the caller drops its executor");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_schema_and_serialization_never_query() {
+        let mut state = State::default();
+        let mut executor = RecordingExecutor::new(&mut state);
+        for schema in [Some("app.bad"), None] {
+            for future in [false, true] {
+                let options = PostgresBackendOptions {
+                    schema: schema.map(str::to_owned),
+                };
+                let result = if future {
+                    PostgresPublishingBackend::publish_future_with_executor::<RejectedPayloadTask>(
+                        &mut executor,
+                        RejectedPayload,
+                        Instant::now(),
+                        options,
+                    )
+                    .await
+                } else {
+                    PostgresPublishingBackend::publish_with_executor::<RejectedPayloadTask>(
+                        &mut executor,
+                        RejectedPayload,
+                        options,
+                    )
+                    .await
+                };
+                let PublishTaskError::Backend(error) = result.unwrap_err();
+                if schema.is_some() {
+                    assert!(
+                        error.is::<std::io::Error>(),
+                        "schema validation precedes serialization"
+                    );
+                } else {
+                    assert!(matches!(
+                        error.downcast_ref::<PostgresBackendError>(),
+                        Some(PostgresBackendError::PayloadSerialization(_))
+                    ));
+                    assert!(error.source().unwrap().is::<serde_json::Error>());
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("intentional payload serialization failure")
+                    );
+                }
+                assert!(executor.state.queries.is_empty());
+            }
+        }
+        assert_eq!(
+            PostgresPublishingBackend::publish_with_executor::<AckTaskSpec>(
+                &mut executor,
+                (),
+                PostgresBackendOptions::default(),
+            )
+            .await
+            .unwrap()
+            .task_id,
+            17,
+        );
+    }
+
+    #[derive(Debug)]
+    struct QueryError(std::io::Error);
+
+    impl fmt::Display for QueryError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            self.0.fmt(f)
+        }
+    }
+
+    impl Error for QueryError {
+        fn source(&self) -> Option<&(dyn Error + 'static)> {
+            Some(&self.0)
+        }
+    }
+
+    #[tokio::test]
+    async fn custom_query_errors_preserve_identity_sources_and_caller_state() {
+        let mut state = State::default();
+        let mut executor = RecordingExecutor::new(&mut state);
+        for future in [false, true] {
+            let error = Box::new(QueryError(std::io::Error::other("adapter failure")));
+            let original = std::ptr::from_ref(error.as_ref());
+            executor.result = Some(Err(error));
+            executor.state.queries.clear();
+            let result = if future {
+                PostgresPublishingBackend::publish_future_with_executor::<AckTaskSpec>(
+                    &mut executor,
+                    (),
+                    Instant::now(),
+                    PostgresBackendOptions::default(),
+                )
+                .await
+            } else {
+                PostgresPublishingBackend::publish_with_executor::<AckTaskSpec>(
+                    &mut executor,
+                    (),
+                    PostgresBackendOptions::default(),
+                )
+                .await
+            };
+            let PublishTaskError::Backend(error) = result.unwrap_err();
+            assert!(std::ptr::eq(
+                error.downcast_ref::<QueryError>().unwrap(),
+                original
+            ));
+            assert!(error.source().unwrap().is::<std::io::Error>());
+            assert_eq!(
+                executor.state.queries.len(),
+                1,
+                "query failures are not retried"
+            );
+            assert_eq!(executor.state.drops, 0);
+        }
+        executor.result = Some(Ok(18));
+        assert_eq!(
+            PostgresPublishingBackend::publish_with_executor::<AckTaskSpec>(
+                &mut executor,
+                (),
+                PostgresBackendOptions::default(),
+            )
+            .await
+            .unwrap()
+            .task_id,
+            18,
+        );
+    }
+
+    #[tokio::test]
+    async fn receipts_keep_the_signed_postgres_range_without_a_javascript_ceiling() {
+        let mut state = State::default();
+        let mut executor = RecordingExecutor::new(&mut state);
+        for future in [false, true] {
+            for raw_id in [0, 1, 9_007_199_254_740_992, i64::MAX, -1, i64::MIN] {
+                executor.result = Some(Ok(raw_id));
+                executor.state.queries.clear();
+                let result = if future {
+                    PostgresPublishingBackend::publish_future_with_executor::<AckTaskSpec>(
+                        &mut executor,
+                        (),
+                        Instant::now(),
+                        PostgresBackendOptions::default(),
+                    )
+                    .await
+                } else {
+                    PostgresPublishingBackend::publish_with_executor::<AckTaskSpec>(
+                        &mut executor,
+                        (),
+                        PostgresBackendOptions::default(),
+                    )
+                    .await
+                };
+                if let Ok(expected) = u64::try_from(raw_id) {
+                    assert_eq!(result.unwrap().task_id, expected);
+                } else {
+                    let PublishTaskError::Backend(error) = result.unwrap_err();
+                    assert!(matches!(
+                        error.downcast_ref::<PostgresBackendError>(),
+                        Some(PostgresBackendError::InvalidTaskId(_))
+                    ));
+                    assert!(error.source().unwrap().is::<std::num::TryFromIntError>());
+                }
+                assert_eq!(executor.state.queries.len(), 1);
+                assert_eq!(executor.state.drops, 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_drops_only_the_borrow() {
+        let mut state = State::default();
+        state.pending.set(true);
+        let mut executor = RecordingExecutor::new(&mut state);
+        let mut publication = Box::pin(PostgresPublishingBackend::publish_with_executor::<
+            AckTaskSpec,
+        >(
+            &mut executor, (), PostgresBackendOptions::default()
+        ));
+        fn assert_send<T: Send>(_: &T) {}
+        assert_send(&publication);
+        assert!(matches!(
+            publication
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Pending,
+        ));
+        drop(publication);
+        assert_eq!(executor.state.drops, 0);
+        assert_eq!(executor.state.queries.len(), 1);
+        executor.state.pending.set(false);
+        assert_eq!(
+            PostgresPublishingBackend::publish_with_executor::<AckTaskSpec>(
+                &mut executor,
+                (),
+                PostgresBackendOptions::default(),
+            )
+            .await
+            .unwrap()
+            .task_id,
+            17,
+        );
+        drop(executor);
+        assert_eq!(state.drops, 1);
+    }
+}
+
+mod publishing_transactions {
+    use bellows::backends::{
+        BoxBackendError, PublishedTask,
+        postgres_publishing::{PostgresPublishQuery, PostgresPublishingExecutor},
+    };
+    use sqlx::{
+        PgPool, Postgres, Transaction,
+        postgres::{PgListener, PgPoolOptions, PgRow},
+    };
+
+    use super::*;
+
+    struct Fixture {
+        database: TestDatabase,
+        pool: PgPool,
+        observer: PgConnection,
+    }
+
+    impl Fixture {
+        async fn new() -> Self {
+            let database = TestDatabase::new("publishing_tx").await;
+            initialize_postgres_schema(database.url(), "public")
+                .await
+                .unwrap();
+            let mut observer = PgConnection::connect(database.url()).await.unwrap();
+            observer
+                .execute("CREATE TABLE business (value INT UNIQUE DEFERRABLE INITIALLY DEFERRED)")
+                .await
+                .unwrap();
+            let pool = PgPoolOptions::new()
+                .max_connections(1)
+                .connect(database.url())
+                .await
+                .unwrap();
+            Self {
+                database,
+                pool,
+                observer,
+            }
+        }
+
+        async fn cleanup(self) {
+            self.pool.close().await;
+            self.observer.close().await.unwrap();
+            self.database.cleanup().await;
+        }
+    }
+
+    async fn counts(connection: &mut PgConnection, table: &str) -> (i64, i64) {
+        sqlx::query_as(&format!(
+            "SELECT (SELECT count(*) FROM business), (SELECT count(*) FROM {table})"
+        ))
+        .fetch_one(connection)
+        .await
+        .unwrap()
+    }
+
+    // Model an ORM's differently shaped raw-query API, retaining the borrowed transaction.
+    struct OrmTransaction<'a, 'c> {
+        transaction: &'a mut Transaction<'c, Postgres>,
+        queries: usize,
+    }
+
+    impl OrmTransaction<'_, '_> {
+        async fn raw(
+            &mut self,
+            sql: &str,
+            values: (&str, &str, Option<i64>, Option<i64>),
+        ) -> Result<Vec<PgRow>, sqlx::Error> {
+            self.queries += 1;
+            sqlx::query(sql)
+                .bind(values.0)
+                .bind(values.1)
+                .bind(values.2)
+                .bind(values.3)
+                .fetch_all(&mut **self.transaction)
+                .await
+        }
+    }
+
+    impl PostgresPublishingExecutor for OrmTransaction<'_, '_> {
+        async fn query_task_id(
+            &mut self,
+            query: PostgresPublishQuery<'_>,
+        ) -> Result<i64, BoxBackendError> {
+            let rows = self
+                .raw(
+                    query.sql,
+                    (
+                        query.task_name,
+                        query.payload_json,
+                        query.callback_id,
+                        query.available_from_unix_ms,
+                    ),
+                )
+                .await?;
+            Ok(rows[0].try_get("task_id")?)
+        }
+    }
+
+    async fn publish_pair(
+        executor: &mut impl PostgresPublishingExecutor,
+        options: PostgresBackendOptions,
+        deadline: Instant,
+    ) -> [PublishedTask; 2] {
+        let payload = || EchoTaskPayload {
+            name: "transaction \"🦀\"\n".into(),
+        };
+        [
+            PostgresPublishingBackend::publish_with_executor::<EchoTaskSpec>(
+                executor,
+                payload(),
+                options.clone(),
+            )
+            .await
+            .unwrap(),
+            PostgresPublishingBackend::publish_future_with_executor::<EchoTaskSpec>(
+                executor,
+                payload(),
+                deadline,
+                options,
+            )
+            .await
+            .unwrap(),
+        ]
+    }
+
+    #[tokio::test]
+    async fn external_pool_and_connection_remain_caller_owned() {
+        let mut f = Fixture::new().await;
+        let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+        let first = PostgresPublishingBackend::publish_with_executor::<AckTaskSpec>(
+            &mut f.pool,
+            (),
+            PostgresBackendOptions::default(),
+        )
+        .await
+        .unwrap();
+        let second = PostgresPublishingBackend::publish_future_with_executor::<AckTaskSpec>(
+            &mut &f.pool,
+            (),
+            Instant::now() + Duration::from_secs(60),
+            PostgresBackendOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert_ne!(first.task_id, second.task_id);
+        assert_eq!(counts(&mut f.observer, "bellows_tasks").await, (0, 2));
+        assert!(!f.pool.is_closed());
+        let (same_pid, listeners): (i32, i64) = sqlx::query_as(
+            "SELECT pg_backend_pid(), (SELECT count(*) FROM pg_listening_channels())",
+        )
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        assert_eq!(same_pid, pid);
+        assert_eq!(listeners, 0);
+        let connections: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database()",
+        )
+        .fetch_one(&mut f.observer)
+        .await
+        .unwrap();
+        assert_eq!(connections, 2, "only the caller pool and observer exist");
+        PostgresPublishingBackend::publish_with_executor::<AckTaskSpec>(
+            &mut f.observer,
+            (),
+            PostgresBackendOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(counts(&mut f.observer, "bellows_tasks").await, (0, 3));
+        f.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn direct_and_orm_transactions_commit_or_roll_back_all_business_and_task_rows() {
+        // Cover both schema modes without multiplying every error scenario by schema/adapter.
+        for adapted in [false, true] {
+            let mut f = Fixture::new().await;
+            let options = if adapted {
+                f.observer.execute("CREATE SCHEMA app_tasks").await.unwrap();
+                initialize_postgres_schema(f.database.url(), "app_tasks")
+                    .await
+                    .unwrap();
+                PostgresBackendOptions {
+                    schema: Some("app_tasks".into()),
+                }
+            } else {
+                PostgresBackendOptions::default()
+            };
+            let table = if adapted {
+                "app_tasks.bellows_tasks"
+            } else {
+                "public.bellows_tasks"
+            };
+            for outcome in ["rollback", "application_error", "commit"] {
+                let mut transaction = f.pool.begin().await.unwrap();
+                transaction
+                    .execute("INSERT INTO business VALUES (1)")
+                    .await
+                    .unwrap();
+                let identity: (i64, String) =
+                    sqlx::query_as("SELECT txid_current(), current_setting('search_path')")
+                        .fetch_one(&mut *transaction)
+                        .await
+                        .unwrap();
+                let deadline_ms = unix_ms_now() + 60_000;
+                let deadline = Instant::now() + Duration::from_secs(60);
+                let receipts = if adapted {
+                    let mut adapter = OrmTransaction {
+                        transaction: &mut transaction,
+                        queries: 0,
+                    };
+                    let receipts = publish_pair(&mut adapter, options.clone(), deadline).await;
+                    assert_eq!(adapter.queries, 2);
+                    receipts
+                } else {
+                    publish_pair(&mut transaction, options.clone(), deadline).await
+                };
+                assert_eq!(counts(&mut transaction, table).await, (1, 2));
+                assert_eq!(counts(&mut f.observer, table).await, (0, 0));
+                let after: (i64, String) =
+                    sqlx::query_as("SELECT txid_current(), current_setting('search_path')")
+                        .fetch_one(&mut *transaction)
+                        .await
+                        .unwrap();
+                assert_eq!(
+                    after, identity,
+                    "publication must not replace the transaction"
+                );
+                for (index, receipt) in receipts.iter().enumerate() {
+                    let row = sqlx::query(&format!("SELECT * FROM {table} WHERE task_id = $1"))
+                        .bind(receipt.task_id as i64)
+                        .fetch_one(&mut *transaction)
+                        .await
+                        .unwrap();
+                    assert_eq!(row.get::<String, _>("task_name"), EchoTaskSpec::NAME);
+                    assert_eq!(
+                        row.get::<String, _>("payload_json"),
+                        serde_json::to_string(&EchoTaskPayload {
+                            name: "transaction \"🦀\"\n".into()
+                        })
+                        .unwrap()
+                    );
+                    assert_eq!(row.get::<Option<String>, _>("task_unique_key"), None);
+                    assert_eq!(row.get::<Option<i64>, _>("callback_id"), None);
+                    assert_eq!(row.get::<Option<i64>, _>("lease_worker_id"), None);
+                    let available: Option<i64> = row.get("available_from_unix_ms");
+                    if index == 0 {
+                        assert_eq!(available, None);
+                    } else {
+                        assert!((available.unwrap() - deadline_ms).abs() <= 100);
+                    }
+                }
+                let mut dispatched = Vec::new();
+                match outcome {
+                    "commit" => {
+                        transaction.commit().await.unwrap();
+                        assert_eq!(counts(&mut f.observer, table).await, (1, 2));
+                        let ids: Vec<i64> = sqlx::query_scalar(&format!(
+                            "SELECT task_id FROM {table} ORDER BY task_id"
+                        ))
+                        .fetch_all(&mut f.observer)
+                        .await
+                        .unwrap();
+                        assert_eq!(ids, receipts.map(|receipt| receipt.task_id as i64));
+                        dispatched.extend(receipts);
+                    }
+                    "application_error" => {
+                        let application_result: Result<(), _> = Err(std::io::Error::other(
+                            "business operation failed after publication",
+                        ));
+                        assert!(application_result.is_err());
+                        transaction.rollback().await.unwrap();
+                    }
+                    _ => transaction.rollback().await.unwrap(),
+                }
+                assert_eq!(dispatched.len(), if outcome == "commit" { 2 } else { 0 });
+                if outcome != "commit" {
+                    assert_eq!(counts(&mut f.observer, table).await, (0, 0));
+                }
+                assert!(!f.pool.is_closed());
+                sqlx::query("SELECT 1").execute(&f.pool).await.unwrap();
+            }
+            if adapted {
+                assert_eq!(
+                    counts(&mut f.observer, "public.bellows_tasks").await,
+                    (1, 0)
+                );
+            }
+            f.cleanup().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn statement_and_codec_errors_leave_finalization_to_the_caller() {
+        let mut f = Fixture::new().await;
+        let mut transaction = f.pool.begin().await.unwrap();
+        transaction
+            .execute("INSERT INTO business VALUES (1)")
+            .await
+            .unwrap();
+        let mut adapter = OrmTransaction {
+            transaction: &mut transaction,
+            queries: 0,
+        };
+        for future in [false, true] {
+            let result = if future {
+                PostgresPublishingBackend::publish_future_with_executor::<RejectedPayloadTask>(
+                    &mut adapter,
+                    RejectedPayload,
+                    Instant::now(),
+                    PostgresBackendOptions::default(),
+                )
+                .await
+            } else {
+                PostgresPublishingBackend::publish_with_executor::<RejectedPayloadTask>(
+                    &mut adapter,
+                    RejectedPayload,
+                    PostgresBackendOptions::default(),
+                )
+                .await
+            };
+            let PublishTaskError::Backend(error) = result.unwrap_err();
+            assert!(error.source().unwrap().is::<serde_json::Error>());
+            assert!(
+                error
+                    .to_string()
+                    .contains("intentional payload serialization failure")
+            );
+        }
+        assert_eq!(adapter.queries, 0);
+        let called: bool = sqlx::query_scalar("SELECT is_called FROM bellows_tasks_task_id_seq")
+            .fetch_one(&mut *transaction)
+            .await
+            .unwrap();
+        assert!(!called);
+        assert_eq!(counts(&mut transaction, "bellows_tasks").await, (1, 0));
+        assert_eq!(counts(&mut f.observer, "bellows_tasks").await, (0, 0));
+        transaction.rollback().await.unwrap();
+
+        f.observer
+            .execute("ALTER TABLE bellows_tasks ADD CONSTRAINT reject_insert CHECK (false)")
+            .await
+            .unwrap();
+        for adapted in [false, true] {
+            let mut transaction = f.pool.begin().await.unwrap();
+            transaction
+                .execute("INSERT INTO business VALUES (1)")
+                .await
+                .unwrap();
+            let result = if adapted {
+                let mut adapter = OrmTransaction {
+                    transaction: &mut transaction,
+                    queries: 0,
+                };
+                let result =
+                    PostgresPublishingBackend::publish_future_with_executor::<AckTaskSpec>(
+                        &mut adapter,
+                        (),
+                        Instant::now(),
+                        PostgresBackendOptions::default(),
+                    )
+                    .await;
+                assert_eq!(adapter.queries, 1);
+                result
+            } else {
+                PostgresPublishingBackend::publish_with_executor::<AckTaskSpec>(
+                    &mut transaction,
+                    (),
+                    PostgresBackendOptions::default(),
+                )
+                .await
+            };
+            let PublishTaskError::Backend(error) = result.unwrap_err();
+            let source = if adapted {
+                error.downcast_ref::<sqlx::Error>().unwrap()
+            } else {
+                error
+                    .source()
+                    .unwrap()
+                    .downcast_ref::<sqlx::Error>()
+                    .unwrap()
+            };
+            let database_error = source.as_database_error().unwrap();
+            assert_eq!(database_error.code().as_deref(), Some("23514"));
+            assert_eq!(database_error.constraint(), Some("reject_insert"));
+            let aborted = transaction.execute("SELECT 1").await.unwrap_err();
+            assert_eq!(
+                aborted.as_database_error().unwrap().code().as_deref(),
+                Some("25P02")
+            );
+            assert_eq!(counts(&mut f.observer, "bellows_tasks").await, (0, 0));
+            transaction.rollback().await.unwrap();
+            let attempts: i64 =
+                sqlx::query_scalar("SELECT last_value FROM bellows_tasks_task_id_seq")
+                    .fetch_one(&f.pool)
+                    .await
+                    .unwrap();
+            assert_eq!(attempts, if adapted { 2 } else { 1 });
+            assert_eq!(counts(&mut f.observer, "bellows_tasks").await, (0, 0));
+        }
+        assert!(!f.pool.is_closed());
+        f.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn receipt_errors_and_large_valid_ids_are_provisional() {
+        let mut f = Fixture::new().await;
+        for id in [-1_i64, 9_007_199_254_740_992, i64::MAX] {
+            f.observer
+                .execute(
+                    format!(
+                        "ALTER SEQUENCE bellows_tasks_task_id_seq MINVALUE -1 RESTART WITH {id}"
+                    )
+                    .as_str(),
+                )
+                .await
+                .unwrap();
+            let mut transaction = f.pool.begin().await.unwrap();
+            transaction
+                .execute("INSERT INTO business VALUES (1)")
+                .await
+                .unwrap();
+            let result = PostgresPublishingBackend::publish_with_executor::<AckTaskSpec>(
+                &mut transaction,
+                (),
+                PostgresBackendOptions::default(),
+            )
+            .await;
+            if id < 0 {
+                let PublishTaskError::Backend(error) = result.unwrap_err();
+                assert!(error.source().unwrap().is::<std::num::TryFromIntError>());
+            } else {
+                assert_eq!(result.unwrap().task_id, id as u64);
+            }
+            let pending: i64 = sqlx::query_scalar("SELECT task_id FROM bellows_tasks")
+                .fetch_one(&mut *transaction)
+                .await
+                .unwrap();
+            assert_eq!(pending, id);
+            assert_eq!(counts(&mut transaction, "bellows_tasks").await, (1, 1));
+            assert_eq!(counts(&mut f.observer, "bellows_tasks").await, (0, 0));
+            transaction.rollback().await.unwrap();
+            assert_eq!(counts(&mut f.observer, "bellows_tasks").await, (0, 0));
+        }
+        sqlx::query("SELECT 1").execute(&f.pool).await.unwrap();
+        f.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn commit_failure_after_a_valid_receipt_never_dispatches_or_commits_rows() {
+        let mut f = Fixture::new().await;
+        let mut transaction = f.pool.begin().await.unwrap();
+        transaction
+            .execute("INSERT INTO business VALUES (1), (1)")
+            .await
+            .unwrap();
+        let receipt = PostgresPublishingBackend::publish_with_executor::<AckTaskSpec>(
+            &mut transaction,
+            (),
+            PostgresBackendOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(counts(&mut transaction, "bellows_tasks").await, (2, 1));
+        assert_eq!(counts(&mut f.observer, "bellows_tasks").await, (0, 0));
+        let mut dispatched = Vec::new();
+        let result = async {
+            transaction.commit().await?;
+            dispatched.push(receipt);
+            Ok::<_, sqlx::Error>(())
+        }
+        .await;
+        assert_eq!(
+            result
+                .unwrap_err()
+                .as_database_error()
+                .unwrap()
+                .code()
+                .as_deref(),
+            Some("23505")
+        );
+        assert!(dispatched.is_empty());
+        assert_eq!(counts(&mut f.observer, "bellows_tasks").await, (0, 0));
+        sqlx::query("SELECT 1").execute(&f.pool).await.unwrap();
+        f.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn notifications_wait_for_commit_and_rollback_emits_nothing() {
+        let mut f = Fixture::new().await;
+        let listener_pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(f.database.url())
+            .await
+            .unwrap();
+        let mut listener = PgListener::connect_with(&listener_pool).await.unwrap();
+        listener.listen("bellows_tasks").await.unwrap();
+        for commit in [false, true] {
+            let mut transaction = f.pool.begin().await.unwrap();
+            let receipts = publish_pair(
+                &mut transaction,
+                PostgresBackendOptions::default(),
+                Instant::now() + Duration::from_secs(60),
+            )
+            .await;
+            let availability: Vec<Option<i64>> = sqlx::query_scalar(
+                "SELECT available_from_unix_ms FROM bellows_tasks ORDER BY task_id",
+            )
+            .fetch_all(&mut *transaction)
+            .await
+            .unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), listener.recv())
+                    .await
+                    .is_err()
+            );
+            if commit {
+                transaction.commit().await.unwrap();
+                for (receipt, available) in receipts.into_iter().zip(availability) {
+                    let notification =
+                        tokio::time::timeout(Duration::from_secs(2), listener.recv())
+                            .await
+                            .unwrap()
+                            .unwrap();
+                    assert_eq!(notification.channel(), "bellows_tasks");
+                    let payload: serde_json::Value =
+                        serde_json::from_str(notification.payload()).unwrap();
+                    assert_eq!(
+                        payload,
+                        serde_json::json!({
+                            "kind": "new_task_available", "task_name": EchoTaskSpec::NAME,
+                            "task_id": receipt.task_id, "available_from_unix_ms": available,
+                        })
+                    );
+                }
+            } else {
+                transaction.rollback().await.unwrap();
+            }
+            // A later notification is a barrier: no rolled-back or duplicate task event may precede it.
+            f.observer
+                .execute("SELECT pg_notify('bellows_tasks', 'barrier')")
+                .await
+                .unwrap();
+            let next = tokio::time::timeout(Duration::from_secs(2), listener.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(next.payload(), "barrier");
+        }
+        listener.unlisten_all().await.unwrap();
+        drop(listener);
+        listener_pool.close().await;
+        f.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn schema_options_respect_search_path_without_initialization_or_cleanup() {
+        let mut f = Fixture::new().await;
+        f.observer
+            .execute("CREATE SCHEMA app_tasks; CREATE SCHEMA empty_schema")
+            .await
+            .unwrap();
+        initialize_postgres_schema(f.database.url(), "app_tasks")
+            .await
+            .unwrap();
+        let mut transaction = f.pool.begin().await.unwrap();
+        transaction
+            .execute("SET LOCAL search_path = app_tasks, pg_catalog")
+            .await
+            .unwrap();
+        for schema in [None, Some("public")] {
+            PostgresPublishingBackend::publish_with_executor::<AckTaskSpec>(
+                &mut transaction,
+                (),
+                PostgresBackendOptions {
+                    schema: schema.map(str::to_owned),
+                },
+            )
+            .await
+            .unwrap();
+            let search_path: String = sqlx::query_scalar("SHOW search_path")
+                .fetch_one(&mut *transaction)
+                .await
+                .unwrap();
+            assert_eq!(search_path, "app_tasks, pg_catalog");
+        }
+        transaction.commit().await.unwrap();
+        assert_eq!(
+            counts(&mut f.observer, "public.bellows_tasks").await,
+            (0, 1)
+        );
+        assert_eq!(
+            counts(&mut f.observer, "app_tasks.bellows_tasks").await,
+            (0, 1)
+        );
+        for schema in [
+            Some("not.valid"),
+            Some("missing_schema"),
+            Some("empty_schema"),
+            None,
+        ] {
+            let mut transaction = f.pool.begin().await.unwrap();
+            transaction
+                .execute("SET LOCAL search_path = empty_schema, pg_catalog")
+                .await
+                .unwrap();
+            let PublishTaskError::Backend(error) =
+                PostgresPublishingBackend::publish_with_executor::<AckTaskSpec>(
+                    &mut transaction,
+                    (),
+                    PostgresBackendOptions {
+                        schema: schema.map(str::to_owned),
+                    },
+                )
+                .await
+                .unwrap_err();
+            if schema == Some("not.valid") {
+                assert!(error.is::<std::io::Error>());
+                transaction.execute("SELECT 1").await.unwrap();
+            } else {
+                assert_eq!(
+                    error
+                        .source()
+                        .unwrap()
+                        .downcast_ref::<sqlx::Error>()
+                        .unwrap()
+                        .as_database_error()
+                        .unwrap()
+                        .code()
+                        .as_deref(),
+                    Some("42P01")
+                );
+                assert_eq!(
+                    transaction
+                        .execute("SELECT 1")
+                        .await
+                        .unwrap_err()
+                        .as_database_error()
+                        .unwrap()
+                        .code()
+                        .as_deref(),
+                    Some("25P02")
+                );
+            }
+            transaction.rollback().await.unwrap();
+            assert!(!f.pool.is_closed());
+        }
+        let initialized: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT FROM pg_namespace WHERE nspname = 'missing_schema') \
+             OR to_regclass('empty_schema.bellows_tasks') IS NOT NULL",
+        )
+        .fetch_one(&mut f.observer)
+        .await
+        .unwrap();
+        assert!(!initialized);
+        assert_eq!(
+            counts(&mut f.observer, "public.bellows_tasks").await,
+            (0, 1)
+        );
+        sqlx::query("SELECT 1").execute(&f.pool).await.unwrap();
+        f.cleanup().await;
+    }
+}
+
 #[tokio::test]
 async fn test_postgres_publishing_error_sources_no_retries_and_id_range() {
     let database = TestDatabase::new("publishing_errors").await;

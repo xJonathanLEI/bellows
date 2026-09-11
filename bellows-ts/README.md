@@ -142,7 +142,7 @@ The annotated synchronous callback infers environment and payload types and runs
 
 Bellows acquires a fresh listener-free `PostgresPublishingBackend`, publishes exactly once, retains the string ID, validates it, awaits `close()`, then calls `dispatchTask` for object `global` with the published definition's exact name. Success waits for complete response-body consumption and returns readonly `PostgresPublisherReceipt.taskId: string`. It confirms **dispatch acceptance, not processing or business success**.
 
-Both PostgreSQL processors require canonical positive decimal IDs up to `9007199254740991`. Lower-level TypeScript PostgreSQL receipts remain `{ taskId: number }` for exact safe integers. Their `PostgresPublishedTaskIdError` preserves an unsupported committed ID as a string; the adapter turns it into a `task-id` failure without rounding or deleting the row. Rust's lower-level receipts remain exact `u64` values.
+Both PostgreSQL processors require canonical positive decimal IDs up to `9007199254740991`. Lower-level TypeScript PostgreSQL receipts remain `{ taskId: number }` for exact safe integers. Their `PostgresPublishedTaskIdError` preserves an unsupported ID as an exact string; the adapter turns it into a `task-id` failure without rounding or deleting the row. Rust's lower-level receipts remain exact `u64` values.
 
 `PostgresPublisherError` exposes `stage`, `cause`, optional `receipt`, and optional `backendCloseError: { cause: unknown }`. Stages are `configuration`, `acquisition`, `publication`, `task-id`, `backend-close`, and `dispatch`. The first failure stays primary even if closing later fails; arbitrary thrown values, including `undefined`, remain failures. A connection failure on the first pool query can be a `publication` failure; stages identify adapter operations rather than driver network categories.
 
@@ -268,13 +268,100 @@ try {
 }
 ```
 
-The backend owns a `pg.Pool`; call and await `close()` once, including on error paths. On Workers, use `env.HYPERDRIVE.connectionString` inside each request with `nodejs_compat`, and await shutdown before returning the response. Never retain connections across requests. The package root and generic Cloudflare entry point do not load PostgreSQL.
+#### Connection ownership
 
-For immediate Cloudflare publication followed by dispatch, prefer [`createPostgresPublisher`](#publisher), which owns this request-scoped lifecycle. Direct backend publication plus `dispatchTask` remains an escape hatch with caller-owned cleanup.
+| Construction                                                | Resource ownership                                                                                                                                                                                  |
+| ----------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `await PostgresPublishingBackend.connect(url, options)`     | Bellows creates and owns a `pg.Pool`. Await `close()` once, including on error paths.                                                                                                               |
+| `PostgresPublishingBackend.fromExecutor(executor, options)` | Synchronous, query-only construction: no pool creation, connection acquisition, or initialization. The caller owns all resources. `close()` is a repeatable no-op and does not disable publication. |
 
-Publication stores a task and may emit a PostgreSQL notification; listener-free is not notification-free. Future publication records availability, not a scheduler or a future Worker request. It does not atomically dispatch to a Durable Object, join an application transaction, or retry publication. A database exception near commit does not establish that no row was written. Awaitable publication remains on the full backend because callback delivery requires its listener.
+`Pool`, `Client`, and `PoolClient` from `pg` satisfy the executor interface directly. For connection reuse, `PostgresPublishingBackend.fromExecutor(pool, { schema: "bellows" })` works with an existing pool and supports both calls in `publishWelcome` above. Sharing a pool is **not** transaction atomicity; each pool query may use a different connection. Bellows never begins, commits, rolls back, releases, or closes caller executors, even after validation/publication failure.
 
-Both PostgreSQL publishing implementations return `{ taskId: number }` only for exact safe integers, including `Number.MAX_SAFE_INTEGER`. Otherwise they throw `PostgresPublishedTaskIdError`, exported from both `backends/postgres-publishing` and `backends/postgres`, with the committed row's exact ID in readonly `taskId: string`. This error does not undo publication; inspect the retained ID rather than automatically republishing. Other publication errors do not prove rollback.
+On Workers, use `env.HYPERDRIVE.connectionString` within each request with `nodejs_compat`. Await owned backend shutdown before returning a response; external executors need caller cleanup. Never retain connections across requests. The package root and generic Cloudflare entry point do not load PostgreSQL. For immediate publication followed by dispatch with an owned connection, [`createPostgresPublisher`](#publisher) retains its request-scoped lifecycle; it does not accept application transactions.
+
+#### Caller-managed transactions
+
+Business mutations and task inserts are atomic only when they use the **same transaction-bound executor**. Using `welcome` above and an existing application table `accounts(email TEXT NOT NULL)`, this function returns only after caller commit and client release:
+
+```ts
+import type { Pool } from "pg";
+
+async function createAccount(pool: Pool, email: string) {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const publisher = PostgresPublishingBackend.fromExecutor(client, {
+      schema: "bellows",
+    });
+    await client.query("INSERT INTO accounts (email) VALUES ($1)", [email]);
+    const receipt = await publisher.publish(welcome, email);
+    // client is still ours; further transaction queries can go here.
+    await client.query("COMMIT");
+    return receipt;
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+```
+
+Keep the transaction-backed publisher inside the transaction's scope. `publishFuture` uses that same transaction but records availability only. No `publisher.close()` is needed: it would neither commit nor release `client`.
+
+If you also need explicit Cloudflare dispatch, use your caller-owned `pool` and dispatcher binding **after** `createAccount` resolves:
+
+```ts
+import { dispatchTask } from "@xjonathanlei/bellows/cloudflare";
+
+const receipt = await createAccount(pool, "alice@example.com");
+await dispatchTask(dispatcher, welcome.name, String(receipt.taskId));
+```
+
+Dispatch is deliberately outside the transaction's error/rollback block: dispatch failure after commit must not trigger a misleading rollback attempt. Retain `receipt` for recovery with the original task name and ID instead of republishing.
+
+#### ORM adapters
+
+The publishing subpath exports `PostgresPublishingExecutor` and `PostgresPublishParameters`. An adapter forwards parameterized SQL to its transaction and normalizes the result shape; it needs no `pg.QueryResult`, pool lifecycle methods, or ORM dependency. For an illustrative transaction API returning `records` rather than `rows`:
+
+```ts
+import type {
+  PostgresPublishingExecutor,
+  PostgresPublishParameters,
+} from "@xjonathanlei/bellows/backends/postgres-publishing";
+
+interface OrmTransaction {
+  execute(
+    sql: string,
+    parameters: PostgresPublishParameters,
+  ): Promise<{ records: { task_id: string }[] }>;
+}
+
+function publicationExecutor(
+  transaction: OrmTransaction,
+): PostgresPublishingExecutor {
+  return {
+    async query(sql, parameters) {
+      const result = await transaction.execute(sql, parameters);
+      return { rows: result.records };
+    },
+  };
+}
+```
+
+Inside your ORM transaction callback, use `PostgresPublishingBackend.fromExecutor(publicationExecutor(transaction), options)` and perform business mutations through that very transaction. Never fall back to a root ORM client or pool. Await the **outer transaction operation**, including commit, before dispatching. Do not retain a transaction-backed publisher outside that scope.
+
+Execute Bellows's generated insert once; do not reconstruct it or interpolate application values. Parameters are `$1` task name, `$2` already-encoded JSON text, `$3` callback ID or `null`, and `$4` availability in Unix milliseconds or `null`. Return the exact textual ID from `RETURNING task_id::text AS task_id`; converting through `number` can irreversibly lose it. Bellows calls `query` on its receiver, so adapters may use `this`.
+
+Explicit schema options are validated and qualify the task table. Omitting `schema` uses the executor's current search path. Neither external construction nor publication initializes tables, issues `SET search_path`, or falls back to `public`.
+
+#### Receipts, notifications, and dispatch
+
+Receipts inside a transaction are **provisional**: caller rollback or a later commit failure can leave no committed task. Both PostgreSQL publishing implementations return `{ taskId: number }` only for exact safe integers, including `Number.MAX_SAFE_INTEGER`. Otherwise they throw the same `PostgresPublishedTaskIdError`, exported from both `backends/postgres-publishing` and `backends/postgres`, with the exact ID in readonly `taskId: string`. That row may have committed in standalone publication or may still be pending in a caller transaction; receipt validation does not undo the insert or finalize the transaction. Inspect the retained ID instead of automatically republishing. A database/transport exception after sending SQL does not establish rollback.
+
+Existing PostgreSQL trigger notifications are delivered only after commit, and not after rollback; listener-free is not notification-free. Explicit Durable Object dispatch is separate and cannot undo a committed publication if it fails. The Cloudflare processor accepts only canonical positive IDs up to `9007199254740991`; an exact ID outside that range requires another recovery path, not ordinary redispatch.
+
+No outbox, durable dispatch guarantee, automatic retry, savepoint, or transaction finalization is added. Future publication records availability, not a scheduler or a future Worker request. Plain publication supports callback-bearing definitions without callback registration, singleton publication remains unavailable, and awaitable publication still needs the full backend's listener.
 
 ### `PostgresExecutionBackend`
 

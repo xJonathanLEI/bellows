@@ -206,11 +206,85 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-The native backend owns a SQLx pool; closing any clone closes the shared resources. On Workers, enable only `cloudflare`, connect through Hyperdrive inside each request, and await `close()` on success and error paths before responding. Never retain connections across requests or rely on dropping clones to close the driver. See the [TypeScript equivalent](./bellows-ts/README.md#postgrespublishingbackend) for its dedicated package subpath and awaited pool shutdown.
+#### Connection ownership
 
-Publication stores a task and may emit a PostgreSQL notification; listener-free is not notification-free. Future publication stores availability, not a scheduler or a future Worker request. It does not atomically dispatch to a Durable Object, join an application transaction, or retry publication. A database exception near commit does not establish that no row was written.
+| Publication path                                                      | Resource ownership                                                                                                                                                            |
+| --------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `connect` / `connect_with_options`, then `publish` / `publish_future` | Bellows owns a native SQLx pool or a Workers connection and driver. Await `close()`; closing any clone closes the shared resources.                                           |
+| `publish_with_executor` / `publish_future_with_executor`              | Each associated function borrows a caller executor for one operation, without constructing a backend. The caller alone manages its transaction, connection, pool, and driver. |
 
-Lower-level Rust receipts retain exact `u64` IDs. TypeScript PostgreSQL receipts retain numeric IDs only when they are exact safe integers; otherwise `PostgresPublishedTaskIdError` preserves the committed ID as a string. The Cloudflare publisher below returns string receipts and restricts dispatch to the processor's safe-positive range.
+On Workers, enable only `cloudflare` and use request-scoped Hyperdrive connections. Await owned backend shutdown on success and error paths before responding; dropping clones does not close the driver. Caller-owned `tokio_postgres::Client` and `tokio_postgres::Transaction` adapters leave driver cleanup to the caller. Never retain connections across requests. See the [TypeScript equivalent](./bellows-ts/README.md#postgrespublishingbackend) for `fromExecutor()` and its no-op external `close()`.
+
+#### Caller-managed transactions
+
+To make business mutations and task inserts atomic, execute both through the **same transaction**. Native executors support SQLx `PgPool`, `&PgPool`, `PgConnection`, and `Transaction<'_, Postgres>`. Using `Welcome` from above and an existing application table `accounts(email TEXT NOT NULL)`:
+
+```rust
+async fn create_account(
+    pool: &sqlx::PgPool,
+    email: &str,
+) -> Result<bellows::backends::PublishedTask, bellows::backends::BoxBackendError> {
+    let mut transaction = pool.begin().await?;
+    sqlx::query("INSERT INTO accounts (email) VALUES ($1)")
+        .bind(email)
+        .execute(&mut *transaction)
+        .await?;
+
+    let receipt = PostgresPublishingBackend::publish_with_executor::<Welcome>(
+        &mut transaction,
+        email.to_owned(),
+        PostgresBackendOptions {
+            schema: Some("bellows".into()),
+        },
+    )
+    .await?;
+    // The borrow has ended; the caller can query, commit, or roll back the transaction.
+    transaction.commit().await?;
+
+    // Return the receipt for optional caller dispatch only after commit succeeds.
+    Ok(receipt)
+}
+```
+
+On an early return, dropping the transaction asks SQLx to roll it back; use `transaction.rollback().await` when you need to await rollback explicitly.
+
+With the `cloudflare` feature enabled, optional explicit dispatch belongs at the call site after `create_account` resolves, using your caller-owned `pool` and dispatcher `namespace`:
+
+```rust
+use bellows::cloudflare::dispatch_task;
+
+let receipt = create_account(pool, "alice@example.com").await?;
+dispatch_task(namespace, Welcome::NAME, &receipt.task_id.to_string()).await?;
+```
+
+Retain `receipt` if dispatch fails; the transaction has already committed. On Workers, use the same commit boundary with a `tokio_postgres` transaction and your `worker::ObjectNamespace`. Do not dispatch while publication is still transaction-local.
+
+A shared external pool is useful for connection reuse but does **not** join business mutations into one transaction. For example, with `pool: &sqlx::PgPool`, future publication borrows a shared handle without closing the pool:
+
+```rust
+let mut executor = pool;
+let receipt = PostgresPublishingBackend::publish_future_with_executor::<Welcome>(
+    &mut executor,
+    "bob@example.com".into(),
+    Instant::now() + Duration::from_secs(60),
+    PostgresBackendOptions {
+        schema: Some("bellows".into()),
+    },
+)
+.await?;
+```
+
+For an ORM, implement `PostgresPublishingExecutor::query_task_id` by forwarding the supplied `PostgresPublishQuery.sql` once to the borrowed transaction. Bind `$1` to `task_name`, `$2` to the already-encoded `payload_json` text, `$3` to `callback_id`, and `$4` to `available_from_unix_ms`; normalize the returned `task_id` to the exact signed `i64` without a floating-point conversion. Return the original driver error as `BoxBackendError`. Do not reconstruct the insert, interpolate values, or fall back to the ORM's root client/pool. The [TypeScript adapter example](./bellows-ts/README.md#orm-adapters) illustrates the same query-only contract without an ORM dependency. If the ORM owns a transaction callback, await the **outer transaction operation**, including commit, before dispatching.
+
+All paths validate explicit schema names and qualify the task table; with no schema option, they use the executor's existing search path. External publication does not initialize schemas/tables, issue `SET search_path`, or fall back to `public`.
+
+#### Receipts, notifications, and dispatch
+
+A receipt returned inside a transaction is **provisional**: the caller can roll back, and a later commit can fail. Receipt-validation errors can likewise refer to a row still pending in that transaction; they do not roll it back. Lower-level Rust receipts convert PostgreSQL's nonnegative signed `i64` IDs to exact `u64` values without a JavaScript safe-integer ceiling. TypeScript returns numeric receipts only for exact safe integers; otherwise `PostgresPublishedTaskIdError.taskId` retains the exact string ID, whether the insert committed in standalone publication or is still transaction-local. Retain exact IDs for recovery rather than blindly republishing; a database/transport exception after sending SQL is not proof of rollback.
+
+PostgreSQL delivers the existing trigger notifications only after commit, and not after rollback; listener-free is not notification-free. Explicit Durable Object dispatch remains a separate caller action after successful commit. A post-commit dispatch failure does not undo publication: retain the receipt and recover dispatch using the original task name and ID instead of republishing. The Cloudflare processor accepts only canonical positive IDs up to `9007199254740991`; an exact ID outside that range requires a different recovery path.
+
+There is no automatic retry, savepoint, transaction finalization, outbox, or durable dispatch guarantee. Future publication records availability only, not a scheduler or a future Worker request. Plain publication supports callback-bearing definitions without registering callbacks; singleton publication remains unavailable, and awaitable publication still requires the full backend. The high-level Cloudflare publisher below retains its owned publish/close/dispatch lifecycle and does not accept application transactions.
 
 ## Cloudflare Workers (Rust and TypeScript)
 

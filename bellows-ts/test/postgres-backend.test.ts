@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { Client, Pool } from "pg";
+import { Client, Pool, type PoolClient } from "pg";
 import { afterEach, expect, expectTypeOf, test, vi } from "vitest";
 import {
   PostgresPublishedTaskIdError as FullBackendPublishedTaskIdError,
@@ -11,11 +11,14 @@ import { validatePostgresSchemaName } from "../src/backends/postgres-operations.
 import {
   PostgresPublishedTaskIdError,
   PostgresPublishingBackend,
+  type PostgresPublishingExecutor,
+  type PostgresPublishParameters,
 } from "../src/backends/postgres-publishing.js";
 import {
   definePublishTask,
   defineSingletonTask,
   LeaseLostError,
+  type PublishedTask,
   runTaskOnce,
   TaskFailure,
   TaskLeasedError,
@@ -505,6 +508,210 @@ test("postgres publishing backend exposes only publication and lifecycle methods
   >();
 });
 
+test("postgres publishing executor types accept native clients and minimal adapters", () => {
+  expectTypeOf<Pool>().toExtend<PostgresPublishingExecutor>();
+  expectTypeOf<Client>().toExtend<PostgresPublishingExecutor>();
+  expectTypeOf<PoolClient>().toExtend<PostgresPublishingExecutor>();
+  expectTypeOf<keyof PostgresPublishingExecutor>().toEqualTypeOf<"query">();
+  expectTypeOf<PostgresPublishParameters>().toEqualTypeOf<
+    [string, string, number | null, number | null]
+  >();
+  const executor = {
+    async query(_sql: string, _parameters: PostgresPublishParameters) {
+      return { rows: [{ task_id: "17" }] };
+    },
+  };
+  expectTypeOf(
+    PostgresPublishingBackend.fromExecutor(executor),
+  ).toEqualTypeOf<PostgresPublishingBackend>();
+  // Typechecked, not executed: the factory preserves task inference and singleton rejection.
+  expectTypeOf((publisher: PostgresPublishingBackend) => {
+    // @ts-expect-error The payload must match the task definition.
+    void publisher.publish(echoTask, { name: 1 });
+    // @ts-expect-error Future payloads must also match the task definition.
+    void publisher.publishFuture(echoTask, { name: 1 }, 0);
+    // @ts-expect-error Singleton activation is not publishable.
+    void publisher.publish(singletonTask, undefined);
+    // @ts-expect-error Singleton activation is not publishable in the future.
+    void publisher.publishFuture(singletonTask, undefined, 0);
+    return publisher.publish(echoTask, { name: "immediate" });
+  }).returns.resolves.toEqualTypeOf<PublishedTask>();
+  expectTypeOf((publisher: PostgresPublishingBackend) =>
+    publisher.publishFuture(echoTask, { name: "future" }, 0),
+  ).returns.resolves.toEqualTypeOf<PublishedTask>();
+});
+
+test.each([
+  undefined,
+  "app_tasks",
+])("postgres publishing executor sends one encoded insert with schema %s", async (schema) => {
+  const executor = {
+    rawTaskId: "17",
+    query: vi.fn(async function (
+      this: { rawTaskId: string },
+      _sql: string,
+      _parameters: PostgresPublishParameters,
+    ) {
+      return { rows: [{ task_id: this.rawTaskId }] };
+    }),
+  };
+  const publisher = PostgresPublishingBackend.fromExecutor(executor, {
+    schema,
+  });
+  expect(executor.query).not.toHaveBeenCalled();
+  const encode = vi.fn(echoTask.codec.encode);
+  const task = { ...echoTask, codec: { ...echoTask.codec, encode } };
+  const payload = { name: 'hello "🦀"\n' };
+  for (const availability of [null, Date.now() + 60_000]) {
+    executor.query.mockClear();
+    encode.mockClear();
+    const receipt = await (availability === null
+      ? publisher.publish(task, payload)
+      : publisher.publishFuture(task, payload, availability));
+    expect(receipt).toEqual({ taskId: 17 });
+    expect(encode).toHaveBeenCalledExactlyOnceWith(payload);
+    expect(executor.query).toHaveBeenCalledExactlyOnceWith(expect.any(String), [
+      task.name,
+      echoTask.codec.encode(payload),
+      null,
+      availability,
+    ]);
+    const sql = executor.query.mock.calls[0][0].trim();
+    const table = schema ? `"${schema}".bellows_tasks` : "bellows_tasks";
+    expect(sql.startsWith(`INSERT INTO ${table} (`)).toBe(true);
+    expect(sql).toContain("VALUES ($1, NULL, $2, $3, NULL, $4)");
+    expect(sql.endsWith("RETURNING task_id::text AS task_id")).toBe(true);
+    expect(sql.match(/INSERT INTO/g)).toHaveLength(1);
+    expect(sql).not.toContain(payload.name);
+  }
+});
+
+test("postgres publishing executor validation and codec failures never query", async () => {
+  const query = vi.fn(async () => ({ rows: [{ task_id: "17" }] }));
+  for (const schema of ["", "Public", "a.b", "a\n", "a\r", 'a"b']) {
+    expect(() =>
+      PostgresPublishingBackend.fromExecutor({ query }, { schema }),
+    ).toThrow("Database schema names");
+  }
+  const publisher = PostgresPublishingBackend.fromExecutor({ query });
+  const error = new Error("intentional payload serialization failure");
+  const encode = vi.fn(() => {
+    throw error;
+  });
+  const task = { ...echoTask, codec: { ...echoTask.codec, encode } };
+  await expect(publisher.publish(task, { name: "immediate" })).rejects.toBe(
+    error,
+  );
+  await expect(
+    publisher.publishFuture(task, { name: "future" }, 100),
+  ).rejects.toBe(error);
+  expect(encode).toHaveBeenCalledTimes(2);
+  expect(query).not.toHaveBeenCalled();
+  expect(await publisher.publish(echoTask, { name: "usable" })).toEqual({
+    taskId: 17,
+  });
+});
+
+test("postgres publishing executor errors and close never take resource ownership", async () => {
+  const cause = new Error("driver failure");
+  const failure = new Error("adapter failure", { cause });
+  const executor = {
+    query: vi.fn(async () => ({ rows: [{ task_id: "17" }] })),
+    connect: vi.fn(),
+    begin: vi.fn(),
+    commit: vi.fn(),
+    rollback: vi.fn(),
+    release: vi.fn(),
+    end: vi.fn(),
+    close: vi.fn(),
+  };
+  // A factory must neither create its own pool nor acquire the external executor.
+  const poolConnect = vi.spyOn(Pool.prototype, "connect");
+  const poolEnd = vi.spyOn(Pool.prototype, "end");
+  try {
+    const publisher = PostgresPublishingBackend.fromExecutor(executor);
+    expect(() =>
+      PostgresPublishingBackend.fromExecutor(executor, { schema: "a.b" }),
+    ).toThrow("Database schema names");
+    expect(executor.query).not.toHaveBeenCalled();
+    expect(await publisher.publish(ackTask, undefined)).toEqual({ taskId: 17 });
+    for (const availability of [null, 100]) {
+      executor.query.mockClear();
+      executor.query.mockRejectedValueOnce(failure);
+      const publication =
+        availability === null
+          ? publisher.publish(ackTask, undefined)
+          : publisher.publishFuture(ackTask, undefined, availability);
+      await expect(publication).rejects.toBe(failure);
+      await expect(publication).rejects.toHaveProperty("cause", cause);
+      expect(executor.query).toHaveBeenCalledTimes(1);
+    }
+    await publisher.close();
+    await publisher.close();
+    expect(await publisher.publishFuture(ackTask, undefined, 200)).toEqual({
+      taskId: 17,
+    });
+    for (const method of [
+      executor.connect,
+      executor.begin,
+      executor.commit,
+      executor.rollback,
+      executor.release,
+      executor.end,
+      executor.close,
+      poolConnect,
+      poolEnd,
+    ]) {
+      expect(method).not.toHaveBeenCalled();
+    }
+  } finally {
+    poolConnect.mockRestore();
+    poolEnd.mockRestore();
+  }
+});
+
+test("postgres publishing executor receipts keep exact IDs and canonical safe-integer checks", async () => {
+  const query = vi.fn(async () => ({ rows: [{ task_id: "17" }] }));
+  const publisher = PostgresPublishingBackend.fromExecutor({ query });
+  for (const availability of [null, 100]) {
+    for (const [rawTaskId, expected] of [
+      ["0", 0],
+      ["-1", -1],
+      ["1", 1],
+      ["9007199254740991", Number.MAX_SAFE_INTEGER],
+      ["-9007199254740991", Number.MIN_SAFE_INTEGER],
+      ["9007199254740992", null],
+      ["9007199254740993", null],
+      ["9223372036854775807", null],
+      ["01", null],
+      ["1.0", null],
+      ["1e0", null],
+      ["-0", null],
+    ] as const) {
+      query.mockClear();
+      query.mockResolvedValueOnce({ rows: [{ task_id: rawTaskId }] });
+      const publication =
+        availability === null
+          ? publisher.publish(ackTask, undefined)
+          : publisher.publishFuture(ackTask, undefined, availability);
+      if (expected === null) {
+        await expect(publication).rejects.toBeInstanceOf(
+          PostgresPublishedTaskIdError,
+        );
+        await expect(publication).rejects.toMatchObject({
+          name: "PostgresPublishedTaskIdError",
+          message:
+            "PostgreSQL publication returned an ID not representable as a safe integer.",
+          taskId: rawTaskId,
+        });
+      } else {
+        expect(await publication).toEqual({ taskId: expected });
+      }
+      expect(query).toHaveBeenCalledTimes(1);
+    }
+  }
+});
+
 test("postgres publication ID errors are shared by both public backends", () => {
   expect(FullBackendPublishedTaskIdError).toBe(PostgresPublishedTaskIdError);
   expectTypeOf<
@@ -862,6 +1069,483 @@ test.each([
     await admin.end();
   }
 });
+
+test("postgres publishing external pool is reusable and creates no owned pool or listener", async () => {
+  const database = track(await TestPostgresDatabase.create("external_pool"));
+  await initializePostgresSchema(database.url, "public");
+  const pool = new Pool({ connectionString: database.url, max: 1 });
+  const observer = new Client({ connectionString: database.url });
+  await observer.connect();
+  const end = vi.spyOn(pool, "end");
+  try {
+    const before = (await pool.query("SELECT pg_backend_pid() AS pid")).rows;
+    const connect = vi.spyOn(pool, "connect");
+    const publisher = PostgresPublishingBackend.fromExecutor(pool);
+    expect(connect).not.toHaveBeenCalled();
+    connect.mockRestore();
+    const first = await publisher.publish(ackTask, undefined);
+    await publisher.close();
+    await publisher.close();
+    expect(end).not.toHaveBeenCalled();
+    const second = await publisher.publishFuture(
+      ackTask,
+      undefined,
+      Date.now() + 60_000,
+    );
+    expect(second.taskId).not.toBe(first.taskId);
+    expect(
+      (
+        await observer.query(
+          "SELECT task_id FROM bellows_tasks ORDER BY task_id",
+        )
+      ).rows,
+    ).toEqual([
+      { task_id: String(first.taskId) },
+      { task_id: String(second.taskId) },
+    ]);
+    expect((await pool.query("SELECT pg_backend_pid() AS pid")).rows).toEqual(
+      before,
+    );
+    expect(
+      (await pool.query("SELECT * FROM pg_listening_channels()")).rows,
+    ).toEqual([]);
+    expect(
+      (
+        await observer.query(
+          "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database()",
+        )
+      ).rows,
+    ).toEqual([{ count: "2" }]);
+    expect(pool.totalCount).toBe(1);
+  } finally {
+    end.mockRestore();
+    await pool.end();
+    await observer.end();
+  }
+});
+
+test.each([
+  false,
+  true,
+])("postgres publishing transaction commits or rolls back all rows (ORM adapter: %s)", async (adapted) => {
+  const f = await publicationTransactionFixture();
+  const schema = adapted ? "app_tasks" : undefined;
+  if (schema) {
+    await f.observer.query("CREATE SCHEMA app_tasks");
+    await initializePostgresSchema(f.database.url, schema);
+  }
+  const table = `"${schema ?? "public"}".bellows_tasks`;
+  for (const outcome of ["rollback", "application-error", "commit"]) {
+    await f.begin();
+    await f.client.query("INSERT INTO business VALUES (1)");
+    const identity = (
+      await f.client.query(
+        "SELECT txid_current(), current_setting('search_path') AS search_path",
+      )
+    ).rows;
+    // This API deliberately has a different result shape and is bound to the transaction client.
+    const orm = {
+      async execute(sql: string, values: PostgresPublishParameters) {
+        return (await f.client.query<{ task_id: string }>(sql, values)).rows;
+      },
+    };
+    const adapter = {
+      query: vi.fn(async (sql: string, values: PostgresPublishParameters) => ({
+        rows: await orm.execute(sql, values),
+      })),
+    };
+    const publisher = PostgresPublishingBackend.fromExecutor(
+      adapted ? adapter : f.client,
+      { schema },
+    );
+    const payload = { name: 'transaction "🦀"\n' };
+    const availability = Date.now() + 60_000;
+    const receipts = [
+      await publisher.publish(echoTask, payload),
+      await publisher.publishFuture(echoTask, payload, availability),
+    ];
+    if (adapted) {
+      expect(adapter.query).toHaveBeenCalledTimes(2);
+    }
+    await publisher.close();
+    await publisher.close();
+    f.assertCallerOwned();
+    expect(
+      (
+        await f.client.query(
+          "SELECT txid_current(), current_setting('search_path') AS search_path",
+        )
+      ).rows,
+    ).toEqual(identity);
+    expect(await publicationCounts(f.client, table)).toEqual(["1", "2"]);
+    expect(await publicationCounts(f.observer, table)).toEqual(["0", "0"]);
+    const expected = receipts.map(({ taskId }, index) => ({
+      task_id: String(taskId),
+      task_name: echoTask.name,
+      task_unique_key: null,
+      payload_json: JSON.stringify(payload),
+      callback_id: null,
+      lease_worker_id: null,
+      available_from_unix_ms: index === 0 ? null : String(availability),
+    }));
+    expect(
+      (await f.client.query(`SELECT * FROM ${table} ORDER BY task_id`)).rows,
+    ).toEqual(expected);
+    const dispatch = vi.fn();
+    if (outcome === "commit") {
+      await f.commit();
+      expect(await publicationCounts(f.observer, table)).toEqual(["1", "2"]);
+      expect(
+        (await f.observer.query(`SELECT * FROM ${table} ORDER BY task_id`))
+          .rows,
+      ).toEqual(expected);
+      dispatch(receipts);
+    } else if (outcome === "application-error") {
+      const applicationError = new Error("business failure after publication");
+      try {
+        throw applicationError;
+      } catch (error) {
+        expect(error).toBe(applicationError);
+        await f.rollback();
+      }
+    } else {
+      await f.rollback();
+    }
+    expect(dispatch).toHaveBeenCalledTimes(outcome === "commit" ? 1 : 0);
+    if (outcome !== "commit") {
+      expect(await publicationCounts(f.observer, table)).toEqual(["0", "0"]);
+    }
+    f.assertCallerOwned();
+    await f.client.query("SELECT 1");
+  }
+  if (adapted) {
+    expect(await publicationCounts(f.observer, "public.bellows_tasks")).toEqual(
+      ["1", "0"],
+    );
+  }
+});
+
+test("postgres publishing transaction codec and statement failures remain caller-controlled", async () => {
+  const f = await publicationTransactionFixture();
+  const publisher = PostgresPublishingBackend.fromExecutor(f.client);
+  await f.begin();
+  await f.client.query("INSERT INTO business VALUES (1)");
+  const query = vi.spyOn(f.client, "query");
+  const codecError = new Error("intentional payload serialization failure");
+  const rejected = {
+    ...echoTask,
+    codec: {
+      ...echoTask.codec,
+      encode: () => {
+        throw codecError;
+      },
+    },
+  };
+  try {
+    await expect(
+      publisher.publish(rejected, { name: "rejected" }),
+    ).rejects.toBe(codecError);
+    await expect(
+      publisher.publishFuture(rejected, { name: "rejected" }, Date.now()),
+    ).rejects.toBe(codecError);
+    expect(query).not.toHaveBeenCalled();
+    await publisher.close();
+    f.assertCallerOwned();
+    expect(
+      (await f.client.query("SELECT is_called FROM bellows_tasks_task_id_seq"))
+        .rows,
+    ).toEqual([{ is_called: false }]);
+    expect(await publicationCounts(f.client)).toEqual(["1", "0"]);
+    expect(await publicationCounts(f.observer)).toEqual(["0", "0"]);
+    await f.rollback();
+
+    await f.observer.query(
+      "ALTER TABLE bellows_tasks ADD CONSTRAINT reject_insert CHECK (false)",
+    );
+    let attempts = 0;
+    for (const availability of [null, Date.now() + 60_000]) {
+      await f.begin();
+      await f.client.query("INSERT INTO business VALUES (1)");
+      query.mockClear();
+      const publication =
+        availability === null
+          ? publisher.publish(ackTask, undefined)
+          : publisher.publishFuture(ackTask, undefined, availability);
+      await expect(publication).rejects.toMatchObject({
+        code: "23514",
+        constraint: "reject_insert",
+        table: "bellows_tasks",
+      });
+      expect(query).toHaveBeenCalledTimes(1);
+      // The exact driver exception, not a message-only replacement, reaches the caller.
+      const original = await query.mock.results[0].value.catch(
+        (error: unknown) => error,
+      );
+      await expect(publication).rejects.toBe(original);
+      await publisher.close();
+      await publisher.close();
+      f.assertCallerOwned();
+      await expect(f.client.query("SELECT 1")).rejects.toMatchObject({
+        code: "25P02",
+      });
+      expect(await publicationCounts(f.observer)).toEqual(["0", "0"]);
+      await f.rollback();
+      expect(
+        (
+          await f.client.query(
+            "SELECT last_value FROM bellows_tasks_task_id_seq",
+          )
+        ).rows,
+      ).toEqual([{ last_value: String(++attempts) }]);
+      expect(await publicationCounts(f.observer)).toEqual(["0", "0"]);
+    }
+    await f.observer.query(
+      "ALTER TABLE bellows_tasks DROP CONSTRAINT reject_insert",
+    );
+    // A no-op external close does not disable later use, even after failure and rollback.
+    await publisher.publish(ackTask, undefined);
+    f.assertCallerOwned();
+  } finally {
+    query.mockRestore();
+  }
+});
+
+test("postgres publishing transaction receipt errors retain exact pending IDs without finalizing", async () => {
+  const f = await publicationTransactionFixture();
+  const publisher = PostgresPublishingBackend.fromExecutor(f.client);
+  for (const rawId of ["9007199254740993", "9223372036854775807"]) {
+    await f.observer.query(
+      `ALTER SEQUENCE bellows_tasks_task_id_seq RESTART WITH ${rawId}`,
+    );
+    await f.begin();
+    await f.client.query("INSERT INTO business VALUES (1)");
+    const publication = publisher.publish(ackTask, undefined);
+    await expect(publication).rejects.toBeInstanceOf(
+      PostgresPublishedTaskIdError,
+    );
+    await expect(publication).rejects.toMatchObject({ taskId: rawId });
+    await publisher.close();
+    f.assertCallerOwned();
+    expect(
+      (await f.client.query("SELECT task_id::text FROM bellows_tasks")).rows,
+    ).toEqual([{ task_id: rawId }]);
+    expect(await publicationCounts(f.client)).toEqual(["1", "1"]);
+    expect(await publicationCounts(f.observer)).toEqual(["0", "0"]);
+    await f.rollback();
+    expect(await publicationCounts(f.observer)).toEqual(["0", "0"]);
+  }
+  await f.client.query("SELECT 1");
+});
+
+test("postgres publishing valid transaction receipt can precede commit failure without dispatch", async () => {
+  const f = await publicationTransactionFixture();
+  await f.begin();
+  await f.client.query("INSERT INTO business VALUES (1), (1)");
+  const publisher = PostgresPublishingBackend.fromExecutor(f.client);
+  const receipt = await publisher.publish(ackTask, undefined);
+  expect(receipt.taskId).toBeGreaterThan(0);
+  expect(await publicationCounts(f.client)).toEqual(["2", "1"]);
+  expect(await publicationCounts(f.observer)).toEqual(["0", "0"]);
+  const dispatch = vi.fn();
+  const workflow = async () => {
+    await f.commit();
+    dispatch(receipt);
+  };
+  await expect(workflow()).rejects.toMatchObject({ code: "23505" });
+  expect(dispatch).not.toHaveBeenCalled();
+  expect(await publicationCounts(f.observer)).toEqual(["0", "0"]);
+  f.assertCallerOwned();
+  await f.client.query("SELECT 1");
+});
+
+test("postgres publishing transaction notifications wait for commit and exclude rollback", async () => {
+  const f = await publicationTransactionFixture();
+  const notifications: string[] = [];
+  f.observer.on("notification", ({ channel, payload }) => {
+    expect(channel).toBe("bellows_tasks");
+    notifications.push(payload ?? "");
+  });
+  await f.observer.query("LISTEN bellows_tasks");
+  try {
+    for (const commit of [false, true]) {
+      await f.begin();
+      const publisher = PostgresPublishingBackend.fromExecutor(f.client);
+      const availability = Date.now() + 60_000;
+      const receipts = [
+        await publisher.publish(echoTask, { name: "notifications" }),
+        await publisher.publishFuture(
+          echoTask,
+          { name: "notifications" },
+          availability,
+        ),
+      ];
+      await sleep(50);
+      expect(notifications).toEqual([]);
+      if (commit) {
+        await f.commit();
+        await expect
+          .poll(() => notifications.length, { timeout: 1_000 })
+          .toBe(2);
+        expect(
+          notifications.splice(0).map((value) => JSON.parse(value)),
+        ).toEqual(
+          receipts.map(({ taskId }, index) => ({
+            kind: "new_task_available",
+            task_name: echoTask.name,
+            task_id: taskId,
+            available_from_unix_ms: index === 0 ? null : availability,
+          })),
+        );
+      } else {
+        await f.rollback();
+      }
+      // This later event forms a barrier for rolled-back or duplicated trigger notifications.
+      await f.client.query("SELECT pg_notify('bellows_tasks', 'barrier')");
+      await expect.poll(() => notifications.length, { timeout: 1_000 }).toBe(1);
+      expect(notifications.splice(0)).toEqual(["barrier"]);
+    }
+  } finally {
+    await f.observer.query("UNLISTEN bellows_tasks");
+  }
+});
+
+test("postgres publishing external schema options preserve search path and never initialize or clean up", async () => {
+  const f = await publicationTransactionFixture();
+  await f.observer.query("CREATE SCHEMA app_tasks; CREATE SCHEMA empty_schema");
+  await initializePostgresSchema(f.database.url, "app_tasks");
+  await f.begin();
+  await f.client.query("SET LOCAL search_path = app_tasks, pg_catalog");
+  for (const schema of [undefined, "public"]) {
+    const publisher = PostgresPublishingBackend.fromExecutor(f.client, {
+      schema,
+    });
+    await publisher.publish(ackTask, undefined);
+    await publisher.close();
+    await publisher.close();
+    f.assertCallerOwned();
+    expect((await f.client.query("SHOW search_path")).rows).toEqual([
+      { search_path: "app_tasks, pg_catalog" },
+    ]);
+  }
+  await f.commit();
+  expect(await publicationCounts(f.observer, "public.bellows_tasks")).toEqual([
+    "0",
+    "1",
+  ]);
+  expect(
+    await publicationCounts(f.observer, "app_tasks.bellows_tasks"),
+  ).toEqual(["0", "1"]);
+  for (const schema of [
+    "not.valid",
+    "missing_schema",
+    "empty_schema",
+    undefined,
+  ]) {
+    await f.begin();
+    await f.client.query("SET LOCAL search_path = empty_schema, pg_catalog");
+    if (schema === "not.valid") {
+      const query = vi.spyOn(f.client, "query");
+      try {
+        expect(() =>
+          PostgresPublishingBackend.fromExecutor(f.client, { schema }),
+        ).toThrow("Database schema names");
+        expect(query).not.toHaveBeenCalled();
+      } finally {
+        query.mockRestore();
+      }
+      await f.client.query("SELECT 1");
+    } else {
+      const publisher = PostgresPublishingBackend.fromExecutor(f.client, {
+        schema,
+      });
+      await expect(publisher.publish(ackTask, undefined)).rejects.toMatchObject(
+        {
+          code: "42P01",
+        },
+      );
+      await publisher.close();
+      await publisher.close();
+      await expect(f.client.query("SELECT 1")).rejects.toMatchObject({
+        code: "25P02",
+      });
+    }
+    f.assertCallerOwned();
+    await f.rollback();
+  }
+  expect(
+    (
+      await f.observer.query(
+        "SELECT EXISTS (SELECT FROM pg_namespace WHERE nspname = 'missing_schema') AS created_schema, to_regclass('empty_schema.bellows_tasks') AS created_table",
+      )
+    ).rows,
+  ).toEqual([{ created_schema: false, created_table: null }]);
+  expect(await publicationCounts(f.observer, "public.bellows_tasks")).toEqual([
+    "0",
+    "1",
+  ]);
+  await f.client.query("SELECT 1");
+});
+
+async function publicationCounts(
+  client: Client | PoolClient,
+  table = "bellows_tasks",
+) {
+  const { rows } = await client.query<{ business: string; tasks: string }>(
+    `SELECT (SELECT count(*) FROM business) AS business, (SELECT count(*) FROM ${table}) AS tasks`,
+  );
+  return [rows[0].business, rows[0].tasks];
+}
+
+async function publicationTransactionFixture() {
+  const database = track(await TestPostgresDatabase.create("publishing_tx"));
+  await initializePostgresSchema(database.url, "public");
+  const observer = new Client({ connectionString: database.url });
+  await observer.connect();
+  await observer.query(
+    "CREATE TABLE business (value INT UNIQUE DEFERRABLE INITIALLY DEFERRED)",
+  );
+  const pool = new Pool({ connectionString: database.url, max: 1 });
+  const client = await pool.connect();
+  const release = vi.spyOn(client, "release");
+  const poolEnd = vi.spyOn(pool, "end");
+  let transactionOpen = false;
+  return track({
+    database,
+    observer,
+    client,
+    async begin() {
+      await client.query("BEGIN");
+      transactionOpen = true;
+    },
+    async commit() {
+      try {
+        await client.query("COMMIT");
+      } finally {
+        // These fixtures use a deferred constraint failure, which ends the transaction.
+        transactionOpen = false;
+      }
+    },
+    async rollback() {
+      await client.query("ROLLBACK");
+      transactionOpen = false;
+    },
+    assertCallerOwned() {
+      expect(release).not.toHaveBeenCalled();
+      expect(poolEnd).not.toHaveBeenCalled();
+    },
+    async close() {
+      if (transactionOpen) {
+        await this.rollback();
+      }
+      // Caller cleanup is deliberately outside the lifecycle-spy assertion window.
+      release.mockRestore();
+      poolEnd.mockRestore();
+      client.release();
+      await pool.end();
+      await observer.end();
+    },
+  });
+}
 
 test("postgres publishing serial pool has no listener and awaited close removes its connections", async () => {
   const database = track(await TestPostgresDatabase.create("publishing_pool"));

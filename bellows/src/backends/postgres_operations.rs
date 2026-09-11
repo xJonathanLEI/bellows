@@ -8,23 +8,24 @@ use std::{
 };
 
 use sqlx::{
-    Connection, PgConnection, Row,
+    Connection, PgConnection, Postgres, Row, Transaction,
     postgres::{PgPool, PgPoolOptions},
 };
 
 use crate::backends::{
-    ClaimTaskError, ClaimedTask, FailTaskError, FailedTask, FinishTaskError, FinishedTask,
-    PublishTaskError, PublishedTask, RenewTaskError, RenewedTaskLease,
+    BoxBackendError, ClaimTaskError, ClaimedTask, FailTaskError, FailedTask, FinishTaskError,
+    FinishedTask, PublishTaskError, PublishedTask, RenewTaskError, RenewedTaskLease,
 };
 use crate::{PublishActivationStrategy, TaskDefinition};
 
 use super::postgres_common::{
-    NOTIFY_CHANNEL, NOTIFY_SQL, NotificationPayload, PostgresBackendOptions, claim_earliest_sql,
-    claim_published_sql, claim_singleton_sql, earliest_availability_sql, fail_sql,
-    finish_published_sql, finish_rescheduled_sql, finish_singleton_sql, instant_to_unix_ms,
-    publish_sql, published_state_sql, renew_sql, singleton_state_sql, unix_ms_to_instant,
-    unix_timestamp_ms, validate_schema_name,
+    NOTIFY_CHANNEL, NOTIFY_SQL, NotificationPayload, PostgresBackendOptions, PreparedPublication,
+    claim_earliest_sql, claim_published_sql, claim_singleton_sql, earliest_availability_sql,
+    fail_sql, finish_published_sql, finish_rescheduled_sql, finish_singleton_sql,
+    instant_to_unix_ms, published_state_sql, published_task, renew_sql, singleton_state_sql,
+    unix_ms_to_instant, unix_timestamp_ms, validate_schema_name,
 };
+use super::postgres_publishing::{PostgresPublishQuery, PostgresPublishingExecutor};
 
 const INITIALIZE_SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS bellows_tasks (
@@ -126,6 +127,68 @@ impl StdError for PostgresBackendError {
     }
 }
 
+async fn query_task_id<'e>(
+    executor: impl sqlx::Executor<'e, Database = Postgres>,
+    query: PostgresPublishQuery<'_>,
+) -> Result<i64, sqlx::Error> {
+    sqlx::query(query.sql)
+        .bind(query.task_name)
+        .bind(query.payload_json)
+        .bind(query.callback_id)
+        .bind(query.available_from_unix_ms)
+        .fetch_one(executor)
+        .await?
+        .try_get("task_id")
+}
+
+fn publishing_query_error(error: sqlx::Error) -> BoxBackendError {
+    Box::new(PostgresBackendError::Sqlx(error))
+}
+
+impl PostgresPublishingExecutor for PgPool {
+    async fn query_task_id(
+        &mut self,
+        query: PostgresPublishQuery<'_>,
+    ) -> Result<i64, BoxBackendError> {
+        query_task_id(&*self, query)
+            .await
+            .map_err(publishing_query_error)
+    }
+}
+
+impl PostgresPublishingExecutor for &PgPool {
+    async fn query_task_id(
+        &mut self,
+        query: PostgresPublishQuery<'_>,
+    ) -> Result<i64, BoxBackendError> {
+        query_task_id(*self, query)
+            .await
+            .map_err(publishing_query_error)
+    }
+}
+
+impl PostgresPublishingExecutor for PgConnection {
+    async fn query_task_id(
+        &mut self,
+        query: PostgresPublishQuery<'_>,
+    ) -> Result<i64, BoxBackendError> {
+        query_task_id(&mut *self, query)
+            .await
+            .map_err(publishing_query_error)
+    }
+}
+
+impl PostgresPublishingExecutor for Transaction<'_, Postgres> {
+    async fn query_task_id(
+        &mut self,
+        query: PostgresPublishQuery<'_>,
+    ) -> Result<i64, BoxBackendError> {
+        query_task_id(&mut **self, query)
+            .await
+            .map_err(publishing_query_error)
+    }
+}
+
 /// Initializes Bellows tables, indexes, and notification triggers in an existing schema.
 ///
 /// This administrative operation uses a temporary connection without a notification listener.
@@ -221,28 +284,17 @@ impl PostgresTaskOperations {
         T: TaskDefinition,
         T::Trigger: PublishActivationStrategy,
     {
-        let payload_json = serde_json::to_string(&payload).map_err(|err| {
+        let publication =
+            PreparedPublication::new::<T>(&self.table_name, payload, callback_id, available_from);
+        let publication = publication.map_err(|err| {
             PublishTaskError::Backend(Box::new(PostgresBackendError::PayloadSerialization(err)))
         })?;
-
-        let now_system = SystemTime::now();
-        let available_from_unix_ms =
-            available_from.map(|available_from| instant_to_unix_ms(available_from, now_system));
-
-        let row = sqlx::query(&publish_sql(&self.table_name))
-            .bind(T::NAME)
-            .bind(payload_json)
-            .bind(callback_id)
-            .bind(available_from_unix_ms)
-            .fetch_one(&self.pool)
+        let task_id = query_task_id(&self.pool, publication.query())
             .await
-            .map_err(|err| PublishTaskError::Backend(Box::new(PostgresBackendError::Sqlx(err))))?;
-
-        let task_id = u64::try_from(row.get::<i64, _>("task_id")).map_err(|err| {
+            .map_err(|error| PublishTaskError::Backend(publishing_query_error(error)))?;
+        published_task(task_id).map_err(|err| {
             PublishTaskError::Backend(Box::new(PostgresBackendError::InvalidTaskId(err)))
-        })?;
-
-        Ok(PublishedTask { task_id })
+        })
     }
 
     pub(super) async fn claim_published<T>(

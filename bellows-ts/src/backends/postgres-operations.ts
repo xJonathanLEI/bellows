@@ -79,9 +79,39 @@ export interface PostgresBackendOptions {
   readonly schema?: string;
 }
 
+/** Bind order: `$1` task name, `$2` encoded JSON text, `$3` callback ID, `$4` Unix milliseconds. */
+export type PostgresPublishParameters = [
+  taskName: string,
+  payloadJson: string,
+  callbackId: number | null,
+  availableFromMs: number | null,
+];
+
 /**
- * Publication committed a task whose ID cannot be returned as an exact safe integer.
- * `taskId` retains the exact PostgreSQL ID; do not automatically republish.
+ * Query-only access to a caller-owned PostgreSQL executor, including a transaction or ORM adapter.
+ * Execute the supplied parameterized SQL once without reconstructing the insert or interpolating
+ * values. Return the exact textual `task_id` from `RETURNING task_id::text AS task_id`; never
+ * normalize it through a potentially lossy number conversion.
+ *
+ * Bellows does not begin/finalize transactions, retry, acquire/release clients, or close this
+ * executor. A pool may manage its own checkout, but sharing a pool does not provide atomicity:
+ * business mutations and publication must use the same transaction-bound executor.
+ * ORM adapters must not fall back to a root client/pool. If the ORM owns a transaction callback,
+ * await the outer operation, including commit, before dispatching. Keep transaction-backed
+ * publishers within that transaction's scope. The query is invoked on its receiver (`this`).
+ */
+export interface PostgresPublishingExecutor {
+  query(
+    sql: string,
+    parameters: PostgresPublishParameters,
+  ): Promise<{ rows: { task_id: string }[] }>;
+}
+
+/**
+ * An inserted task's ID cannot be returned as an exact safe integer. The row may have committed
+ * in standalone publication or may still be pending in a caller-owned transaction.
+ * `taskId` retains the exact PostgreSQL ID; validation does not roll back or finalize a caller
+ * transaction. Do not automatically republish.
  * Other publication errors do not establish whether the insert committed.
  */
 export class PostgresPublishedTaskIdError extends Error {
@@ -135,12 +165,12 @@ export async function initializePostgresPool(
   }
 }
 
-export class PostgresTaskOperations implements TaskExecutionBackend {
+export class PostgresPublishingOperations {
   // Explicit qualification avoids relying on a connection-level search_path through pooling.
   private readonly tableName: string;
 
   constructor(
-    private readonly pool: Pool,
+    private readonly executor: PostgresPublishingExecutor,
     options: PostgresBackendOptions = {},
   ) {
     this.tableName = qualifiedTasksTable(parseSchemaOption(options));
@@ -152,7 +182,7 @@ export class PostgresTaskOperations implements TaskExecutionBackend {
     callbackId: number | null,
     availableFromMs: number | null,
   ): Promise<PublishedTask> {
-    const result = await this.pool.query<{ task_id: string }>(
+    const result = await this.executor.query(
       `
 INSERT INTO ${this.tableName} (
     task_name,
@@ -175,6 +205,33 @@ RETURNING task_id::text AS task_id
     }
 
     return { taskId };
+  }
+}
+
+export class PostgresTaskOperations implements TaskExecutionBackend {
+  private readonly tableName: string;
+  private readonly publishing: PostgresPublishingOperations;
+
+  constructor(
+    private readonly pool: Pool,
+    options: PostgresBackendOptions = {},
+  ) {
+    this.tableName = qualifiedTasksTable(parseSchemaOption(options));
+    this.publishing = new PostgresPublishingOperations(pool, options);
+  }
+
+  async publish<TPayload, TCallback>(
+    task: PublishTaskDefinition<TPayload, TCallback>,
+    payload: TPayload,
+    callbackId: number | null,
+    availableFromMs: number | null,
+  ): Promise<PublishedTask> {
+    return await this.publishing.publish(
+      task,
+      payload,
+      callbackId,
+      availableFromMs,
+    );
   }
 
   async claimPublished<TPayload, TCallback>(
