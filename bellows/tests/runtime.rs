@@ -11,8 +11,8 @@ use std::{
 
 use bellows::{
     ActivationStrategy, PublishActivationStrategy, PublishDispatchToken, PublishTrigger,
-    SingletonTrigger, TaskDefinition, TaskExecutionBackend, TaskFailure, TaskPublishingBackend,
-    TaskResult, TaskSuccess, Worker, WorkerFactory,
+    SingletonTrigger, TaskAttemptOutcome, TaskDefinition, TaskExecutionBackend, TaskFailure,
+    TaskPublishingBackend, TaskResult, TaskSuccess, Worker, WorkerFactory,
     backends::{
         ClaimTaskError, ClaimedTask, FailTaskError, FailedTask, FinishTaskError, FinishedTask,
         RenewTaskError, RenewedTaskLease, in_memory::InMemoryBackend,
@@ -131,6 +131,7 @@ struct ExecutionOnly {
     claim_error: bool,
     finish_error: bool,
     fail_error: bool,
+    finalization_lost: bool,
     recording: Arc<Semaphore>,
     recording_gate: Option<Arc<Semaphore>>,
     renewal: Renewal,
@@ -145,6 +146,7 @@ impl ExecutionOnly {
             claim_error: false,
             finish_error: false,
             fail_error: false,
+            finalization_lost: false,
             recording: Arc::new(Semaphore::new(0)),
             recording_gate: None,
             renewal: Renewal::Normal,
@@ -236,6 +238,9 @@ impl TaskExecutionBackend for ExecutionOnly {
         available_from: Option<Instant>,
     ) -> Result<FailedTask, FailTaskError> {
         self.record().await;
+        if self.finalization_lost {
+            return Err(FailTaskError::LeaseLost);
+        }
         if self.fail_error {
             return Err(FailTaskError::Backend("injected failure error".into()));
         }
@@ -253,6 +258,9 @@ impl TaskExecutionBackend for ExecutionOnly {
         T: TaskDefinition,
     {
         self.record().await;
+        if self.finalization_lost {
+            return Err(FinishTaskError::LeaseLost);
+        }
         if self.finish_error {
             return Err(FinishTaskError::Backend("injected finish error".into()));
         }
@@ -280,7 +288,7 @@ async fn waits_for_worker_and_removes_task() {
     assert_eq!(started.recv().await, Some((17, task.task_id)));
     assert!(!execution.is_finished());
     factory.gate.add_permits(1);
-    let (): () = execution.await.unwrap();
+    assert_eq!(execution.await.unwrap(), TaskAttemptOutcome::Done);
     assert!(matches!(
         backend
             .claim_published::<Published>(18, task.task_id, lease_expiration())
@@ -317,7 +325,12 @@ async fn execution_only_backend_waits_for_completion_and_failure_recording() {
             Err(ClaimTaskError::TaskLeased { .. })
         ));
         gate.add_permits(1);
-        execution.await.unwrap();
+        let outcome = execution.await.unwrap();
+        if failed {
+            assert_immediate(outcome);
+        } else {
+            assert_eq!(outcome, TaskAttemptOutcome::Done);
+        }
         let claim = inner
             .claim_published::<Published>(18, task.task_id, lease_expiration())
             .await;
@@ -360,7 +373,8 @@ async fn singleton_uses_unit_dispatch_token() {
     let backend = InMemoryBackend::new();
     let (factory, mut started) = Factory::<Singleton>::new();
     factory.gate.add_permits(1);
-    run_task_once(ExecutionOnly::new(backend.clone()), factory.clone(), 17, ()).await;
+    let outcome = run_task_once(ExecutionOnly::new(backend.clone()), factory.clone(), 17, ()).await;
+    assert_immediate(outcome);
     let (worker_id, task_id) = started.recv().await.unwrap();
     assert_eq!(worker_id, 17);
     assert_eq!(factory.builds.load(Ordering::SeqCst), 1);
@@ -377,24 +391,56 @@ async fn singleton_uses_unit_dispatch_token() {
 #[tokio::test]
 async fn unsuccessful_claims_never_build_a_worker() {
     let backend = InMemoryBackend::new();
+    let deadline = lease_expiration();
     let leased = backend.publish::<Published>(()).await.unwrap();
     backend
-        .claim_published::<Published>(18, leased.task_id, lease_expiration())
+        .claim_published::<Published>(18, leased.task_id, deadline)
         .await
         .unwrap();
     let future = backend
-        .publish_future::<Published>((), lease_expiration())
+        .publish_future::<Published>((), deadline)
         .await
         .unwrap();
     let (factory, _started) = Factory::<Published>::new();
-    for token in [
-        PublishDispatchToken::Task(u64::MAX),
-        PublishDispatchToken::Task(leased.task_id),
-        PublishDispatchToken::Task(future.task_id),
-        PublishDispatchToken::EarliestAvailable,
+    for (token, expected) in [
+        (
+            PublishDispatchToken::Task(u64::MAX),
+            TaskAttemptOutcome::Done,
+        ),
+        (
+            PublishDispatchToken::Task(leased.task_id),
+            TaskAttemptOutcome::RetryAt {
+                available_from: deadline,
+            },
+        ),
+        (
+            PublishDispatchToken::Task(future.task_id),
+            TaskAttemptOutcome::RetryAt {
+                available_from: deadline,
+            },
+        ),
+        (
+            PublishDispatchToken::EarliestAvailable,
+            TaskAttemptOutcome::RetryAt {
+                available_from: deadline,
+            },
+        ),
     ] {
-        run_task_once(backend.clone(), factory.clone(), 17, token).await;
+        assert_eq!(
+            run_task_once(backend.clone(), factory.clone(), 17, token).await,
+            expected
+        );
     }
+    assert_eq!(
+        run_task_once(
+            InMemoryBackend::new(),
+            factory.clone(),
+            17,
+            PublishDispatchToken::EarliestAvailable
+        )
+        .await,
+        TaskAttemptOutcome::Retry
+    );
     assert_eq!(factory.builds.load(Ordering::SeqCst), 0);
 }
 
@@ -411,14 +457,20 @@ async fn retries_and_rescheduling_require_an_external_attempt() {
         let (mut factory, _started) = Factory::<Published>::new();
         factory.result = result;
         factory.gate.add_permits(2);
-        run_task_once(backend.clone(), factory.clone(), 17, token).await;
-        assert_eq!(factory.builds.load(Ordering::SeqCst), 1);
-        factory.result = Ok(TaskSuccess::done(()));
-        run_task_once(backend.clone(), factory.clone(), 18, token).await;
+        let outcome = run_task_once(backend.clone(), factory.clone(), 17, token).await;
         let scheduled = match result {
             Ok(success) => success.available_from,
             Err(failure) => failure.available_from,
         };
+        match scheduled {
+            Some(available_from) => {
+                assert_eq!(outcome, TaskAttemptOutcome::RetryAt { available_from })
+            }
+            None => assert_immediate(outcome),
+        }
+        assert_eq!(factory.builds.load(Ordering::SeqCst), 1);
+        factory.result = Ok(TaskSuccess::done(()));
+        run_task_once(backend.clone(), factory.clone(), 18, token).await;
         let claim = backend
             .claim_published::<Published>(19, task.task_id, lease_expiration())
             .await;
@@ -437,26 +489,28 @@ async fn retries_and_rescheduling_require_an_external_attempt() {
 }
 
 #[tokio::test]
-async fn backend_errors_return_unit() {
-    for operation in ["claim", "finish", "fail"] {
+async fn backend_errors_remain_retryable() {
+    for operation in ["claim", "finish", "fail", "finish-lost", "fail-lost"] {
         let inner = InMemoryBackend::new();
         let task = inner.publish::<Published>(()).await.unwrap();
         let mut backend = ExecutionOnly::new(inner.clone());
         backend.claim_error = operation == "claim";
         backend.finish_error = operation == "finish";
         backend.fail_error = operation == "fail";
+        backend.finalization_lost = operation.ends_with("-lost");
         let (mut factory, _started) = Factory::<Published>::new();
         factory.gate.add_permits(1);
-        if backend.fail_error {
+        if operation.starts_with("fail") {
             factory.result = Err(TaskFailure::retry_immediately());
         }
-        let (): () = run_task_once(
+        let outcome = run_task_once(
             backend,
             factory.clone(),
             17,
             PublishDispatchToken::Task(task.task_id),
         )
         .await;
+        assert_eq!(outcome, TaskAttemptOutcome::Retry);
         assert_eq!(
             factory.builds.load(Ordering::SeqCst),
             usize::from(operation != "claim")
@@ -493,7 +547,14 @@ async fn renews_while_processing_and_aborts_worker_on_renewal_failure() {
         if matches!(renewal, Renewal::Due) {
             factory.gate.add_permits(1);
         }
-        execution.await.unwrap();
+        assert_eq!(
+            execution.await.unwrap(),
+            if matches!(renewal, Renewal::Due) {
+                TaskAttemptOutcome::Done
+            } else {
+                TaskAttemptOutcome::Retry
+            }
+        );
         // Abortion is asynchronous; wait for the worker's drop rather than assuming it already ran.
         factory.dropped.acquire().await.unwrap().forget();
         let claim = inner
@@ -534,7 +595,14 @@ async fn worker_progresses_during_pending_renewal_but_finalization_waits_for_own
         assert_eq!(backend.recording.available_permits(), 0);
 
         backend.renewal_gate.add_permits(1);
-        execution.await.unwrap();
+        assert_eq!(
+            execution.await.unwrap(),
+            if matches!(renewal, Renewal::Due) {
+                TaskAttemptOutcome::Done
+            } else {
+                TaskAttemptOutcome::Retry
+            }
+        );
         let claim = inner
             .claim_published::<Published>(18, task.task_id, lease_expiration())
             .await;
@@ -571,11 +639,62 @@ async fn native_worker_panic_awaits_failure_recording_and_releases_the_task() {
     assert!(!execution.is_finished());
     assert_eq!(factory.builds.load(Ordering::SeqCst), 1);
     gate.add_permits(1);
-    let (): () = execution.await.unwrap();
+    assert_immediate(execution.await.unwrap());
     assert!(
         inner
             .claim_published::<Published>(18, task.task_id, lease_expiration())
             .await
             .is_ok()
     );
+}
+
+fn assert_immediate(outcome: TaskAttemptOutcome) {
+    let TaskAttemptOutcome::RetryAt { available_from } = outcome else {
+        panic!("expected immediate retry, got {outcome:?}");
+    };
+    assert!(available_from <= Instant::now());
+    assert!(available_from.elapsed() < Duration::from_secs(1));
+}
+
+#[tokio::test]
+async fn scheduling_outcomes_wait_for_finalization_and_require_ownership() {
+    for failed in [false, true] {
+        for disposition in ["committed", "error", "lost"] {
+            let inner = InMemoryBackend::new();
+            let task = inner.publish::<Published>(()).await.unwrap();
+            let mut backend = ExecutionOnly::new(inner);
+            let gate = Arc::new(Semaphore::new(0));
+            backend.recording_gate = Some(gate.clone());
+            backend.fail_error = disposition == "error";
+            backend.finish_error = disposition == "error";
+            backend.finalization_lost = disposition == "lost";
+            let (mut factory, _started) = Factory::<Published>::new();
+            let deadline = lease_expiration();
+            factory.result = if failed {
+                Err(TaskFailure::retry_at(deadline))
+            } else {
+                Ok(TaskSuccess::schedule_next_run((), deadline))
+            };
+            factory.gate.add_permits(1);
+            let execution = tokio::spawn(run_task_once(
+                backend.clone(),
+                factory,
+                17,
+                PublishDispatchToken::Task(task.task_id),
+            ));
+            backend.recording.acquire().await.unwrap().forget();
+            assert!(!execution.is_finished());
+            gate.add_permits(1);
+            assert_eq!(
+                execution.await.unwrap(),
+                if disposition == "committed" {
+                    TaskAttemptOutcome::RetryAt {
+                        available_from: deadline,
+                    }
+                } else {
+                    TaskAttemptOutcome::Retry
+                }
+            );
+        }
+    }
 }

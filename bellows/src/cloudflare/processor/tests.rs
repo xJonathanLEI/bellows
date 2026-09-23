@@ -24,6 +24,78 @@ const SECRET: &str = "postgres://user:secret@private/database";
 const CANONICAL: &str = "taskId must be a canonical positive decimal string";
 const SAFE: &str = "taskId must encode a positive safe integer canonically";
 
+fn retry_envelope(
+    response: Response<String>,
+    earliest: crate::time::clock::SystemTime,
+    latest: crate::time::clock::SystemTime,
+) {
+    let body: Value = serde_json::from_str(response.body()).unwrap();
+    let at_ms = body["nextAction"]["atMs"].as_u64().unwrap();
+    let unix_ms = |time: crate::time::clock::SystemTime| {
+        time.duration_since(crate::time::clock::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    };
+    assert!(at_ms >= unix_ms(earliest) && at_ms <= unix_ms(latest) + 1);
+    envelope(
+        response,
+        200,
+        json!({ "taskId": "17", "nextAction": { "type": "retryAt", "atMs": at_ms } }),
+    );
+}
+
+#[tokio::test]
+async fn availability_and_committed_schedules_preserve_absolute_deadlines_through_cleanup() {
+    for past in [false, true] {
+        for kind in ["future", "failure", "reschedule"] {
+            let clocks = crate::time::deadlines::ClockSnapshot::now();
+            let at = if past {
+                Instant::now() - Duration::from_secs(60)
+            } else {
+                Instant::now() + Duration::from_secs(60)
+            };
+            let expected = clocks.to_system_time(at).unwrap();
+            let state = Arc::new(State {
+                claim: if kind == "future" {
+                    Claim::Future(at)
+                } else {
+                    Claim::Found
+                },
+                outcome: if kind == "failure" {
+                    Outcome::ScheduledFailure(at)
+                } else {
+                    Outcome::Reschedule(at)
+                },
+                cleanup_gate: Some(gate()),
+                close_gate: Some(gate()),
+                ..State::default()
+            });
+            let harness = Harness::new(vec![state.clone()]);
+            let response = fetch(
+                &harness,
+                request(json!({ "taskId": "17", "taskName": Task::NAME })),
+            );
+            tokio::pin!(response);
+            tokio::select! {
+                _ = &mut response => panic!("response before cleanup"),
+                _ = wait(&state.cleaning) => {}
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            state.cleanup_gate.as_ref().unwrap().add_permits(1);
+            tokio::select! {
+                _ = &mut response => panic!("response before close"),
+                _ = wait(&state.closing) => {}
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            state.close_gate.as_ref().unwrap().add_permits(1);
+            retry_envelope(response.await, expected, expected);
+            assert_eq!(state.count("finish"), usize::from(kind == "reschedule"));
+            assert_eq!(state.count("fail"), usize::from(kind == "failure"));
+            assert!(harness.logs.lock().unwrap().is_empty());
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct Payload {
     name: String,
@@ -41,7 +113,7 @@ async fn application_cleanup_is_optional() {
         )
         .await,
         200,
-        json!({ "taskId": "17", "attemptFinished": true }),
+        json!({ "taskId": "17", "nextAction": { "type": "done" } }),
     );
     assert_eq!(state.count("cleanup"), 0);
     assert_eq!(state.count("close"), 1);
@@ -100,6 +172,7 @@ enum Claim {
     Found,
     Missing,
     Leased,
+    Future(Instant),
     Unavailable,
     Error,
 }
@@ -110,6 +183,8 @@ enum Outcome {
     Success,
     Failure,
     Panic,
+    Reschedule(Instant),
+    ScheduledFailure(Instant),
 }
 
 struct State {
@@ -124,6 +199,7 @@ struct State {
     claim: Claim,
     outcome: Outcome,
     finalization_error: bool,
+    finalization_lost: bool,
     acquisition_error: bool,
     attempt_error: bool,
     cleanup_error: bool,
@@ -157,6 +233,7 @@ impl Default for State {
             claim: Claim::Found,
             outcome: Outcome::Success,
             finalization_error: false,
+            finalization_lost: false,
             acquisition_error: false,
             attempt_error: false,
             cleanup_error: false,
@@ -231,6 +308,8 @@ impl Worker for BusinessWorker {
             Outcome::Success => Ok(TaskSuccess::done("claimed".to_owned())),
             Outcome::Failure => Err(TaskFailure::retry_immediately()),
             Outcome::Panic => panic!("injected business panic"),
+            Outcome::Reschedule(at) => Ok(TaskSuccess::schedule_next_run("claimed".to_owned(), at)),
+            Outcome::ScheduledFailure(at) => Err(TaskFailure::retry_at(at)),
         }
     }
 }
@@ -297,6 +376,11 @@ impl TaskExecutionBackend for Execution {
                     expiration: lease_expiration,
                 });
             }
+            Claim::Future(at) => {
+                return Err(ClaimTaskError::TaskUnavailable {
+                    available_from: Some(at),
+                });
+            }
             Claim::Unavailable => {
                 return Err(ClaimTaskError::TaskUnavailable {
                     available_from: None,
@@ -353,7 +437,9 @@ impl TaskExecutionBackend for Execution {
         _: Option<Instant>,
     ) -> Result<FailedTask, FailTaskError> {
         self.0.record("fail").await;
-        if self.0.finalization_error {
+        if self.0.finalization_lost {
+            Err(FailTaskError::LeaseLost)
+        } else if self.0.finalization_error {
             Err(FailTaskError::Backend(SECRET.into()))
         } else {
             Ok(FailedTask { task_id })
@@ -376,7 +462,9 @@ impl TaskExecutionBackend for Execution {
             .unwrap()
             .push(serde_json::to_value(callback).unwrap());
         self.0.record("finish").await;
-        if self.0.finalization_error {
+        if self.0.finalization_lost {
+            Err(FinishTaskError::LeaseLost)
+        } else if self.0.finalization_error {
             Err(FinishTaskError::Backend(SECRET.into()))
         } else {
             Ok(FinishedTask { task_id })
@@ -499,13 +587,12 @@ impl Processor for Harness {
         task: ProcessorTask<Execution>,
         worker_id: u64,
         task_id: u64,
-    ) -> Result<(), BoxDispatchError> {
-        // The production runtime returns unit. This private seam covers an adapter-visible error.
+    ) -> Result<TaskAttemptOutcome, BoxDispatchError> {
+        // This private seam covers an adapter-visible error rather than a runtime outcome.
         if backend.0.attempt_error {
             return Err(SECRET.into());
         }
-        task.run(backend, worker_id, task_id).await;
-        Ok(())
+        Ok(task.run(backend, worker_id, task_id).await)
     }
 
     async fn close(&self, backend: Execution) -> Result<(), BoxDispatchError> {
@@ -740,7 +827,7 @@ async fn boundary_ids_use_explicit_tokens_and_only_claimed_payloads() {
         envelope(
             fetch(&harness, input).await,
             200,
-            json!({ "taskId": task_id, "attemptFinished": true }),
+            json!({ "taskId": task_id, "nextAction": { "type": "done" } }),
         );
         let worker_id = (1_u64 << 48) - 1;
         let id = task_id.parse::<u64>().unwrap();
@@ -874,7 +961,7 @@ async fn heterogeneous_routing_uses_each_definition_and_its_claimed_payload() {
             fetch(&harness, request(json!({
                 "taskId": "17", "taskName": name, "payload": { "name": "untrusted", "count": 99 }
             }))).await,
-            200, json!({ "taskId": "17", "attemptFinished": true }),
+            200, json!({ "taskId": "17", "nextAction": { "type": "done" } }),
         );
         assert_eq!(*state.claims.lock().unwrap(), [(name.to_owned(), 23, 17)]);
         assert_eq!(*state.decoded.lock().unwrap(), [name]);
@@ -948,7 +1035,7 @@ async fn persisted_name_mismatch_never_decodes_or_builds_either_worker() {
         )
         .await,
         200,
-        json!({ "taskId": "17", "attemptFinished": true }),
+        json!({ "taskId": "17", "nextAction": { "type": "done" } }),
     );
     assert_eq!(
         *state.claims.lock().unwrap(),
@@ -966,7 +1053,7 @@ async fn persisted_name_mismatch_never_decodes_or_builds_either_worker() {
 }
 
 #[tokio::test]
-async fn no_claim_and_swallowed_claim_errors_still_cleanup_normally() {
+async fn no_claim_outcomes_preserve_cleanup_and_report_next_actions() {
     for claim in [
         Claim::Missing,
         Claim::Leased,
@@ -978,21 +1065,38 @@ async fn no_claim_and_swallowed_claim_errors_still_cleanup_normally() {
             ..State::default()
         });
         let harness = Harness::new(vec![state.clone()]);
-        envelope(
-            fetch(
-                &harness,
-                request(json!({ "taskName": Task::NAME, "taskId": "17" })),
-            )
-            .await,
-            200,
-            json!({ "taskId": "17", "attemptFinished": true }),
-        );
+        let before = crate::time::clock::SystemTime::now();
+        let response = fetch(
+            &harness,
+            request(json!({ "taskName": Task::NAME, "taskId": "17" })),
+        )
+        .await;
+        match claim {
+            Claim::Missing => envelope(
+                response,
+                200,
+                json!({ "taskId": "17", "nextAction": { "type": "done" } }),
+            ),
+            Claim::Leased => retry_envelope(
+                response,
+                before + Duration::from_secs(20),
+                crate::time::clock::SystemTime::now() + Duration::from_secs(20),
+            ),
+            _ => envelope(
+                response,
+                500,
+                json!({ "error": "task processing attempt failed" }),
+            ),
+        }
         assert_eq!(
             *state.events.lock().unwrap(),
             ["configure", "acquire", "cleanup", "close"]
         );
         assert!(state.builds.lock().unwrap().is_empty());
-        assert!(harness.logs.lock().unwrap().is_empty());
+        assert_eq!(
+            harness.logs.lock().unwrap().is_empty(),
+            matches!(claim, Claim::Missing | Claim::Leased)
+        );
     }
 }
 
@@ -1012,6 +1116,7 @@ async fn attempt_finalization_cleanup_and_close_each_hold_the_response() {
             ..State::default()
         });
         let harness = Harness::new(vec![state.clone()]);
+        let before = crate::time::clock::SystemTime::now();
         let response = fetch(
             &harness,
             request(json!({ "taskName": Task::NAME, "taskId": "17" })),
@@ -1039,11 +1144,16 @@ async fn attempt_finalization_cleanup_and_close_each_hold_the_response() {
             _ = wait(&state.closing) => {}
         }
         close.add_permits(1);
-        envelope(
-            response.await,
-            200,
-            json!({ "taskId": "17", "attemptFinished": true }),
-        );
+        let response = response.await;
+        if matches!(outcome, Outcome::Success) {
+            envelope(
+                response,
+                200,
+                json!({ "taskId": "17", "nextAction": { "type": "done" } }),
+            );
+        } else {
+            retry_envelope(response, before, crate::time::clock::SystemTime::now());
+        }
         assert_eq!(
             state.count(if matches!(outcome, Outcome::Success) {
                 "finish"
@@ -1059,11 +1169,60 @@ async fn attempt_finalization_cleanup_and_close_each_hold_the_response() {
 }
 
 #[tokio::test]
-async fn swallowed_finalization_errors_keep_normal_attempt_semantics() {
-    for outcome in [Outcome::Success, Outcome::Failure] {
+async fn finalization_errors_return_uncertain_responses() {
+    let at = Instant::now() + Duration::from_secs(60);
+    for outcome in [
+        Outcome::Success,
+        Outcome::Failure,
+        Outcome::Reschedule(at),
+        Outcome::ScheduledFailure(at),
+    ] {
+        for lost in [false, true] {
+            let recording = gate();
+            let state = Arc::new(State {
+                outcome,
+                finalization_error: !lost,
+                finalization_lost: lost,
+                recording_gate: Some(recording.clone()),
+                ..State::default()
+            });
+            let harness = Harness::new(vec![state.clone()]);
+            let response = fetch(
+                &harness,
+                request(json!({ "taskName": Task::NAME, "taskId": "17" })),
+            );
+            tokio::pin!(response);
+            tokio::select! {
+                _ = &mut response => panic!("response before failed finalization"),
+                _ = wait(&state.recording) => {}
+            }
+            assert_eq!(state.count("cleanup"), 0);
+            recording.add_permits(1);
+            envelope(
+                response.await,
+                500,
+                json!({ "error": "task processing attempt failed" }),
+            );
+            assert_eq!(state.count("cleanup"), 1);
+            assert_eq!(state.count("close"), 1);
+            assert_eq!(
+                *harness.logs.lock().unwrap(),
+                [("17".to_owned(), "attempt")]
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn invalid_wire_dates_return_uncertainty_after_cleanup() {
+    use crate::time::{clock::UNIX_EPOCH, deadlines::ClockSnapshot};
+    for date in [
+        UNIX_EPOCH - Duration::from_millis(1),
+        UNIX_EPOCH + Duration::from_millis(8_640_000_000_000_001),
+    ] {
+        let at = ClockSnapshot::now().to_instant(date).unwrap();
         let state = Arc::new(State {
-            outcome,
-            finalization_error: true,
+            outcome: Outcome::Reschedule(at),
             ..State::default()
         });
         let harness = Harness::new(vec![state.clone()]);
@@ -1073,12 +1232,16 @@ async fn swallowed_finalization_errors_keep_normal_attempt_semantics() {
                 request(json!({ "taskName": Task::NAME, "taskId": "17" })),
             )
             .await,
-            200,
-            json!({ "taskId": "17", "attemptFinished": true }),
+            500,
+            json!({ "error": "task processing attempt failed" }),
         );
+        assert_eq!(state.count("finish"), 1);
         assert_eq!(state.count("cleanup"), 1);
         assert_eq!(state.count("close"), 1);
-        assert!(harness.logs.lock().unwrap().is_empty());
+        assert_eq!(
+            *harness.logs.lock().unwrap(),
+            [("17".to_owned(), "attempt")]
+        );
     }
 }
 
@@ -1189,13 +1352,13 @@ async fn concurrent_requests_have_fresh_scopes_and_backends() {
     second_gate.add_permits(1);
     tokio::select! {
         _ = &mut first_response => panic!("first response released with second"),
-        response = &mut second_response => envelope(response, 200, json!({ "taskId": "18", "attemptFinished": true })),
+        response = &mut second_response => envelope(response, 200, json!({ "taskId": "18", "nextAction": { "type": "done" } })),
     }
     first_gate.add_permits(1);
     envelope(
         first_response.await,
         200,
-        json!({ "taskId": "17", "attemptFinished": true }),
+        json!({ "taskId": "17", "nextAction": { "type": "done" } }),
     );
     assert_eq!(*first.builds.lock().unwrap(), [1]);
     assert_eq!(*second.builds.lock().unwrap(), [2]);
@@ -1247,13 +1410,16 @@ async fn renewal_loss_aborts_worker_but_retains_and_awaits_application_cleanup()
     cleanup_gate.add_permits(1);
     envelope(
         response.await,
-        200,
-        json!({ "taskId": "17", "attemptFinished": true }),
+        500,
+        json!({ "error": "task processing attempt failed" }),
     );
     assert_eq!(*state.resource.lock().await, Some(true));
     assert_eq!(state.count("cleanup"), 1);
     assert_eq!(state.count("close"), 1);
     assert_eq!(state.count("finish"), 0);
     assert_eq!(state.count("fail"), 0);
-    assert!(harness.logs.lock().unwrap().is_empty());
+    assert_eq!(
+        *harness.logs.lock().unwrap(),
+        [("17".to_owned(), "attempt")]
+    );
 }

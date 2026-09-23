@@ -8,3 +8,9 @@ export const fullNameTask = definePublishTask<{
   firstName: string;
   lastName: string;
 }>("cloudflare_full_name");
+
+export const schedulingTask = definePublishTask<{
+  name: string;
+  mode: "failure" | "success" | "immediate";
+  availableFromMs: number;
+}>("cloudflare_scheduling");

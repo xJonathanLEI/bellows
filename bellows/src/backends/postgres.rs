@@ -7,7 +7,7 @@ use std::{
     collections::{HashMap, hash_map::Entry as HashMapEntry},
     fmt::Formatter,
     sync::{Arc, Mutex, Weak},
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, Instant},
 };
 
 use rand::RngExt;
@@ -444,7 +444,7 @@ impl Daemon {
 
                 if let Some(sender) = sender {
                     let available_from = available_from_unix_ms
-                        .map(|unix_ms| unix_ms_to_instant(unix_ms, SystemTime::now()))
+                        .and_then(unix_ms_to_instant)
                         .unwrap_or_else(Instant::now);
                     let _ = sender.send(BackendSignal::NewTaskAvailable(
                         NewTaskAvailableSignalPayload {

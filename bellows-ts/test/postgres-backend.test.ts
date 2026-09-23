@@ -7,7 +7,10 @@ import {
   PostgresBackend,
 } from "../src/backends/postgres.js";
 import { PostgresExecutionBackend } from "../src/backends/postgres-execution.js";
-import { validatePostgresSchemaName } from "../src/backends/postgres-operations.js";
+import {
+  PostgresTaskOperations,
+  validatePostgresSchemaName,
+} from "../src/backends/postgres-operations.js";
 import {
   PostgresPublishedTaskIdError,
   PostgresPublishingBackend,
@@ -49,6 +52,114 @@ const adminDatabaseUrl =
   "postgres://postgres:postgres@localhost:5432/postgres";
 
 const resources: Array<{ close: () => Promise<void> | void }> = [];
+
+test("failed claim follow-up never reports an existing due row missing", async () => {
+  const database = track(await TestPostgresDatabase.create("claim_follow_up"));
+  const backend = track(await PostgresBackend.connect(database.url));
+  await backend.initialize();
+  const admin = new Client({ connectionString: database.url });
+  await admin.connect();
+  try {
+    const future = await backend.publishFuture(
+      ackTask,
+      undefined,
+      Date.now() + 60_000,
+    );
+    // A statement trigger runs for a zero-row UPDATE, changing availability before the SELECT.
+    await admin.query(`
+      CREATE FUNCTION release_after_claim() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN UPDATE bellows_tasks SET available_from_unix_ms = NULL; RETURN NULL; END $$;
+      CREATE TRIGGER release_after_claim AFTER UPDATE ON bellows_tasks
+      FOR EACH STATEMENT WHEN (pg_trigger_depth() = 0) EXECUTE FUNCTION release_after_claim();
+    `);
+    await expect(
+      backend.claimPublished(ackTask, 17, future.taskId, Date.now() + 60_000),
+    ).rejects.toBeInstanceOf(TaskUnavailableError);
+    await admin.query("DROP TRIGGER release_after_claim ON bellows_tasks");
+    await admin.query(`
+      CREATE FUNCTION skip_claim() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN RETURN NULL; END $$;
+      CREATE TRIGGER skip_claim BEFORE UPDATE ON bellows_tasks
+      FOR EACH ROW WHEN (NEW.lease_worker_id = 17) EXECUTE FUNCTION skip_claim();
+    `);
+    for (const available of [null, Date.now() - 1_000]) {
+      const task =
+        available === null
+          ? await backend.publish(ackTask, undefined)
+          : await backend.publishFuture(ackTask, undefined, available);
+      try {
+        await backend.claimPublished(
+          ackTask,
+          17,
+          task.taskId,
+          Date.now() + 60_000,
+        );
+        expect.unreachable("claim should have been suppressed");
+      } catch (error) {
+        expect(error).toBeInstanceOf(TaskUnavailableError);
+        expect(
+          (error as TaskUnavailableError).availableFromMs,
+        ).toBeLessThanOrEqual(Date.now());
+        if (available !== null)
+          expect((error as TaskUnavailableError).availableFromMs).toBe(
+            available,
+          );
+      }
+    }
+    const singleton = await backend.claimSingleton(
+      singletonTask,
+      18,
+      Date.now() + 60_000,
+    );
+    await backend.finish(singletonTask, 18, singleton.taskId, undefined, null);
+    await expect(
+      backend.claimSingleton(singletonTask, 17, Date.now() + 60_000),
+    ).rejects.toBeInstanceOf(TaskUnavailableError);
+  } finally {
+    await admin.end();
+  }
+});
+
+test.each([
+  null,
+  -1_000,
+  60_000,
+])("follow-up availability survives delayed I/O: offset=%s", async (offset) => {
+  vi.useFakeTimers();
+  try {
+    const now = Date.now();
+    const deadline = offset === null ? null : now + offset;
+    const gate = new Gate();
+    const queried = new Gate();
+    const query = vi
+      .fn()
+      .mockResolvedValueOnce({ rowCount: 0, rows: [] })
+      .mockImplementationOnce(async () => {
+        queried.release();
+        await gate.wait();
+        return {
+          rowCount: 1,
+          rows: [
+            {
+              lease_worker_id: null,
+              available_from_unix_ms: deadline?.toString() ?? null,
+            },
+          ],
+        };
+      });
+    const ops = new PostgresTaskOperations({ query } as unknown as Pool);
+    const claim = ops.claimPublished(ackTask, 17, 1, now + 20_000);
+    const check = expect(claim).rejects.toEqual(
+      new TaskUnavailableError(deadline ?? now + 321),
+    );
+    await queried.wait();
+    vi.setSystemTime(now + 321);
+    gate.release();
+    await check;
+  } finally {
+    vi.useRealTimers();
+  }
+});
 
 afterEach(async () => {
   for (const resource of resources.splice(0).reverse()) {

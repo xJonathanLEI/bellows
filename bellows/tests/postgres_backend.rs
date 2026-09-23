@@ -46,6 +46,76 @@ use tokio::sync::{
 
 struct EchoTaskSpec;
 
+#[tokio::test]
+async fn failed_claim_follow_up_never_reports_an_existing_due_row_missing() {
+    let database = TestDatabase::new("claim_follow_up").await;
+    let backend = PostgresBackend::connect(database.url()).await.unwrap();
+    backend.initialize().await.unwrap();
+    let mut admin = PgConnection::connect(database.url()).await.unwrap();
+    let future = backend
+        .publish_future::<AckTaskSpec>((), Instant::now() + Duration::from_secs(60))
+        .await
+        .unwrap();
+    // A statement trigger runs even for a zero-row UPDATE: the row becomes available strictly
+    // after the unsuccessful claim and before the follow-up SELECT, without a timing race.
+    admin
+        .execute(
+            "CREATE FUNCTION release_after_claim() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN UPDATE bellows_tasks SET available_from_unix_ms = NULL; RETURN NULL; END $$;
+         CREATE TRIGGER release_after_claim AFTER UPDATE ON bellows_tasks
+         FOR EACH STATEMENT WHEN (pg_trigger_depth() = 0) EXECUTE FUNCTION release_after_claim();",
+        )
+        .await
+        .unwrap();
+    assert!(matches!(backend.claim_published::<AckTaskSpec>(
+        17, future.task_id, Instant::now() + Duration::from_secs(60),
+    ).await, Err(ClaimTaskError::TaskUnavailable { available_from: Some(at) }) if at <= Instant::now()));
+    admin
+        .execute("DROP TRIGGER release_after_claim ON bellows_tasks")
+        .await
+        .unwrap();
+    // Force the failed-UPDATE path while leaving a matching, available row for the SELECT.
+    admin
+        .execute(
+            "CREATE FUNCTION skip_claim() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN RETURN NULL; END $$;
+         CREATE TRIGGER skip_claim BEFORE UPDATE ON bellows_tasks
+         FOR EACH ROW WHEN (NEW.lease_worker_id = 17) EXECUTE FUNCTION skip_claim();",
+        )
+        .await
+        .unwrap();
+    for available in [None, Some(Instant::now() - Duration::from_secs(1))] {
+        let task = match available {
+            None => backend.publish::<AckTaskSpec>(()).await.unwrap(),
+            Some(at) => backend.publish_future::<AckTaskSpec>((), at).await.unwrap(),
+        };
+        let result = backend
+            .claim_published::<AckTaskSpec>(
+                17,
+                task.task_id,
+                Instant::now() + Duration::from_secs(60),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(ClaimTaskError::TaskUnavailable { available_from: Some(at) }) if at <= Instant::now())
+        );
+    }
+    let singleton = backend
+        .claim_singleton::<SingletonTaskSpec>(18, Instant::now() + Duration::from_secs(60))
+        .await
+        .unwrap();
+    backend
+        .finish::<SingletonTaskSpec>(18, singleton.task_id, (), None)
+        .await
+        .unwrap();
+    assert!(matches!(backend.claim_singleton::<SingletonTaskSpec>(
+        17, Instant::now() + Duration::from_secs(60),
+    ).await, Err(ClaimTaskError::TaskUnavailable { available_from: Some(at) }) if at <= Instant::now()));
+    admin.close().await.unwrap();
+    drop(backend);
+    database.cleanup().await;
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct EchoTaskPayload {
     pub name: String,

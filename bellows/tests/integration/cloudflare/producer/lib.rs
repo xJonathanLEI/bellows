@@ -13,7 +13,9 @@ use bellows::{
     },
 };
 use serde_json::json;
-use task::{FullNamePayload, FullNameTask, GreetingPayload, GreetingTask};
+use task::{
+    FullNamePayload, FullNameTask, GreetingPayload, GreetingTask, SchedulingPayload, SchedulingTask,
+};
 use worker::*;
 
 // ECMAScript String.trim whitespace, including BOM (Rust's str::trim differs).
@@ -44,23 +46,52 @@ fn publisher_config(env: &Env) -> Result<PostgresPublisherConfig> {
 #[event(fetch)]
 pub async fn fetch(mut request: Request, env: Env, _ctx: Context) -> Result<Response> {
     let path = request.path();
-    if path != "/tasks" && path != "/full-names" {
+    if path != "/tasks" && path != "/full-names" && path != "/scheduled" {
         return http::error(404, "not-found");
     }
     let body = match http::body(&mut request, &path).await {
         Ok(body) => body,
         Err(response) => return Ok(response),
     };
-    let publication = if path == "/tasks" {
+    let available_from = match request
+        .url()?
+        .query_pairs()
+        .find(|(key, _)| key == "availableFromMs")
+    {
+        None => None,
+        Some((_, value)) => match value.parse::<u64>() {
+            Ok(at) if at <= 8_640_000_000_000_000 && value.bytes().all(|b| b.is_ascii_digit()) => {
+                Some(task::deadline(at))
+            }
+            _ => return http::error(400, "invalid availability"),
+        },
+    };
+    let publication = if path == "/scheduled" {
+        let Ok(payload) = serde_json::from_value::<SchedulingPayload>(body) else {
+            return http::error(400, "invalid scheduling payload");
+        };
+        if blank(&payload.name)
+            || payload.name.encode_utf16().count() > 200
+            || payload.available_from_ms > 8_640_000_000_000_000
+        {
+            return http::error(400, "invalid scheduling payload");
+        }
+        PostgresPublisher::<SchedulingTask, _>::new(publisher_config)
+            .publish(&env, payload)
+            .await
+    } else if path == "/tasks" {
         let Some(name) = name(body.get("name")) else {
             return http::error(
                 400,
                 "body must be an object with a non-blank name of at most 200 characters",
             );
         };
-        PostgresPublisher::<GreetingTask, _>::new(publisher_config)
-            .publish(&env, GreetingPayload { name: name.into() })
-            .await
+        let publisher = PostgresPublisher::<GreetingTask, _>::new(publisher_config);
+        let payload = GreetingPayload { name: name.into() };
+        match available_from {
+            Some(at) => publisher.publish_future(&env, payload, at).await,
+            None => publisher.publish(&env, payload).await,
+        }
     } else {
         let (Some(first_name), Some(last_name)) =
             (name(body.get("firstName")), name(body.get("lastName")))
@@ -70,15 +101,15 @@ pub async fn fetch(mut request: Request, env: Env, _ctx: Context) -> Result<Resp
                 "body must be an object with non-blank firstName and lastName of at most 200 characters each",
             );
         };
-        PostgresPublisher::<FullNameTask, _>::new(publisher_config)
-            .publish(
-                &env,
-                FullNamePayload {
-                    first_name: first_name.into(),
-                    last_name: last_name.into(),
-                },
-            )
-            .await
+        let publisher = PostgresPublisher::<FullNameTask, _>::new(publisher_config);
+        let payload = FullNamePayload {
+            first_name: first_name.into(),
+            last_name: last_name.into(),
+        };
+        match available_from {
+            Some(at) => publisher.publish_future(&env, payload, at).await,
+            None => publisher.publish(&env, payload).await,
+        }
     };
     let receipt = match publication {
         Ok(receipt) => receipt,
@@ -104,25 +135,72 @@ pub async fn fetch(mut request: Request, env: Env, _ctx: Context) -> Result<Resp
 
 #[durable_object]
 pub struct TaskDispatcher {
-    dispatcher: Dispatcher,
+    dispatcher: std::cell::RefCell<std::rc::Rc<Dispatcher>>,
+    state: State,
+    env: Env,
 }
 
 impl DurableObject for TaskDispatcher {
     fn new(state: State, env: Env) -> Self {
         Self {
-            dispatcher: RetainedTaskDispatcher::from_bindings(
-                state.storage(),
-                env.service("PROCESSOR")
-                    .expect("PROCESSOR service binding is required"),
-            ),
+            dispatcher: std::cell::RefCell::new(std::rc::Rc::new(
+                RetainedTaskDispatcher::from_bindings(
+                    state.storage(),
+                    env.service("PROCESSOR")
+                        .expect("PROCESSOR service binding is required"),
+                ),
+            )),
+            state,
+            env,
         }
     }
 
     async fn fetch(&self, request: Request) -> Result<Response> {
-        self.dispatcher.fetch_worker(request).await
+        // Fixture-only storage inspection/reconstruction, not producer HTTP routes.
+        match request.path().as_str() {
+            "/__test/clear" => {
+                self.state.storage().delete_all().await?;
+                self.state.storage().delete_alarm().await?;
+                return Response::empty();
+            }
+            "/__test/reconstruct" => {
+                *self.dispatcher.borrow_mut() =
+                    std::rc::Rc::new(RetainedTaskDispatcher::from_bindings(
+                        self.state.storage(),
+                        self.env.service("PROCESSOR")?,
+                    ));
+                return Response::empty();
+            }
+            "/__test/state" => {
+                let storage = self.state.storage();
+                let records = storage
+                    .list_with_options(ListOptions::new().prefix("task:"))
+                    .await?;
+                let mut tasks = serde_json::Map::new();
+                for entry in records.entries() {
+                    let entry = js_sys::Array::from(&entry?);
+                    tasks.insert(
+                        entry.get(0).as_string().unwrap(),
+                        serde_json::from_str::<serde_json::Value>(
+                            &js_sys::JSON::stringify(&entry.get(1))?.as_string().unwrap(),
+                        )?,
+                    );
+                }
+                return Response::from_json(&json!({
+                    "metadata": storage.get::<serde_json::Value>("scheduler").await?,
+                    "tasks": tasks,
+                    "alarm": storage.get_alarm().await?,
+                    "now": js_sys::Date::now(),
+                }));
+            }
+            _ => {}
+        }
+        let dispatcher = self.dispatcher.borrow().clone();
+        dispatcher.fetch_worker(request).await
     }
 
     async fn alarm(&self) -> Result<Response> {
-        self.dispatcher.alarm_worker().await
+        let dispatcher = self.dispatcher.borrow().clone();
+        dispatcher.alarm_worker().await
     }
 }

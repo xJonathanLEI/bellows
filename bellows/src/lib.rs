@@ -36,13 +36,13 @@
 //! without requiring execution or subscriptions. Import that trait for plain publication calls on
 //! concrete backend types; [`Backend`] retains subscription and awaitable callback delivery.
 //! An external host can instead await [`run_task_once`] with only a [`TaskExecutionBackend`], without
-//! launching a dispatcher. Each call attempts one task; its unit return is not an execution-success
-//! status.
+//! launching a dispatcher. Each call attempts one task and returns a scheduling instruction, not a
+//! business success status: done, retry at an observed/committed deadline, or retry on uncertainty.
 //!
 //! ## Cloudflare Workers
 //!
 //! Target `wasm32-unknown-unknown` with `default-features = false, features = ["cloudflare"]`.
-//! Use `cloudflare::sdk::PostgresPublisher::<Task, _>` for typed immediate publication after
+//! Use `cloudflare::sdk::PostgresPublisher::<Task, _>` for typed immediate or future publication after
 //! application validation. Its synchronous environment-to-config callback runs once per call.
 //! Construction performs no I/O; each call publishes once through a fresh listener-free backend,
 //! retains the exact string ID, validates the processor's positive safe-integer range (up to
@@ -58,7 +58,8 @@
 //! It validates `{ taskId, taskName }` before configuration, rejects unknown names without acquiring
 //! a backend, and awaits [`run_task_once`], registered application cleanup, and backend shutdown.
 //! One request attempts one ID; claims check the persisted name before decoding its typed payload.
-//! HTTP 200 means an attempt ended, not task success.
+//! HTTP 200 reports `nextAction`: `done` or `retryAt` with absolute Unix `atMs`, not task success.
+//! Uncertain runtime outcomes and cleanup failures return sanitized HTTP 500 responses.
 //! Applications still own side-effect resources; retain cleanup ownership outside aborted workers.
 //! Direct `PostgresExecutionBackend` plus `run_task_once`, or `PostgresPublishingBackend` plus
 //! `cloudflare::dispatch_task`, remain lower-level integration APIs with caller-owned cleanup.
@@ -69,15 +70,26 @@
 //! requests. Both reduced backends require request-scoped connections and awaited `close` on
 //! ordinary success and error paths; the delegates own this lifecycle. Dropping clones does not
 //! close a Workers driver. Lower-level Rust receipts remain exact `u64` values.
-//! The publisher offers no future publication, callback delivery, application cleanup hooks,
-//! transaction participation, atomic PostgreSQL-to-DO delivery, or automatic retries.
+//! `publish_future` records availability but dispatches the ID/name immediately; the processor
+//! supplies the scheduling hint. The publisher offers no callback delivery, application cleanup
+//! hooks, transaction participation, atomic PostgreSQL-to-DO delivery, or automatic republishing.
 //! Callback-bearing tasks support plain publication; singleton tasks are rejected. Awaitable
 //! publication remains on the full backend for listener-backed callback delivery.
 //!
-//! The `cloudflare` module provides in-memory retained dispatch, not durable recovery or retries.
-//! Its heartbeat is not lease renewal or eviction recovery; this is not daemon-equivalent discovery
-//! or exactly-once processing. Await delegate calls within the request. They do not extend request
-//! lifetime or guarantee async cleanup after future cancellation, abrupt termination, or wasm traps.
+//! One SQLite-backed `global` Durable Object launches dispatches in memory, then checks/repairs
+//! its warming alarm without persisting task acceptance. A `retryAt` instruction starts durable
+//! tracking until a matching `done`. The shared alarm selects the earliest pending/watchdog deadline or independent
+//! 30-second heartbeat and launches every due distinct ID without a Bellows concurrency cap.
+//! Active same-ID attempts are deduplicated through full response consumption and result persistence.
+//! Uncertain responses back off from one to thirty seconds, only in memory for unsaved tasks.
+//! A 60-second watchdog supersedes hung or interrupted scheduled attempts without guaranteeing
+//! business cancellation. Stale results are ignored.
+//! PostgreSQL remains authoritative: renewed leases may move a scheduling hint later.
+//! Durability starts with a persisted scheduling hint, not DO acceptance. Earlier loss requires
+//! application recovery; there is no PostgreSQL discovery or Cron.
+//! Alarms and attempts are at-least-once, not exactly-once side effects.
+//! Await delegate calls within the request. They do not extend request lifetime or guarantee async
+//! cleanup after future cancellation, abrupt termination, or wasm traps.
 //! See the [Rust examples](https://github.com/xJonathanLEI/bellows/tree/master/bellows/tests/integration/cloudflare)
 //! for setup and limitations. Omit `nodejs_compat`: its Node-style timer handles conflict with SDK timers.
 //!
@@ -114,7 +126,7 @@ mod platform;
 #[cfg(any(not(target_arch = "wasm32"), feature = "cloudflare"))]
 pub(crate) mod runtime;
 #[cfg(any(not(target_arch = "wasm32"), feature = "cloudflare"))]
-pub use runtime::run_task_once;
+pub use runtime::{TaskAttemptOutcome, run_task_once};
 
 pub trait TaskDefinition: Send {
     /// A globally stable backend namespace for this task definition.

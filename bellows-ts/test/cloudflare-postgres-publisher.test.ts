@@ -1,4 +1,12 @@
-import { afterEach, beforeEach, expect, expectTypeOf, test, vi } from "vitest";
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  expectTypeOf,
+  test,
+  vi,
+} from "vitest";
 import {
   PostgresPublishedTaskIdError,
   PostgresPublishingBackend,
@@ -36,9 +44,25 @@ class Publishing implements TaskPublishingBackend {
 
   constructor() {
     vi.spyOn(this as Publishing, "publish");
+    vi.spyOn(this as Publishing, "publishFuture");
   }
 
   async publish<TPayload, TCallback>(
+    definition: PublishTaskDefinition<TPayload, TCallback>,
+    payload: TPayload,
+  ): Promise<PublishedTask> {
+    return this.record(definition, payload);
+  }
+
+  async publishFuture<TPayload, TCallback>(
+    definition: PublishTaskDefinition<TPayload, TCallback>,
+    payload: TPayload,
+    _availableFromMs: number,
+  ): Promise<PublishedTask> {
+    return this.record(definition, payload);
+  }
+
+  private async record<TPayload, TCallback>(
     definition: PublishTaskDefinition<TPayload, TCallback>,
     payload: TPayload,
   ): Promise<PublishedTask> {
@@ -48,10 +72,6 @@ class Publishing implements TaskPublishingBackend {
     this.encoded.push(definition.codec.encode(payload));
     return { taskId: this.taskId };
   }
-
-  publishFuture = vi.fn(async (): Promise<never> => {
-    throw new Error("must publish immediately");
-  });
 
   close = vi.fn(async () => {
     this.events.push("close");
@@ -152,353 +172,375 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-test("construction is inert; detached publication forwards configuration, task and payload", async () => {
-  const f = fixture();
-  expect(f.configure).not.toHaveBeenCalled();
-  expect(f.connect).not.toHaveBeenCalled();
-  expect(Object.keys(f.publisher)).toEqual(["publish"]);
-  const encode = vi.spyOn(task.codec, "encode");
-  const callback = vi.spyOn(task.callbackCodec, "encode");
-  const { publish } = f.publisher;
-  const receipt = await publish(env, payload);
-  expect(receipt).toEqual({ taskId: "17" });
-  expect(Object.isFrozen(receipt)).toBe(true);
-  expect(f.configure).toHaveBeenCalledExactlyOnceWith(env);
-  expect(f.connect).toHaveBeenCalledExactlyOnceWith(env.url, {
-    schema: env.schema,
-  });
-  expect(f.backend.publish).toHaveBeenCalledExactlyOnceWith(task, payload);
-  expect(encode).toHaveBeenCalledExactlyOnceWith(payload);
-  expect(callback).not.toHaveBeenCalled();
-  expect(f.backend.encoded).toEqual(['{"name":"Ada"}']);
-  expect(f.backend.publishFuture).not.toHaveBeenCalled();
-  expect(f.backend.close).toHaveBeenCalledTimes(1);
-  expect(f.dispatcher.getByName).toHaveBeenCalledExactlyOnceWith("global");
-  expect(f.fetch).toHaveBeenCalledExactlyOnceWith(
-    "https://dispatcher/dispatch",
-    {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ taskId: "17", taskName: task.name }),
-    },
-  );
-  expect(f.backend.events).toEqual([
-    "configure",
-    "acquire",
-    "publish",
-    "close",
-    "lookup",
-    "dispatch",
-  ]);
-});
-
-test("void payloads and custom codecs use plain publication", async () => {
-  const f = fixture();
-  const voidTask = definePublishTask<void>("void");
-  const publisher = createPostgresPublisher((env: Env) => ({
-    connectionString: env.url,
-    task: voidTask,
-    dispatcher: f.dispatcher,
-  }));
-  await publisher.publish(env, undefined);
-  const custom = definePublishTask<{ name: string }>("custom", {
-    encode: vi.fn(({ name }) => name.toUpperCase()),
-    decode: vi.fn((name) => ({ name })),
-  });
-  await createPostgresPublisher((env: Env) => ({
-    connectionString: env.url,
-    task: custom,
-    dispatcher: f.dispatcher,
-  })).publish(env, payload);
-  expect(f.backend.encoded).toEqual(["null", "ADA"]);
-  expect(custom.codec.encode).toHaveBeenCalledExactlyOnceWith(payload);
-  expect(custom.codec.decode).not.toHaveBeenCalled();
-  expect(
-    f.fetch.mock.calls.map(([, init]) => JSON.parse(String(init?.body))),
-  ).toEqual([
-    { taskId: "17", taskName: voidTask.name },
-    { taskId: "17", taskName: custom.name },
-  ]);
-});
-
-test("environment, payload, callback-bearing task and error types remain precise", () => {
-  const f = fixture();
-  expectTypeOf(f.publisher.publish).parameters.toEqualTypeOf<
-    [Env, { name: string }]
-  >();
-  expectTypeOf(
-    f.publisher.publish,
-  ).returns.resolves.toEqualTypeOf<PostgresPublisherReceipt>();
-  const config: PostgresPublisherConfig<typeof task> = f.configure(env);
-  expectTypeOf(config.task).toEqualTypeOf<typeof task>();
-  function unsupported(
-    error: PostgresPublisherError,
-    receipt: PostgresPublisherReceipt,
-  ) {
-    expectTypeOf(error.stage).toEqualTypeOf<PostgresPublisherStage>();
-    expectTypeOf(error.cause).toEqualTypeOf<unknown>();
-    expectTypeOf(error.receipt).toEqualTypeOf<
-      PostgresPublisherReceipt | undefined
-    >();
-    // @ts-expect-error The payload must match the bound definition.
-    void f.publisher.publish(env, { name: 1 });
-    // @ts-expect-error The environment is inferred from the callback.
-    void f.publisher.publish({ other: true }, payload);
-    // @ts-expect-error Only immediate publication is supported.
-    void f.publisher.publishFuture(env, payload, 1);
-    // @ts-expect-error No callback registration or awaitable result.
-    void f.publisher.publishAwaitable(env, payload);
-    // @ts-expect-error Recovery uses the separate dispatch helper.
-    void f.publisher.redispatch(env, "17");
-    // @ts-expect-error No application cleanup or lifecycle methods.
-    void f.publisher.close();
-    // @ts-expect-error Receipts are readonly.
-    receipt.taskId = "18";
-  }
-  expect(unsupported).toBeTypeOf("function");
-  // @ts-expect-error Singleton activation cannot be published.
-  createPostgresPublisher((env: Env) => ({
-    connectionString: env.url,
-    task: defineSingletonTask("singleton"),
-    dispatcher: f.dispatcher,
-  }));
-  // @ts-expect-error Configuration must be synchronous.
-  createPostgresPublisher(async (_env: Env) => config);
-});
-
-test.each([
-  1,
-  Number.MAX_SAFE_INTEGER,
-])("dispatches safe ID %s exactly", async (taskId) => {
-  const f = fixture();
-  f.backend.taskId = taskId;
-  expect(await f.publisher.publish(env, payload)).toEqual({
-    taskId: String(taskId),
-  });
-  expect(f.fetch.mock.calls[0][1]?.body).toBe(
-    JSON.stringify({ taskId: String(taskId), taskName: task.name }),
-  );
-});
-
-test.each([
-  0,
-  -1,
-  1.5,
-  NaN,
-  Infinity,
-  9007199254740992,
-])("rejects invalid numeric backend receipt %s after retaining and closing", async (taskId) => {
-  const f = fixture();
-  f.backend.taskId = taskId;
-  const error = await failure(
-    f.publisher.publish(env, payload),
-    "task-id",
-    String(taskId),
-  );
-  expect(error.cause).toBeInstanceOf(Error);
-  expect(error.backendCloseError).toBeUndefined();
-  expect(f.backend.publish).toHaveBeenCalledTimes(1);
-  expect(f.backend.close).toHaveBeenCalledTimes(1);
-  expect(f.dispatcher.getByName).not.toHaveBeenCalled();
-});
-
-test.each([
-  "9007199254740992",
-  "9007199254740993",
-  "9223372036854775807",
-])("preserves exact known publication error ID %s", async (taskId) => {
-  const f = fixture();
-  const cause = new PostgresPublishedTaskIdError(taskId);
-  vi.mocked(f.backend.publish).mockRejectedValue(cause);
-  const error = await failure(
-    f.publisher.publish(env, payload),
-    "task-id",
-    taskId,
-  );
-  expect(error.cause).toBe(cause);
-  expect(error.backendCloseError).toBeUndefined();
-  expect(f.backend.publish).toHaveBeenCalledTimes(1);
-  expect(f.backend.close).toHaveBeenCalledTimes(1);
-  expect(f.dispatcher.getByName).not.toHaveBeenCalled();
-});
-
-test.each([
-  200, 503,
-])("awaits publication, close, and the entire HTTP %s body", async (status) => {
-  const f = fixture();
-  f.backend.publishGate = new Gate();
-  f.backend.closeGate = new Gate();
-  const bodyGate = new Gate();
-  const reading = new Gate();
-  let consumed = false;
-  const body = `${secret.message}${"x".repeat(2000)}tail`;
-  const response = new Response(
-    new ReadableStream<Uint8Array>({
-      async start(controller) {
-        controller.enqueue(new TextEncoder().encode(body.slice(0, 1000)));
-        await bodyGate.wait();
-        controller.enqueue(new TextEncoder().encode(body.slice(1000)));
-        controller.close();
-      },
-    }),
-    { status },
-  );
-  const text = response.text.bind(response);
-  const read = vi.spyOn(response, "text").mockImplementation(async () => {
-    reading.release();
-    const result = await text();
-    expect(result).toBe(body);
-    consumed = true;
-    return result;
-  });
-  f.fetch.mockResolvedValue(response);
-  const operation = f.publisher.publish(env, payload);
-  const assertPending = pending(operation);
-  try {
-    await f.backend.publishing.wait();
-    assertPending();
-    expect(f.backend.close).not.toHaveBeenCalled();
-    expect(f.fetch).not.toHaveBeenCalled();
-    f.backend.publishGate.release();
-    await f.backend.closing.wait();
-    assertPending();
-    expect(f.fetch).not.toHaveBeenCalled();
-    f.backend.closeGate.release();
-    await reading.wait();
-    assertPending();
-    expect(f.backend.close).toHaveBeenCalledTimes(1);
-    expect(consumed).toBe(false);
-    bodyGate.release();
-    if (status === 200) {
-      expect(await operation).toEqual({ taskId: "17" });
-    } else {
-      const error = await failure(operation, "dispatch", "17");
-      expect((error.cause as Error).message).toBe(
-        `task dispatcher returned HTTP 503: ${body.slice(0, 500)}`,
-      );
-      expect(error.backendCloseError).toBeUndefined();
-    }
-    expect(consumed).toBe(true);
-    expect(read).toHaveBeenCalledTimes(1);
-    expect(f.fetch).toHaveBeenCalledTimes(1);
-    expect(f.backend.publish).toHaveBeenCalledTimes(1);
-  } finally {
-    f.backend.publishGate.release();
-    f.backend.closeGate.release();
-    bodyGate.release();
-    await operation.catch(() => {});
-  }
-});
-
-test.each([
-  "configuration",
-  "acquisition",
-  "publication",
-  "backend-close",
-  "lookup",
-  "fetch",
-  "body",
-] as const)("retains %s causes, including arbitrary falsy thrown values", async (point) => {
-  for (const cause of [
-    secret,
-    undefined,
-    null,
-    false,
-    0,
-    "",
-    Symbol("failure"),
-  ]) {
+describe.each(["publish", "publishFuture"] as const)("%s", (method) => {
+  const availableFromMs = 1_900_000_000_000;
+  test("construction is inert; detached publication forwards configuration, task and payload", async () => {
     const f = fixture();
-    if (point === "configuration")
-      f.configure.mockImplementation(() => {
-        throw cause;
-      });
-    if (point === "acquisition") f.connect.mockRejectedValue(cause);
-    if (point === "publication")
-      vi.mocked(f.backend.publish).mockRejectedValue(cause);
-    if (point === "backend-close") f.backend.close.mockRejectedValue(cause);
-    if (point === "lookup")
-      f.dispatcher.getByName.mockImplementation(() => {
-        throw cause;
-      });
-    if (point === "fetch") f.fetch.mockRejectedValue(cause);
-    if (point === "body") {
-      const response = new Response("ignored");
-      vi.spyOn(response, "text").mockRejectedValue(cause);
-      f.fetch.mockResolvedValue(response);
+    expect(f.configure).not.toHaveBeenCalled();
+    expect(f.connect).not.toHaveBeenCalled();
+    expect(Object.keys(f.publisher)).toEqual(["publish", "publishFuture"]);
+    const encode = vi.spyOn(task.codec, "encode");
+    const callback = vi.spyOn(task.callbackCodec, "encode");
+    const publish = f.publisher[method];
+    const receipt = await publish(env, payload, availableFromMs);
+    expect(receipt).toEqual({ taskId: "17" });
+    expect(Object.isFrozen(receipt)).toBe(true);
+    expect(f.configure).toHaveBeenCalledExactlyOnceWith(env);
+    expect(f.connect).toHaveBeenCalledExactlyOnceWith(env.url, {
+      schema: env.schema,
+    });
+    expect(f.backend[method]).toHaveBeenCalledExactlyOnceWith(
+      ...(method === "publish"
+        ? [task, payload]
+        : [task, payload, availableFromMs]),
+    );
+    expect(encode).toHaveBeenCalledExactlyOnceWith(payload);
+    expect(callback).not.toHaveBeenCalled();
+    expect(f.backend.encoded).toEqual(['{"name":"Ada"}']);
+    expect(
+      f.backend[method === "publish" ? "publishFuture" : "publish"],
+    ).not.toHaveBeenCalled();
+    expect(f.backend.close).toHaveBeenCalledTimes(1);
+    expect(f.dispatcher.getByName).toHaveBeenCalledExactlyOnceWith("global");
+    expect(f.fetch).toHaveBeenCalledExactlyOnceWith(
+      "https://dispatcher/dispatch",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ taskId: "17", taskName: task.name }),
+      },
+    );
+    expect(f.backend.events).toEqual([
+      "configure",
+      "acquire",
+      "publish",
+      "close",
+      "lookup",
+      "dispatch",
+    ]);
+  });
+
+  test("void payloads and custom codecs use plain publication", async () => {
+    const f = fixture();
+    const voidTask = definePublishTask<void>("void");
+    const publisher = createPostgresPublisher((env: Env) => ({
+      connectionString: env.url,
+      task: voidTask,
+      dispatcher: f.dispatcher,
+    }));
+    await publisher[method](env, undefined, availableFromMs);
+    const custom = definePublishTask<{ name: string }>("custom", {
+      encode: vi.fn(({ name }) => name.toUpperCase()),
+      decode: vi.fn((name) => ({ name })),
+    });
+    await createPostgresPublisher((env: Env) => ({
+      connectionString: env.url,
+      task: custom,
+      dispatcher: f.dispatcher,
+    }))[method](env, payload, availableFromMs);
+    expect(f.backend.encoded).toEqual(["null", "ADA"]);
+    expect(custom.codec.encode).toHaveBeenCalledExactlyOnceWith(payload);
+    expect(custom.codec.decode).not.toHaveBeenCalled();
+    expect(
+      f.fetch.mock.calls.map(([, init]) => JSON.parse(String(init?.body))),
+    ).toEqual([
+      { taskId: "17", taskName: voidTask.name },
+      { taskId: "17", taskName: custom.name },
+    ]);
+  });
+
+  test("environment, payload, callback-bearing task and error types remain precise", () => {
+    const f = fixture();
+    expectTypeOf(f.publisher.publish).parameters.toEqualTypeOf<
+      [Env, { name: string }]
+    >();
+    expectTypeOf(
+      f.publisher.publish,
+    ).returns.resolves.toEqualTypeOf<PostgresPublisherReceipt>();
+    expectTypeOf(f.publisher.publishFuture).parameters.toEqualTypeOf<
+      [Env, { name: string }, number]
+    >();
+    expectTypeOf(
+      f.publisher.publishFuture,
+    ).returns.resolves.toEqualTypeOf<PostgresPublisherReceipt>();
+    const config: PostgresPublisherConfig<typeof task> = f.configure(env);
+    expectTypeOf(config.task).toEqualTypeOf<typeof task>();
+    function unsupported(
+      error: PostgresPublisherError,
+      receipt: PostgresPublisherReceipt,
+    ) {
+      expectTypeOf(error.stage).toEqualTypeOf<PostgresPublisherStage>();
+      expectTypeOf(error.cause).toEqualTypeOf<unknown>();
+      expectTypeOf(error.receipt).toEqualTypeOf<
+        PostgresPublisherReceipt | undefined
+      >();
+      // @ts-expect-error The payload must match the bound definition.
+      void f.publisher.publish(env, { name: 1 });
+      // @ts-expect-error The environment is inferred from the callback.
+      void f.publisher.publish({ other: true }, payload);
+      // @ts-expect-error Future payloads must match the bound definition too.
+      void f.publisher.publishFuture(env, { name: 1 }, 1);
+      // @ts-expect-error Future publication requires a deadline.
+      void f.publisher.publishFuture(env, payload);
+      // @ts-expect-error Future environments retain the inferred type.
+      void f.publisher.publishFuture({ other: true }, payload, 1);
+      // @ts-expect-error No callback registration or awaitable result.
+      void f.publisher.publishAwaitable(env, payload);
+      // @ts-expect-error Recovery uses the separate dispatch helper.
+      void f.publisher.redispatch(env, "17");
+      // @ts-expect-error No application cleanup or lifecycle methods.
+      void f.publisher.close();
+      // @ts-expect-error Receipts are readonly.
+      receipt.taskId = "18";
     }
-    const dispatch = ["lookup", "fetch", "body"].includes(point);
-    const known = dispatch || point === "backend-close";
-    const acquired = !["configuration", "acquisition"].includes(point);
+    expect(unsupported).toBeTypeOf("function");
+    // @ts-expect-error Singleton activation cannot be published.
+    createPostgresPublisher((env: Env) => ({
+      connectionString: env.url,
+      task: defineSingletonTask("singleton"),
+      dispatcher: f.dispatcher,
+    }));
+    // @ts-expect-error Configuration must be synchronous.
+    createPostgresPublisher(async (_env: Env) => config);
+  });
+
+  test.each([
+    1,
+    Number.MAX_SAFE_INTEGER,
+  ])("dispatches safe ID %s exactly", async (taskId) => {
+    const f = fixture();
+    f.backend.taskId = taskId;
+    expect(await f.publisher[method](env, payload, availableFromMs)).toEqual({
+      taskId: String(taskId),
+    });
+    expect(f.fetch.mock.calls[0][1]?.body).toBe(
+      JSON.stringify({ taskId: String(taskId), taskName: task.name }),
+    );
+  });
+
+  test.each([
+    0,
+    -1,
+    1.5,
+    NaN,
+    Infinity,
+    9007199254740992,
+  ])("rejects invalid numeric backend receipt %s after retaining and closing", async (taskId) => {
+    const f = fixture();
+    f.backend.taskId = taskId;
     const error = await failure(
-      f.publisher.publish(env, payload),
-      dispatch ? "dispatch" : (point as PostgresPublisherStage),
-      known ? "17" : undefined,
+      f.publisher[method](env, payload, availableFromMs),
+      "task-id",
+      String(taskId),
+    );
+    expect(error.cause).toBeInstanceOf(Error);
+    expect(error.backendCloseError).toBeUndefined();
+    expect(f.backend[method]).toHaveBeenCalledTimes(1);
+    expect(f.backend.close).toHaveBeenCalledTimes(1);
+    expect(f.dispatcher.getByName).not.toHaveBeenCalled();
+  });
+
+  test.each([
+    "9007199254740992",
+    "9007199254740993",
+    "9223372036854775807",
+  ])("preserves exact known publication error ID %s", async (taskId) => {
+    const f = fixture();
+    const cause = new PostgresPublishedTaskIdError(taskId);
+    vi.mocked(f.backend[method]).mockRejectedValue(cause);
+    const error = await failure(
+      f.publisher[method](env, payload, availableFromMs),
+      "task-id",
+      taskId,
     );
     expect(error.cause).toBe(cause);
     expect(error.backendCloseError).toBeUndefined();
-    expect(f.backend.publish).toHaveBeenCalledTimes(acquired ? 1 : 0);
-    expect(f.backend.close).toHaveBeenCalledTimes(acquired ? 1 : 0);
-    expect(f.dispatcher.getByName).toHaveBeenCalledTimes(dispatch ? 1 : 0);
-  }
-});
-
-test("encoding errors remain unknown publication outcomes and await shutdown", async () => {
-  const f = fixture();
-  vi.spyOn(task.codec, "encode").mockImplementation(() => {
-    throw secret;
+    expect(f.backend[method]).toHaveBeenCalledTimes(1);
+    expect(f.backend.close).toHaveBeenCalledTimes(1);
+    expect(f.dispatcher.getByName).not.toHaveBeenCalled();
   });
-  const error = await failure(f.publisher.publish(env, payload), "publication");
-  expect(error.cause).toBe(secret);
-  expect(f.backend.publish).toHaveBeenCalledTimes(1);
-  expect(f.backend.close).toHaveBeenCalledTimes(1);
-  expect(f.fetch).not.toHaveBeenCalled();
-});
 
-test.each([
-  "publication",
-  "task-id",
-  "numeric-task-id",
-] as const)("keeps %s primary while awaiting a secondary close failure", async (point) => {
-  for (const closeCause of [closeSecret, undefined]) {
+  test.each([
+    200, 503,
+  ])("awaits publication, close, and the entire HTTP %s body", async (status) => {
     const f = fixture();
-    const cause =
-      point === "publication"
-        ? secret
-        : new PostgresPublishedTaskIdError("9007199254740993");
-    if (point === "numeric-task-id") f.backend.taskId = 0;
-    else vi.mocked(f.backend.publish).mockRejectedValue(cause);
+    f.backend.publishGate = new Gate();
     f.backend.closeGate = new Gate();
-    f.backend.close.mockImplementation(async () => {
-      f.backend.closing.release();
-      await f.backend.closeGate?.wait();
-      throw closeCause;
+    const bodyGate = new Gate();
+    const reading = new Gate();
+    let consumed = false;
+    const body = `${secret.message}${"x".repeat(2000)}tail`;
+    const response = new Response(
+      new ReadableStream<Uint8Array>({
+        async start(controller) {
+          controller.enqueue(new TextEncoder().encode(body.slice(0, 1000)));
+          await bodyGate.wait();
+          controller.enqueue(new TextEncoder().encode(body.slice(1000)));
+          controller.close();
+        },
+      }),
+      { status },
+    );
+    const text = response.text.bind(response);
+    const read = vi.spyOn(response, "text").mockImplementation(async () => {
+      reading.release();
+      const result = await text();
+      expect(result).toBe(body);
+      consumed = true;
+      return result;
     });
-    const operation = f.publisher.publish(env, payload);
+    f.fetch.mockResolvedValue(response);
+    const operation = f.publisher[method](env, payload, availableFromMs);
     const assertPending = pending(operation);
     try {
+      await f.backend.publishing.wait();
+      assertPending();
+      expect(f.backend.close).not.toHaveBeenCalled();
+      expect(f.fetch).not.toHaveBeenCalled();
+      f.backend.publishGate.release();
       await f.backend.closing.wait();
       assertPending();
-      f.backend.closeGate.release();
-      const error = await failure(
-        operation,
-        point === "publication" ? point : "task-id",
-        point === "publication"
-          ? undefined
-          : point === "task-id"
-            ? "9007199254740993"
-            : "0",
-      );
-      if (point !== "numeric-task-id") expect(error.cause).toBe(cause);
-      expect(error.backendCloseError).toEqual({ cause: closeCause });
-      expect(f.backend.publish).toHaveBeenCalledTimes(1);
-      expect(f.backend.close).toHaveBeenCalledTimes(1);
       expect(f.fetch).not.toHaveBeenCalled();
-    } finally {
       f.backend.closeGate.release();
+      await reading.wait();
+      assertPending();
+      expect(f.backend.close).toHaveBeenCalledTimes(1);
+      expect(consumed).toBe(false);
+      bodyGate.release();
+      if (status === 200) {
+        expect(await operation).toEqual({ taskId: "17" });
+      } else {
+        const error = await failure(operation, "dispatch", "17");
+        expect((error.cause as Error).message).toBe(
+          `task dispatcher returned HTTP 503: ${body.slice(0, 500)}`,
+        );
+        expect(error.backendCloseError).toBeUndefined();
+      }
+      expect(consumed).toBe(true);
+      expect(read).toHaveBeenCalledTimes(1);
+      expect(f.fetch).toHaveBeenCalledTimes(1);
+      expect(f.backend[method]).toHaveBeenCalledTimes(1);
+    } finally {
+      f.backend.publishGate.release();
+      f.backend.closeGate.release();
+      bodyGate.release();
       await operation.catch(() => {});
     }
-  }
+  });
+
+  test.each([
+    "configuration",
+    "acquisition",
+    "publication",
+    "backend-close",
+    "lookup",
+    "fetch",
+    "body",
+  ] as const)("retains %s causes, including arbitrary falsy thrown values", async (point) => {
+    for (const cause of [
+      secret,
+      undefined,
+      null,
+      false,
+      0,
+      "",
+      Symbol("failure"),
+    ]) {
+      const f = fixture();
+      if (point === "configuration")
+        f.configure.mockImplementation(() => {
+          throw cause;
+        });
+      if (point === "acquisition") f.connect.mockRejectedValue(cause);
+      if (point === "publication")
+        vi.mocked(f.backend[method]).mockRejectedValue(cause);
+      if (point === "backend-close") f.backend.close.mockRejectedValue(cause);
+      if (point === "lookup")
+        f.dispatcher.getByName.mockImplementation(() => {
+          throw cause;
+        });
+      if (point === "fetch") f.fetch.mockRejectedValue(cause);
+      if (point === "body") {
+        const response = new Response("ignored");
+        vi.spyOn(response, "text").mockRejectedValue(cause);
+        f.fetch.mockResolvedValue(response);
+      }
+      const dispatch = ["lookup", "fetch", "body"].includes(point);
+      const known = dispatch || point === "backend-close";
+      const acquired = !["configuration", "acquisition"].includes(point);
+      const error = await failure(
+        f.publisher[method](env, payload, availableFromMs),
+        dispatch ? "dispatch" : (point as PostgresPublisherStage),
+        known ? "17" : undefined,
+      );
+      expect(error.cause).toBe(cause);
+      expect(error.backendCloseError).toBeUndefined();
+      expect(f.backend[method]).toHaveBeenCalledTimes(acquired ? 1 : 0);
+      expect(f.backend.close).toHaveBeenCalledTimes(acquired ? 1 : 0);
+      expect(f.dispatcher.getByName).toHaveBeenCalledTimes(dispatch ? 1 : 0);
+    }
+  });
+
+  test("encoding errors remain unknown publication outcomes and await shutdown", async () => {
+    const f = fixture();
+    vi.spyOn(task.codec, "encode").mockImplementation(() => {
+      throw secret;
+    });
+    const error = await failure(
+      f.publisher[method](env, payload, availableFromMs),
+      "publication",
+    );
+    expect(error.cause).toBe(secret);
+    expect(f.backend[method]).toHaveBeenCalledTimes(1);
+    expect(f.backend.close).toHaveBeenCalledTimes(1);
+    expect(f.fetch).not.toHaveBeenCalled();
+  });
+
+  test.each([
+    "publication",
+    "task-id",
+    "numeric-task-id",
+  ] as const)("keeps %s primary while awaiting a secondary close failure", async (point) => {
+    for (const closeCause of [closeSecret, undefined]) {
+      const f = fixture();
+      const cause =
+        point === "publication"
+          ? secret
+          : new PostgresPublishedTaskIdError("9007199254740993");
+      if (point === "numeric-task-id") f.backend.taskId = 0;
+      else vi.mocked(f.backend[method]).mockRejectedValue(cause);
+      f.backend.closeGate = new Gate();
+      f.backend.close.mockImplementation(async () => {
+        f.backend.closing.release();
+        await f.backend.closeGate?.wait();
+        throw closeCause;
+      });
+      const operation = f.publisher[method](env, payload, availableFromMs);
+      const assertPending = pending(operation);
+      try {
+        await f.backend.closing.wait();
+        assertPending();
+        f.backend.closeGate.release();
+        const error = await failure(
+          operation,
+          point === "publication" ? point : "task-id",
+          point === "publication"
+            ? undefined
+            : point === "task-id"
+              ? "9007199254740993"
+              : "0",
+        );
+        if (point !== "numeric-task-id") expect(error.cause).toBe(cause);
+        expect(error.backendCloseError).toEqual({ cause: closeCause });
+        expect(f.backend[method]).toHaveBeenCalledTimes(1);
+        expect(f.backend.close).toHaveBeenCalledTimes(1);
+        expect(f.fetch).not.toHaveBeenCalled();
+      } finally {
+        f.backend.closeGate.release();
+        await operation.catch(() => {});
+      }
+    }
+  });
 });
 
 test("concurrent and sequential calls have independent configuration, backends, receipts and failures", async () => {
@@ -528,9 +570,10 @@ test("concurrent and sequential calls have independent configuration, backends, 
     { url: "first", schema: "a", index: 0 },
     { name: "first" },
   );
-  const second = publisher.publish(
+  const second = publisher.publishFuture(
     { url: "second", schema: "b", index: 1 },
     { name: "second" },
+    1_900_000_000_000,
   );
   const assertFirstPending = pending(first);
   try {
@@ -555,9 +598,13 @@ test("concurrent and sequential calls have independent configuration, backends, 
       ["third", { schema: undefined }],
     ]);
     for (const [i, name] of ["first", "second", "third"].entries()) {
-      expect(backends[i].publish).toHaveBeenCalledExactlyOnceWith(task, {
-        name,
-      });
+      const method = i === 1 ? "publishFuture" : "publish";
+      expect(backends[i][method]).toHaveBeenCalledExactlyOnceWith(
+        ...(i === 1 ? [task, { name }, 1_900_000_000_000] : [task, { name }]),
+      );
+      expect(
+        backends[i][i === 1 ? "publish" : "publishFuture"],
+      ).not.toHaveBeenCalled();
       expect(backends[i].close).toHaveBeenCalledTimes(1);
       expect(receivers[i].fetch).toHaveBeenCalledTimes(i === 0 ? 0 : 1);
     }

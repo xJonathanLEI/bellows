@@ -87,7 +87,7 @@ pub trait PostgresPublishingExecutor: Send {
 /// Owned Workers connections must be request-scoped and use Hyperdrive; await [`Self::close`] on
 /// success and error paths before returning a response. Caller-owned connections and drivers
 /// require caller cleanup instead. Never retain connections across requests.
-/// For immediate publication followed by dispatch, `cloudflare::sdk::PostgresPublisher` owns that
+/// For immediate or future publication followed by dispatch, `cloudflare::sdk::PostgresPublisher` owns that
 /// lifecycle. This lower-level backend retains exact `u64` receipts, including IDs above the
 /// Cloudflare processor's safe-positive range; the adapter returns string receipts and checks that range.
 #[derive(Debug, Clone)]

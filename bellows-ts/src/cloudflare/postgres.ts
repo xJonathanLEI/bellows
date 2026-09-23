@@ -1,6 +1,6 @@
 import { PostgresExecutionBackend } from "../backends/postgres-execution.js";
 import type { PostgresBackendOptions } from "../backends/postgres-operations.js";
-import { runTaskOnce } from "../runtime.js";
+import { runTaskOnce, type TaskAttemptOutcome } from "../runtime.js";
 import type { PublishTaskDefinition, WorkerFactory } from "../types.js";
 
 export {
@@ -20,7 +20,7 @@ export interface PostgresProcessorTask {
     backend: PostgresExecutionBackend,
     workerId: number,
     taskId: number,
-  ) => Promise<void>;
+  ) => Promise<TaskAttemptOutcome>;
 }
 
 export function createPostgresProcessorTask<
@@ -52,7 +52,8 @@ export interface PostgresProcessorConfig extends PostgresBackendOptions {
  * Unknown names return 404 without acquisition; claims still check the persisted definition name.
  * Configuration is synchronous and runs only after validation, once per request.
  * Connections are request-scoped; application cleanup and Bellows shutdown are awaited.
- * HTTP 200 means the attempt ended, not that the task succeeded. This does not cancel
+ * HTTP 200 reports `nextAction`: `done` or `retryAt` with absolute Unix `atMs`, not business success.
+ * Uncertain runtime outcomes return a sanitized HTTP 500. This does not cancel
  * arbitrary promises, extend request lifetime, or retry tasks.
  * If configuration throws before returning, it owns its partially created resources.
  *
@@ -121,6 +122,10 @@ export function createPostgresProcessor<TEnv>(
       let unknownName = false;
       let stage = "configuration";
       let failed = false;
+      let nextAction:
+        | { type: "done" }
+        | { type: "retryAt"; atMs: number }
+        | undefined;
       const failure = (stage: string) => {
         failed = true;
         // Never log configuration, driver errors, or request-supplied properties.
@@ -152,7 +157,27 @@ export function createPostgresProcessor<TEnv>(
             { schema: config.schema },
           );
           stage = "attempt";
-          await task[executeTask](backend, workerId, taskId);
+          const outcome = await task[executeTask](backend, workerId, taskId);
+          switch (outcome.type) {
+            case "done":
+              nextAction = { type: "done" };
+              break;
+            case "retryAt": {
+              const atMs = outcome.availableFromMs;
+              if (
+                !Number.isSafeInteger(atMs) ||
+                atMs < 0 ||
+                atMs > 8_640_000_000_000_000
+              ) {
+                throw new Error("invalid scheduling deadline");
+              }
+              nextAction = { type: "retryAt", atMs };
+              break;
+            }
+            case "retry":
+              failure("attempt");
+              break;
+          }
         }
       } catch {
         failure(stage);
@@ -173,7 +198,7 @@ export function createPostgresProcessor<TEnv>(
         ? errorResponse(500, "task processing attempt failed")
         : unknownName
           ? errorResponse(404, "unknown task name")
-          : jsonResponse({ taskId: body.taskId, attemptFinished: true }, 200);
+          : jsonResponse({ taskId: body.taskId, nextAction }, 200);
     },
   };
 }

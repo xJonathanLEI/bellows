@@ -87,7 +87,21 @@ impl DurableObject for ContractDispatcher {
                 "alarm": self.storage.get_alarm().await?,
                 "now": js_sys::Date::now()
             })),
-            "/dispatcher/alarm" => self.dispatcher.alarm_worker().await,
+            "/dispatcher/alarm" => match self.dispatcher.alarm_worker().await {
+                Ok(response) => Ok(response),
+                Err(error) => Response::error(error.to_string(), 400),
+            },
+            "/dispatcher/corrupt" => {
+                self.storage
+                    .put_raw("scheduler", wasm_bindgen::JsValue::NULL)
+                    .await?;
+                Response::empty()
+            }
+            "/dispatcher/clear" => {
+                self.storage.delete_all().await?;
+                self.storage.delete_alarm().await?;
+                Response::empty()
+            }
             _ => self.dispatcher.fetch_worker(request).await,
         }
     }
@@ -130,21 +144,29 @@ impl DurableObject for BodySource {
             "/process" | "/dispatch" => {
                 let body: serde_json::Value = request.json().await?;
                 let error = body["taskId"] == "error";
+                let bytes = if request.path() == "/process" && !error {
+                    json!({ "taskId": body["taskId"], "nextAction": { "type": "done" } })
+                        .to_string()
+                        .into_bytes()
+                } else {
+                    // Larger than the diagnostic excerpt, spanning its UTF-16 boundary.
+                    format!("{}🦀{}", "a".repeat(499), "z".repeat(10_000)).into_bytes()
+                };
                 self.fetched.fetch_add(1, Ordering::SeqCst);
                 let release = self.release.clone();
                 let drained = self.drained.clone();
                 let stream = stream::unfold(
-                    (false, release, drained),
-                    |(sent, release, drained)| async move {
+                    (false, release, drained, bytes),
+                    |(sent, release, drained, bytes)| async move {
                         if sent {
                             drained.fetch_add(1, Ordering::SeqCst);
                             None
                         } else {
                             release.acquire().await.unwrap().forget();
-                            // Larger than the error excerpt, with a scalar spanning the UTF-16 boundary.
-                            let bytes =
-                                format!("{}🦀{}", "a".repeat(499), "z".repeat(10_000)).into_bytes();
-                            Some((Ok::<_, worker::Error>(bytes), (true, release, drained)))
+                            Some((
+                                Ok::<_, worker::Error>(bytes),
+                                (true, release, drained, Vec::new()),
+                            ))
                         }
                     },
                 );

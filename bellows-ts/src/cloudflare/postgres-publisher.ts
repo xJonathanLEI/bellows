@@ -9,7 +9,7 @@ import {
 } from "../cloudflare.js";
 import type { PublishTaskDefinition, TaskPayload } from "../types.js";
 
-/** Configuration for one immediate publication, using an existing schema. */
+/** Configuration for one publication, using an existing schema. */
 export interface PostgresPublisherConfig<
   TTask extends PublishTaskDefinition<unknown, unknown>,
 > extends PostgresBackendOptions {
@@ -62,11 +62,11 @@ export class PostgresPublisherError extends Error {
  * Success confirms acceptance, not completion. Inspect `PostgresPublisherError` before any generic
  * conversion; known publication failures retain their exact receipt.
  *
- * Await `publish` within your request, including when detached from this object. Normal error
+ * Await either method within your request, including when detached from this object. Normal error
  * paths await shutdown, but termination cannot guarantee cleanup. This does not extend request
  * lifetime, own an HTTP endpoint, retry publication, or make publication and dispatch atomic.
- * No future/awaitable publication, callback delivery, application cleanup hooks, transaction
- * participation, or durable recovery is provided.
+ * No awaitable publication, callback delivery, application cleanup hooks, transaction
+ * participation, or recovery of the publication-to-dispatch gap is provided.
  */
 export function createPostgresPublisher<
   TEnv,
@@ -74,82 +74,97 @@ export function createPostgresPublisher<
 >(
   configure: (env: TEnv) => PostgresPublisherConfig<TTask>,
 ): {
+  /** Publishes immediately and awaits shutdown and complete dispatch acceptance. */
   publish(
     env: TEnv,
     payload: TaskPayload<TTask>,
   ): Promise<PostgresPublisherReceipt>;
+  /**
+   * Publishes with absolute Unix-millisecond availability, then immediately dispatches the ID/name.
+   * The processor observes PostgreSQL's availability and instructs the durable dispatcher when to
+   * invoke again. Awaits shutdown and complete acceptance; receipts and requests omit the deadline.
+   */
+  publishFuture(
+    env: TEnv,
+    payload: TaskPayload<TTask>,
+    availableFromMs: number,
+  ): Promise<PostgresPublisherReceipt>;
 } {
-  return {
-    publish: async (env, payload) => {
-      let config: PostgresPublisherConfig<TTask>;
-      let backend: PostgresPublishingBackend;
-      let stage: PostgresPublisherStage = "configuration";
-      try {
-        config = configure(env);
-        stage = "acquisition";
-        backend = await PostgresPublishingBackend.connect(
-          config.connectionString,
-          {
-            schema: config.schema,
-          },
-        );
-      } catch (cause) {
-        throw new PostgresPublisherError(stage, cause);
-      }
+  const publish = async (
+    env: TEnv,
+    payload: TaskPayload<TTask>,
+    availableFromMs?: number,
+  ): Promise<PostgresPublisherReceipt> => {
+    let config: PostgresPublisherConfig<TTask>;
+    let backend: PostgresPublishingBackend;
+    let stage: PostgresPublisherStage = "configuration";
+    try {
+      config = configure(env);
+      stage = "acquisition";
+      backend = await PostgresPublishingBackend.connect(
+        config.connectionString,
+        {
+          schema: config.schema,
+        },
+      );
+    } catch (cause) {
+      throw new PostgresPublisherError(stage, cause);
+    }
 
-      let receipt: PostgresPublisherReceipt | undefined;
-      let failure:
-        | { stage: PostgresPublisherStage; cause: unknown }
-        | undefined;
-      stage = "publication";
-      try {
-        const published = await backend.publish(config.task, payload);
-        receipt = Object.freeze({ taskId: String(published.taskId) });
+    let receipt: PostgresPublisherReceipt | undefined;
+    let failure: { stage: PostgresPublisherStage; cause: unknown } | undefined;
+    stage = "publication";
+    try {
+      const published =
+        availableFromMs === undefined
+          ? await backend.publish(config.task, payload)
+          : await backend.publishFuture(config.task, payload, availableFromMs);
+      receipt = Object.freeze({ taskId: String(published.taskId) });
+      stage = "task-id";
+      if (
+        !Number.isSafeInteger(published.taskId) ||
+        /^[1-9][0-9]{0,15}$/.exec(receipt.taskId)?.[0] !== receipt.taskId
+      ) {
+        throw new Error("task ID must be a canonical positive safe integer");
+      }
+    } catch (cause) {
+      if (cause instanceof PostgresPublishedTaskIdError) {
+        receipt = Object.freeze({ taskId: cause.taskId });
         stage = "task-id";
-        if (
-          !Number.isSafeInteger(published.taskId) ||
-          /^[1-9][0-9]{0,15}$/.exec(receipt.taskId)?.[0] !== receipt.taskId
-        ) {
-          throw new Error("task ID must be a canonical positive safe integer");
-        }
-      } catch (cause) {
-        if (cause instanceof PostgresPublishedTaskIdError) {
-          receipt = Object.freeze({ taskId: cause.taskId });
-          stage = "task-id";
-        }
-        failure = { stage, cause };
       }
+      failure = { stage, cause };
+    }
 
-      let backendCloseError: { readonly cause: unknown } | undefined;
-      try {
-        await backend.close();
-      } catch (cause) {
-        if (failure) {
-          backendCloseError = Object.freeze({ cause });
-        } else {
-          failure = { stage: "backend-close", cause };
-        }
-      }
+    let backendCloseError: { readonly cause: unknown } | undefined;
+    try {
+      await backend.close();
+    } catch (cause) {
       if (failure) {
-        throw new PostgresPublisherError(
-          failure.stage,
-          failure.cause,
-          receipt,
-          backendCloseError,
-        );
+        backendCloseError = Object.freeze({ cause });
+      } else {
+        failure = { stage: "backend-close", cause };
       }
-      // A successful publication always retained its receipt before closing.
-      const published = receipt as PostgresPublisherReceipt;
-      try {
-        await dispatchTask(
-          config.dispatcher,
-          config.task.name,
-          published.taskId,
-        );
-      } catch (cause) {
-        throw new PostgresPublisherError("dispatch", cause, published);
-      }
-      return published;
-    },
+    }
+    if (failure) {
+      throw new PostgresPublisherError(
+        failure.stage,
+        failure.cause,
+        receipt,
+        backendCloseError,
+      );
+    }
+    // A successful publication always retained its receipt before closing.
+    const published = receipt as PostgresPublisherReceipt;
+    try {
+      await dispatchTask(config.dispatcher, config.task.name, published.taskId);
+    } catch (cause) {
+      throw new PostgresPublisherError("dispatch", cause, published);
+    }
+    return published;
+  };
+  return {
+    publish: (env, payload) => publish(env, payload),
+    publishFuture: (env, payload, availableFromMs) =>
+      publish(env, payload, availableFromMs),
   };
 }

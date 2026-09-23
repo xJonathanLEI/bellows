@@ -135,6 +135,9 @@ pub trait TaskPublishingBackend: Clone + Send + Sync {
 /// Import this trait when calling execution methods on concrete backend types.
 pub trait TaskExecutionBackend: Clone + Send + Sync {
     /// Claims a specific published task until a lease expiration time.
+    ///
+    /// `TaskNotFound` requires an absent row matching both definition and task kind. A failed
+    /// claim followed by an existing, now-due row must instead report retryable availability.
     fn claim_published<T>(
         &self,
         worker_id: u64,
@@ -314,8 +317,13 @@ pub struct ClaimedTask<T> {
 #[derive(Debug)]
 pub enum ClaimTaskError {
     Backend(BoxBackendError),
-    TaskLeased { expiration: Instant },
-    TaskUnavailable { available_from: Option<Instant> },
+    TaskLeased {
+        expiration: Instant,
+    },
+    /// `None` means there is no trustworthy next-availability hint, not definitive absence.
+    TaskUnavailable {
+        available_from: Option<Instant>,
+    },
     TaskNotFound,
 }
 

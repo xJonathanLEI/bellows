@@ -246,6 +246,7 @@ export function rustContracts(configPath: URL): void {
               state,
               (s) => s.fetched === s.drained,
             );
+            await consume("/dispatcher/clear");
           }
         } finally {
           await deadline(server.close(), "close Rust contract harness", 5_000);
@@ -309,7 +310,7 @@ export function rustContracts(configPath: URL): void {
         expect(await state()).toEqual({ fetched: 1, drained: 1 });
       }, 10_000);
 
-      test(`retains service fetch through body drainage and releases the ID: ${taskId}`, async () => {
+      test(`retains service fetch through body drainage and permits redispatch: ${taskId}`, async () => {
         expect(await dispatch(taskId)).toEqual({ ok: true, taskId });
         await poll(
           "service response started but body withheld",
@@ -340,7 +341,7 @@ export function rustContracts(configPath: URL): void {
           );
         }
         await poll(
-          "previous ID released",
+          "previous attempt permits explicit redispatch",
           () => dispatch(taskId),
           (s) => s.duplicate !== true,
         );
@@ -362,6 +363,14 @@ export function rustContracts(configPath: URL): void {
       }, 10_000);
     }
 
+    test("rejects stored null metadata rather than resetting attempt identity", async () => {
+      expect((await consume("/dispatcher/corrupt")).status).toBe(200);
+      const response = await consume("/dispatcher/alarm");
+      expect(response.status).toBe(400);
+      expect(response.body.length).toBeGreaterThan(0);
+      expect(await state()).toEqual({ fetched: 0, drained: 0 });
+    }, 10_000);
+
     test("adapts heartbeat alarms as absolute times and schedules while idle", async () => {
       const alarmState = async () =>
         JSON.parse((await consume("/dispatcher/state")).body) as {
@@ -382,11 +391,9 @@ export function rustContracts(configPath: URL): void {
         state,
         (s) => s.drained === 1,
       );
-      const idle = await alarmState();
       await consume("/dispatcher/alarm");
       const rescheduled = await alarmState();
-      expect(rescheduled.alarm).toBeGreaterThanOrEqual(idle.now + 30_000);
-      expect(rescheduled.alarm).toBeLessThanOrEqual(rescheduled.now + 30_000);
+      expect(rescheduled.alarm).toBe(after.alarm);
     }, 10_000);
   });
 }

@@ -6,7 +6,7 @@ use std::{
     fmt::{Display, Formatter},
     str::FromStr,
     sync::{Arc, Mutex},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime},
 };
 
 use rand::RngExt;
@@ -25,6 +25,7 @@ use crate::backends::{
     PublishedTask, RenewTaskError, RenewedTaskLease, SubscribeError, TaskExecutionBackend,
     TaskPublishingBackend,
 };
+use crate::time::deadlines::{instant_to_unix_ms, unix_ms_to_instant, unix_timestamp_ms};
 use crate::{AwaitableTask, PublishActivationStrategy, TaskDefinition};
 
 const SIGNAL_CHANNEL_SIZE: usize = 1024;
@@ -260,9 +261,7 @@ impl SqliteBackend {
             PublishTaskError::Backend(Box::new(SqliteBackendError::PayloadSerialization(err)))
         })?;
 
-        let now_system = SystemTime::now();
-        let available_from_unix_ms =
-            available_from.map(|available_from| instant_to_unix_ms(available_from, now_system));
+        let available_from_unix_ms = available_from.map(instant_to_unix_ms);
 
         let result = sqlx::query(
             r#"
@@ -308,13 +307,7 @@ VALUES (?, NULL, ?, ?, NULL, ?)
         Ok(PublishedTask { task_id })
     }
 
-    async fn load_claim_failure(
-        &self,
-        task_id_db: i64,
-        task_name: &'static str,
-        now_system: SystemTime,
-    ) -> ClaimTaskError {
-        let now_unix_ms = unix_timestamp_ms(now_system);
+    async fn load_claim_failure(&self, task_id_db: i64, task_name: &'static str) -> ClaimTaskError {
         let current = match sqlx::query(
             r#"
 SELECT lease_worker_id, available_from_unix_ms
@@ -339,26 +332,10 @@ WHERE task_id = ?
             return ClaimTaskError::TaskNotFound;
         };
 
-        let worker_id = current.get::<Option<i64>, _>("lease_worker_id");
-        let available_from_unix_ms = current.get::<Option<i64>, _>("available_from_unix_ms");
-
-        match available_from_unix_ms {
-            Some(available_from_unix_ms) if available_from_unix_ms > now_unix_ms => {
-                if worker_id.is_some() {
-                    ClaimTaskError::TaskLeased {
-                        expiration: unix_ms_to_instant(available_from_unix_ms, now_system),
-                    }
-                } else {
-                    ClaimTaskError::TaskUnavailable {
-                        available_from: Some(unix_ms_to_instant(
-                            available_from_unix_ms,
-                            now_system,
-                        )),
-                    }
-                }
-            }
-            Some(_) | None => ClaimTaskError::TaskNotFound,
-        }
+        unclaimed_task(
+            current.get("lease_worker_id"),
+            current.get("available_from_unix_ms"),
+        )
     }
 }
 
@@ -436,7 +413,7 @@ impl TaskExecutionBackend for SqliteBackend {
         })?;
         let now_system = SystemTime::now();
         let now_unix_ms = unix_timestamp_ms(now_system);
-        let lease_expiration_unix_ms = instant_to_unix_ms(lease_expiration, now_system);
+        let lease_expiration_unix_ms = instant_to_unix_ms(lease_expiration);
 
         let claimed_row = sqlx::query(
             r#"
@@ -479,9 +456,7 @@ RETURNING payload_json
                     lease_expiration,
                 })
             }
-            None => Err(self
-                .load_claim_failure(task_id_db, T::NAME, now_system)
-                .await),
+            None => Err(self.load_claim_failure(task_id_db, T::NAME).await),
         }
     }
 
@@ -502,7 +477,7 @@ RETURNING payload_json
         })?;
         let now_system = SystemTime::now();
         let now_unix_ms = unix_timestamp_ms(now_system);
-        let lease_expiration_unix_ms = instant_to_unix_ms(lease_expiration, now_system);
+        let lease_expiration_unix_ms = instant_to_unix_ms(lease_expiration);
 
         let mut tx = self
             .pool
@@ -546,7 +521,7 @@ WHERE task_name = ?
             .await
             .map_err(|err| ClaimTaskError::Backend(Box::new(SqliteBackendError::Sqlx(err))))?
             .get::<Option<i64>, _>("available_from_unix_ms")
-            .map(|unix_ms| unix_ms_to_instant(unix_ms, now_system));
+            .and_then(unix_ms_to_instant);
 
             tx.commit().await.ok();
             return Err(ClaimTaskError::TaskUnavailable {
@@ -617,7 +592,7 @@ WHERE task_id = ?
         })?;
         let now_system = SystemTime::now();
         let now_unix_ms = unix_timestamp_ms(now_system);
-        let lease_expiration_unix_ms = instant_to_unix_ms(lease_expiration, now_system);
+        let lease_expiration_unix_ms = instant_to_unix_ms(lease_expiration);
 
         let claimed_row = sqlx::query(
             r#"
@@ -684,26 +659,10 @@ WHERE task_name = ?
                     return Err(ClaimTaskError::TaskNotFound);
                 };
 
-                let worker_id = current.get::<Option<i64>, _>("lease_worker_id");
-                let available_from_unix_ms =
-                    current.get::<Option<i64>, _>("available_from_unix_ms");
-                match available_from_unix_ms {
-                    Some(available_from_unix_ms) if available_from_unix_ms > now_unix_ms => {
-                        if worker_id.is_some() {
-                            Err(ClaimTaskError::TaskLeased {
-                                expiration: unix_ms_to_instant(available_from_unix_ms, now_system),
-                            })
-                        } else {
-                            Err(ClaimTaskError::TaskUnavailable {
-                                available_from: Some(unix_ms_to_instant(
-                                    available_from_unix_ms,
-                                    now_system,
-                                )),
-                            })
-                        }
-                    }
-                    Some(_) | None => Err(ClaimTaskError::TaskNotFound),
-                }
+                Err(unclaimed_task(
+                    current.get("lease_worker_id"),
+                    current.get("available_from_unix_ms"),
+                ))
             }
         }
     }
@@ -720,7 +679,7 @@ WHERE task_name = ?
         let worker_id_db = i64::try_from(worker_id).map_err(|err| {
             RenewTaskError::Backend(Box::new(SqliteBackendError::InvalidWorkerId(err)))
         })?;
-        let lease_expiration_unix_ms = instant_to_unix_ms(lease_expiration, SystemTime::now());
+        let lease_expiration_unix_ms = instant_to_unix_ms(lease_expiration);
 
         let result = sqlx::query(
             r#"
@@ -779,8 +738,7 @@ WHERE task_id = ?
         let worker_id_db = i64::try_from(worker_id).map_err(|err| {
             FailTaskError::Backend(Box::new(SqliteBackendError::InvalidWorkerId(err)))
         })?;
-        let available_from_unix_ms =
-            available_from.map(|instant| instant_to_unix_ms(instant, SystemTime::now()));
+        let available_from_unix_ms = available_from.map(instant_to_unix_ms);
 
         let updated = sqlx::query(
             r#"
@@ -840,9 +798,7 @@ RETURNING task_name
         let callback_payload_json = serde_json::to_string(&callback_payload).map_err(|err| {
             FinishTaskError::Backend(Box::new(SqliteBackendError::CallbackSerialization(err)))
         })?;
-        let now_system = SystemTime::now();
-        let available_from_unix_ms =
-            available_from.map(|available_from| instant_to_unix_ms(available_from, now_system));
+        let available_from_unix_ms = available_from.map(instant_to_unix_ms);
 
         let mut tx = self
             .pool
@@ -1008,33 +964,13 @@ where
     }
 }
 
-fn unix_timestamp_ms(time: SystemTime) -> i64 {
-    let duration = time.duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO);
-
-    i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
-}
-
-fn instant_to_unix_ms(instant: Instant, now_system: SystemTime) -> i64 {
-    let now_instant = Instant::now();
-    let system_deadline = if instant >= now_instant {
-        now_system + instant.duration_since(now_instant)
-    } else {
-        now_system
-            .checked_sub(now_instant.duration_since(instant))
-            .unwrap_or(UNIX_EPOCH)
-    };
-
-    unix_timestamp_ms(system_deadline)
-}
-
-fn unix_ms_to_instant(unix_ms: i64, now_system: SystemTime) -> Instant {
-    let now_instant = Instant::now();
-    let now_unix_ms = unix_timestamp_ms(now_system);
-
-    if unix_ms <= now_unix_ms {
-        now_instant
-    } else {
-        let delta_ms = u64::try_from(unix_ms - now_unix_ms).unwrap_or(u64::MAX);
-        now_instant + Duration::from_millis(delta_ms)
+// The SELECT found a matching row, even if availability changed after the failed UPDATE.
+fn unclaimed_task(lease_worker_id: Option<i64>, available_ms: Option<i64>) -> ClaimTaskError {
+    let available_from = available_ms.map_or_else(|| Some(Instant::now()), unix_ms_to_instant);
+    match available_from {
+        Some(expiration) if lease_worker_id.is_some() && expiration > Instant::now() => {
+            ClaimTaskError::TaskLeased { expiration }
+        }
+        _ => ClaimTaskError::TaskUnavailable { available_from },
     }
 }

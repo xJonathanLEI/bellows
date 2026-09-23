@@ -1,7 +1,8 @@
 use std::{sync::Arc, time::Duration};
 
 use crate::{
-    ActivationStrategy, TaskDefinition, TaskExecutionBackend, TaskSuccess, Worker, WorkerFactory,
+    ActivationStrategy, ActivationStrategyKind, TaskDefinition, TaskExecutionBackend, TaskSuccess,
+    Worker, WorkerFactory,
     backends::{ClaimTaskError, FailTaskError, FinishTaskError, RenewTaskError},
     platform,
     time::Instant,
@@ -12,6 +13,17 @@ use tracing::{trace, warn};
 const LEASE_DURATION: Duration = Duration::from_secs(20);
 const LEASE_RENEWAL_THRESHOLD: Duration = Duration::from_secs(10);
 
+/// The next action for a host after a single task attempt, not a business success status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskAttemptOutcome {
+    /// The requested published task is absent or its completion was committed.
+    Done,
+    /// Recheck at the observed availability/lease deadline or committed rescheduling deadline.
+    RetryAt { available_from: Instant },
+    /// Ownership or backend state is uncertain; apply the host's infrastructure retry policy.
+    Retry,
+}
+
 /// Executes and awaits one task attempt without starting a dispatcher.
 ///
 /// Published tasks accept [`crate::PublishDispatchToken::Task`] or
@@ -19,9 +31,10 @@ const LEASE_RENEWAL_THRESHOLD: Duration = Duration::from_secs(10);
 /// Both full [`crate::Backend`] implementations and execution-only backends can be used.
 ///
 /// Claims the task before building a worker, renews its lease while processing, and awaits the
-/// failure or completion recording attempt before returning. A normal unit return is **not** a
-/// success status: missing, leased, or unavailable tasks do not start a worker, and backend
-/// claim/finalization errors are logged by the runtime rather than returned.
+/// failure or completion recording attempt before returning a [`TaskAttemptOutcome`].
+/// Missing, leased, or unavailable tasks do not start a worker. Backend errors are logged and
+/// return [`TaskAttemptOutcome::Retry`]; a worker's intended schedule is returned only after
+/// successful finalization.
 /// Renewal failure aborts the worker without recording completion or undoing side effects.
 ///
 /// This does not discover work or retry internally. Retries and successful rescheduling require
@@ -35,7 +48,8 @@ pub async fn run_task_once<B, F>(
     factory: F,
     worker_id: u64,
     dispatch_token: <<<F::Worker as Worker>::Task as TaskDefinition>::Trigger as ActivationStrategy>::DispatchToken,
-) where
+) -> TaskAttemptOutcome
+where
     B: TaskExecutionBackend + 'static,
     F: WorkerFactory + 'static,
 {
@@ -47,7 +61,7 @@ pub async fn run_task_once<B, F>(
         update_signal,
     }
     .run_and_wait(dispatch_token)
-    .await;
+    .await
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,7 +95,7 @@ where
     pub async fn run_and_wait(
         self,
         dispatch_token: <<<F::Worker as Worker>::Task as TaskDefinition>::Trigger as ActivationStrategy>::DispatchToken,
-    ) {
+    ) -> TaskAttemptOutcome {
         let daemon = Daemon {
             backend: self.backend,
             factory: self.factory,
@@ -89,7 +103,7 @@ where
             update_signal: self.update_signal,
             status: DaemonStatus::WaitingForTask { dispatch_token },
         };
-        daemon.run().await;
+        daemon.run().await
     }
 }
 
@@ -110,7 +124,7 @@ where
     F: WorkerFactory,
     F::Worker: 'static,
 {
-    async fn run(mut self) {
+    async fn run(mut self) -> TaskAttemptOutcome {
         loop {
             let (new_self, action, update) = self.event_loop().await;
             self = new_self;
@@ -119,8 +133,8 @@ where
                 let _ = self.update_signal.send(update);
             }
 
-            if matches!(action, EventLoopResult::Exit) {
-                break;
+            if let EventLoopResult::Exit(outcome) = action {
+                return outcome;
             }
         }
     }
@@ -151,7 +165,7 @@ where
                         trace!("Unable to claim task with worker #{}", self.worker_id);
                         (
                             DaemonStatus::WorkerExited,
-                            EventLoopResult::Exit,
+                            EventLoopResult::Exit(TaskAttemptOutcome::RetryAt { available_from: expiration }),
                             Some(RuntimeUpdate {
                                 next_available_from_update: Some(Some(expiration)),
                                 claimed_task: false,
@@ -162,7 +176,7 @@ where
                         trace!("No task available for worker #{}", self.worker_id);
                         (
                             DaemonStatus::WorkerExited,
-                            EventLoopResult::Exit,
+                            EventLoopResult::Exit(available_from.map_or(TaskAttemptOutcome::Retry, |available_from| TaskAttemptOutcome::RetryAt { available_from })),
                             Some(RuntimeUpdate {
                                 next_available_from_update: Some(available_from),
                                 claimed_task: false,
@@ -170,14 +184,18 @@ where
                         )
                     }
                     Err(ClaimTaskError::TaskNotFound) => {
-                        (DaemonStatus::WorkerExited, EventLoopResult::Exit, None)
+                        let outcome = match <<F::Worker as Worker>::Task as TaskDefinition>::Trigger::KIND {
+                            ActivationStrategyKind::Publish => TaskAttemptOutcome::Done,
+                            ActivationStrategyKind::Singleton => TaskAttemptOutcome::Retry,
+                        };
+                        (DaemonStatus::WorkerExited, EventLoopResult::Exit(outcome), None)
                     }
                     Err(ClaimTaskError::Backend(err)) => {
                         warn!(
                             "Unable to claim task with worker #{} due to backend error: {}",
                             self.worker_id, err
                         );
-                        (DaemonStatus::WorkerExited, EventLoopResult::Exit, None)
+                        (DaemonStatus::WorkerExited, EventLoopResult::Exit(TaskAttemptOutcome::Retry), None)
                     }
                 }
             }
@@ -241,7 +259,7 @@ where
                                     self.worker_id
                                 );
                                 worker_handle.abort();
-                                (DaemonStatus::WorkerExited, EventLoopResult::Exit, None)
+                                (DaemonStatus::WorkerExited, EventLoopResult::Exit(TaskAttemptOutcome::Retry), None)
                             }
                             Err(RenewTaskError::Backend(err)) => {
                                 warn!(
@@ -251,7 +269,7 @@ where
                                     err
                                 );
                                 worker_handle.abort();
-                                (DaemonStatus::WorkerExited, EventLoopResult::Exit, None)
+                                (DaemonStatus::WorkerExited, EventLoopResult::Exit(TaskAttemptOutcome::Retry), None)
                             }
                         }
                     },
@@ -297,31 +315,34 @@ where
                 task_id,
                 available_from,
             } => {
-                match self
+                let outcome = match self
                     .backend
                     .fail(self.worker_id, task_id, available_from)
                     .await
                 {
                     Ok(_) => {
                         trace!("Failed task #{} with worker #{}", task_id, self.worker_id);
+                        TaskAttemptOutcome::RetryAt { available_from: available_from.unwrap_or_else(Instant::now) }
                     }
                     Err(FailTaskError::LeaseLost) => {
                         warn!(
                             "Worker #{} failed task #{} but no longer holds its lease; assuming another worker took over",
                             self.worker_id, task_id
                         );
+                        TaskAttemptOutcome::Retry
                     }
                     Err(FailTaskError::Backend(err)) => {
                         warn!(
                             "Unable to record failure for task #{} with worker #{} due to backend error: {}",
                             task_id, self.worker_id, err
                         );
+                        TaskAttemptOutcome::Retry
                     }
-                }
+                };
 
                 (
                     DaemonStatus::WorkerExited,
-                    EventLoopResult::Exit,
+                    EventLoopResult::Exit(outcome),
                     Some(RuntimeUpdate {
                         next_available_from_update: None,
                         claimed_task: false,
@@ -332,7 +353,7 @@ where
                 task_id,
                 task_success,
             } => {
-                match self
+                let outcome = match self
                     .backend
                     .finish::<<F::Worker as Worker>::Task>(
                         self.worker_id,
@@ -344,24 +365,31 @@ where
                 {
                     Ok(_) => {
                         trace!("Finished task #{} with worker #{}", task_id, self.worker_id);
+                        match (task_success.available_from, <<F::Worker as Worker>::Task as TaskDefinition>::Trigger::KIND) {
+                            (Some(available_from), _) => TaskAttemptOutcome::RetryAt { available_from },
+                            (None, ActivationStrategyKind::Singleton) => TaskAttemptOutcome::RetryAt { available_from: Instant::now() },
+                            (None, ActivationStrategyKind::Publish) => TaskAttemptOutcome::Done,
+                        }
                     }
                     Err(FinishTaskError::LeaseLost) => {
                         warn!(
                             "Worker #{} finished task #{} but no longer holds its lease; assuming another worker took over",
                             self.worker_id, task_id
                         );
+                        TaskAttemptOutcome::Retry
                     }
                     Err(FinishTaskError::Backend(err)) => {
                         warn!(
                             "Unable to finalize task #{} with worker #{} due to backend error: {}",
                             task_id, self.worker_id, err
                         );
+                        TaskAttemptOutcome::Retry
                     }
-                }
+                };
 
                 (
                     DaemonStatus::WorkerExited,
-                    EventLoopResult::Exit,
+                    EventLoopResult::Exit(outcome),
                     Some(RuntimeUpdate {
                         next_available_from_update: None,
                         claimed_task: false,
@@ -381,7 +409,7 @@ where
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EventLoopResult {
     Continue,
-    Exit,
+    Exit(TaskAttemptOutcome),
 }
 
 /// Worker runtime daemon lifecycle stages.

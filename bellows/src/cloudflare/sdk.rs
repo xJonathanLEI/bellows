@@ -1,11 +1,12 @@
 //! Workers SDK adapters (wasm + `cloudflare` only).
 //!
-//! Store one [`Dispatcher`] per Durable Object, created with [`Dispatcher::from_bindings`],
+//! Store one [`Dispatcher`] per SQLite-backed Durable Object, created with [`Dispatcher::from_bindings`],
 //! and forward handlers to [`Dispatcher::fetch_worker`] and [`Dispatcher::alarm_worker`].
 //!
 //! For a producer, bind [`PostgresPublisher`] to one published task and its dispatcher. Its
 //! synchronous configuration runs once per call; construction does no I/O. Await
-//! [`PostgresPublisher::publish`] inside your handler: it publishes once, retains the exact string
+//! [`PostgresPublisher::publish`] or [`PostgresPublisher::publish_future`] inside your handler:
+//! either publishes once, retains the exact string
 //! ID, validates the processor's safe-positive range, awaits backend shutdown, then consumes the
 //! complete dispatch response. Applications own authentication, routing, validation, and responses.
 //! Success confirms acceptance, not completion. [`PostgresPublisherError`] retains partial success
@@ -21,24 +22,35 @@
 //! business-connection ownership outside the spawned worker to survive lease-loss aborts. Cleanup
 //! runs once whenever configuration returned, even for invalid registrations or unknown names.
 //! Backend shutdown is always awaited afterwards if acquired, even when application cleanup fails.
-//! HTTP 200 reports an ended attempt, not business success. Applications still own arbitrary
+//! HTTP 200 reports a known next action, not business success. Applications still own arbitrary
 //! side-effect resources.
 //!
 //! Direct [`crate::backends::postgres_execution::PostgresExecutionBackend`] with
 //! [`crate::run_task_once`] remains available for custom integrations with caller-owned cleanup.
 //! Likewise, [`crate::backends::postgres_publishing::PostgresPublishingBackend`] plus
-//! [`super::dispatch_task`] supports caller-managed publication. The publisher is immediate-only:
-//! no future/awaitable publication, callback delivery, or application cleanup hooks.
-//! Neither delegate extends request lifetime or adds durable recovery or automatic retries.
-//! Publication and dispatch are not atomic; cancellation, termination, and wasm traps have no
+//! [`super::dispatch_task`] supports caller-managed publication. The publisher's `publish_future`
+//! records availability and immediately dispatches the ID/name for processor-driven scheduling.
+//! It adds no awaitable publication, callback delivery, or application cleanup hooks.
+//! The named object `global` launches external dispatches in memory, then checks the warming alarm.
+//! It sets the alarm only when missing or later than now plus thirty seconds, without task writes.
+//! Active same-ID requests stay deduplicated through full body consumption and result persistence.
+//! Only a matching `done` removes tracking; `retryAt` persists an absolute hint. Uncertain responses
+//! back off from one to thirty seconds. One alarm selects the earliest pending/watchdog deadline or
+//! independent 30-second heartbeat, launching every due ID without a Bellows concurrency limit.
+//! The 60-second watchdog supersedes interrupted/hung transport and ignores stale results, without
+//! guaranteeing business cancellation. PostgreSQL controls execution eligibility; another invocation
+//! may observe an extended lease. Alarm and transport redelivery do not imply exactly-once work.
+//! Durability starts when `retryAt` is persisted; earlier uncertainty retries only in memory.
+//! The watchdog applies to scheduled attempts. There is no PostgreSQL discovery or Cron. Publication and dispatch
+//! are not atomic; cancellation, termination, and wasm traps have no
 //! async-finally guarantee. Initialize schemas administratively, not during requests.
 
 use http::{Request, Response};
 use worker::send::{SendFuture, SendWrapper};
 
 use super::{
-    AlarmStorage, BoxDispatchError, DurableObjectNamespaceLike, ProcessorFetcher,
-    RetainedTaskDispatcher, TextBody,
+    BoxDispatchError, DispatcherState, DispatcherStorage, DispatcherTask,
+    DurableObjectNamespaceLike, ProcessorFetcher, RetainedTaskDispatcher, ScheduleUpdate, TextBody,
 };
 
 mod postgres;
@@ -58,12 +70,12 @@ impl From<worker::Fetcher> for Service {
     }
 }
 
-/// Durable Object alarm storage using absolute timestamps.
-pub struct Storage(SendWrapper<worker::Storage>);
+/// SQLite-backed Durable Object records and shared alarm, committed atomically.
+pub struct Storage(SendWrapper<std::rc::Rc<worker::Storage>>);
 
 impl From<worker::Storage> for Storage {
     fn from(value: worker::Storage) -> Self {
-        Self(SendWrapper::new(value))
+        Self(SendWrapper::new(std::rc::Rc::new(value)))
     }
 }
 
@@ -133,26 +145,121 @@ impl ProcessorFetcher for Service {
     }
 }
 
-impl AlarmStorage for Storage {
+impl DispatcherStorage for Storage {
     fn get_alarm(&self) -> impl Future<Output = Result<Option<i64>, BoxDispatchError>> + Send {
         SendFuture::new(async move { self.0.get_alarm().await.map_err(sdk_error) })
     }
 
-    fn set_alarm(
-        &self,
-        alarm_time: i64,
-    ) -> impl Future<Output = Result<(), BoxDispatchError>> + Send {
+    fn set_alarm(&self, at_ms: i64) -> impl Future<Output = Result<(), BoxDispatchError>> + Send {
         SendFuture::new(async move {
-            // An i64 passed directly to set_alarm is an OFFSET in workers-rs, not a timestamp.
-            let date = worker::js_sys::Date::new(&worker::wasm_bindgen::JsValue::from_f64(
-                alarm_time as f64,
-            ));
+            let date =
+                worker::js_sys::Date::new(&worker::wasm_bindgen::JsValue::from_f64(at_ms as f64));
             self.0
                 .set_alarm(worker::ScheduledTime::new(date))
                 .await
                 .map_err(sdk_error)
         })
     }
+
+    fn contains_task(
+        &self,
+        id: &str,
+    ) -> impl Future<Output = Result<bool, BoxDispatchError>> + Send {
+        SendFuture::new(async move {
+            let key = format!("task:{id}");
+            let records = self
+                .0
+                .get_multiple(vec![key.as_str()])
+                .await
+                .map_err(sdk_error)?;
+            Ok(records.has(&worker::wasm_bindgen::JsValue::from_str(&key)))
+        })
+    }
+
+    fn transaction<T>(
+        &self,
+        update: ScheduleUpdate<T>,
+    ) -> impl Future<Output = Result<T, BoxDispatchError>> + Send
+    where
+        T: Send + 'static,
+    {
+        SendFuture::new(async move {
+            let storage = std::rc::Rc::clone(&self.0);
+            let result = std::rc::Rc::new(std::cell::RefCell::new(None));
+            let output = result.clone();
+            self.0
+                .transaction(move |_transaction| async move {
+                    // Top-level operations on this same SQLite storage join the transaction,
+                    // including set_alarm, which the SDK Transaction wrapper does not expose.
+                    // Storage::get deserializes Option<T>, conflating stored null with absence.
+                    // Membership must be checked separately so corrupt metadata cannot reset IDs.
+                    let metadata = storage.get_multiple(vec!["scheduler"]).await?;
+                    let key = worker::wasm_bindgen::JsValue::from_str("scheduler");
+                    let mut state = DispatcherState {
+                        alarm: storage.get_alarm().await?,
+                        metadata: if metadata.has(&key) {
+                            Some(stored_value(&metadata.get(&key))?)
+                        } else {
+                            None
+                        },
+                        ..Default::default()
+                    };
+                    let records = storage
+                        .list_with_options(worker::ListOptions::new().prefix("task:"))
+                        .await?;
+                    for entry in records.entries() {
+                        let entry = worker::js_sys::Array::from(&entry?);
+                        let key = entry.get(0).as_string().ok_or_else(|| {
+                            worker::Error::RustError("invalid dispatcher storage key".into())
+                        })?;
+                        let task: DispatcherTask = stored_value(&entry.get(1))?;
+                        if key != format!("task:{}", task.task_id) {
+                            return Err(worker::Error::RustError(
+                                "invalid dispatcher storage key".into(),
+                            ));
+                        }
+                        state.tasks.insert(task.task_id.clone(), task);
+                    }
+                    let previous = state.tasks.clone();
+                    let value = update(&mut state)
+                        .map_err(|error| worker::Error::RustError(error.to_string()))?;
+                    for (id, task) in &state.tasks {
+                        if previous.get(id) != Some(task) {
+                            storage.put(&format!("task:{id}"), task).await?;
+                        }
+                    }
+                    for id in previous.keys() {
+                        if !state.tasks.contains_key(id) {
+                            storage.delete(&format!("task:{id}")).await?;
+                        }
+                    }
+                    storage.put("scheduler", &state.metadata).await?;
+                    // An integer passed to workers-rs set_alarm is a relative OFFSET.
+                    let date = worker::js_sys::Date::new(&worker::wasm_bindgen::JsValue::from_f64(
+                        state.alarm_at_ms() as f64,
+                    ));
+                    storage.set_alarm(worker::ScheduledTime::new(date)).await?;
+                    *output.borrow_mut() = Some(value);
+                    Ok(())
+                })
+                .await
+                .map_err(sdk_error)?;
+            let value = result
+                .borrow_mut()
+                .take()
+                .ok_or("dispatcher transaction returned no result")?;
+            Ok(value)
+        })
+    }
+}
+
+fn stored_value<T: serde::de::DeserializeOwned>(
+    value: &worker::wasm_bindgen::JsValue,
+) -> worker::Result<T> {
+    let json = worker::js_sys::JSON::stringify(value)?
+        .as_string()
+        .ok_or_else(|| worker::Error::RustError("invalid dispatcher storage value".into()))?;
+    Ok(serde_json::from_str(&json)?)
 }
 
 fn incoming_request(mut request: worker::Request) -> worker::Result<Request<TextBody>> {

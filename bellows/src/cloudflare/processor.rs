@@ -5,13 +5,13 @@ use serde_json::{Value, json};
 
 use super::{BoxDispatchError, INVALID_TASK_NAME, TextBody, json_response, validate_task_name};
 use crate::{
-    PublishActivationStrategy, PublishDispatchToken, TaskDefinition, TaskExecutionBackend, Worker,
-    WorkerFactory, run_task_once,
+    PublishActivationStrategy, PublishDispatchToken, TaskAttemptOutcome, TaskDefinition,
+    TaskExecutionBackend, Worker, WorkerFactory, run_task_once,
 };
 
 pub(super) type Cleanup = Pin<Box<dyn Future<Output = Result<(), BoxDispatchError>>>>;
 
-type Attempt = Pin<Box<dyn Future<Output = ()>>>;
+type Attempt = Pin<Box<dyn Future<Output = TaskAttemptOutcome>>>;
 
 // Erase the factory only after checking its own published definition and callback types.
 pub(super) struct ProcessorTask<B> {
@@ -30,18 +30,21 @@ impl<B: TaskExecutionBackend + 'static> ProcessorTask<B> {
         Self {
             name: <F::Worker as Worker>::Task::NAME,
             execute: Box::new(move |backend, worker_id, task_id| {
-                Box::pin(run_task_once(
-                    backend,
-                    factory,
-                    worker_id,
-                    PublishDispatchToken::Task(task_id),
-                ))
+                Box::pin(async move {
+                    run_task_once(
+                        backend,
+                        factory,
+                        worker_id,
+                        PublishDispatchToken::Task(task_id),
+                    )
+                    .await
+                })
             }),
         }
     }
 
-    pub async fn run(self, backend: B, worker_id: u64, task_id: u64) {
-        (self.execute)(backend, worker_id, task_id).await;
+    pub async fn run(self, backend: B, worker_id: u64, task_id: u64) -> TaskAttemptOutcome {
+        (self.execute)(backend, worker_id, task_id).await
     }
 }
 
@@ -67,9 +70,8 @@ pub(super) trait Processor {
         task: ProcessorTask<Self::Backend>,
         worker_id: u64,
         task_id: u64,
-    ) -> Result<(), BoxDispatchError> {
-        task.run(backend, worker_id, task_id).await;
-        Ok(())
+    ) -> Result<TaskAttemptOutcome, BoxDispatchError> {
+        Ok(task.run(backend, worker_id, task_id).await)
     }
 
     fn log_failure(&self, task_id: &str, stage: &'static str) {
@@ -114,7 +116,7 @@ pub(super) async fn fetch<P: Processor>(
             return Err("configuration");
         }
         let Some(task) = tasks.into_iter().find(|task| task.name == task_name) else {
-            return Ok(false);
+            return Ok(None);
         };
         let worker_id = random_worker_id(|| processor.random_bytes()).map_err(|_| "worker-id")?;
         let acquired = processor
@@ -122,15 +124,25 @@ pub(super) async fn fetch<P: Processor>(
             .await
             .map_err(|_| "acquisition")?;
         backend = Some(acquired.clone());
-        processor
+        let outcome = processor
             .attempt(acquired, task, worker_id, id)
             .await
             .map_err(|_| "attempt")?;
-        Ok(true)
+        let action = match outcome {
+            TaskAttemptOutcome::Done => json!({ "type": "done" }),
+            TaskAttemptOutcome::RetryAt { available_from } => {
+                let at_ms = crate::time::deadlines::ClockSnapshot::now()
+                    .to_wire_ms(available_from)
+                    .ok_or("attempt")?;
+                json!({ "type": "retryAt", "atMs": at_ms })
+            }
+            TaskAttemptOutcome::Retry => return Err("attempt"),
+        };
+        Ok(Some(action))
     }
     .await;
     let mut failed = false;
-    if let Err(stage) = attempt {
+    if let Err(stage) = &attempt {
         failed = true;
         processor.log_failure(&task_id, stage);
     }
@@ -152,13 +164,13 @@ pub(super) async fn fetch<P: Processor>(
             StatusCode::INTERNAL_SERVER_ERROR,
             "task processing attempt failed",
         )
-    } else if attempt == Ok(false) {
-        error(StatusCode::NOT_FOUND, "unknown task name")
-    } else {
+    } else if let Ok(Some(next_action)) = attempt {
         json_response(
-            json!({ "taskId": task_id, "attemptFinished": true }),
+            json!({ "taskId": task_id, "nextAction": next_action }),
             StatusCode::OK,
         )
+    } else {
+        error(StatusCode::NOT_FOUND, "unknown task name")
     }
 }
 

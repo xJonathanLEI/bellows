@@ -25,6 +25,102 @@ use crate::{
 
 const DATABASE_URL: &str = "postgres://postgres:postgres@localhost:5432/postgres";
 const LIMIT: Duration = Duration::from_secs(5);
+
+#[tokio::test]
+async fn failed_claim_follow_up_never_reports_an_existing_due_row_missing() {
+    let f = Fixture::new().await;
+    let ops = f.connect().await;
+    let future = f
+        .insert(
+            Echo::NAME,
+            r#"{"name":"future"}"#,
+            Some(unix_timestamp_ms(SystemTime::now()) + 60_000),
+        )
+        .await;
+    // Change availability between the unsuccessful UPDATE and its follow-up SELECT.
+    f.admin.batch_execute(&format!(
+        "CREATE FUNCTION \"{schema}\".release_after_claim() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN UPDATE {table} SET available_from_unix_ms = NULL; RETURN NULL; END $$;
+         CREATE TRIGGER release_after_claim AFTER UPDATE ON {table}
+         FOR EACH STATEMENT WHEN (pg_trigger_depth() = 0) EXECUTE FUNCTION \"{schema}\".release_after_claim();",
+        schema = f.schema, table = f.table,
+    )).await.unwrap();
+    assert!(
+        matches!(ops.claim_published::<Echo>(17, future, expiration()).await,
+        Err(ClaimTaskError::TaskUnavailable { available_from: Some(at) }) if at <= Instant::now())
+    );
+    f.admin
+        .batch_execute(&format!("DROP TRIGGER release_after_claim ON {}", f.table))
+        .await
+        .unwrap();
+    f.admin
+        .batch_execute(&format!(
+            "CREATE FUNCTION \"{schema}\".skip_claim() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN RETURN NULL; END $$;
+         CREATE TRIGGER skip_claim BEFORE UPDATE ON {table}
+         FOR EACH ROW WHEN (NEW.lease_worker_id = 17) EXECUTE FUNCTION \"{schema}\".skip_claim();",
+            schema = f.schema,
+            table = f.table,
+        ))
+        .await
+        .unwrap();
+    for available in [None, Some(unix_timestamp_ms(SystemTime::now()) - 1_000)] {
+        let id = f.insert(Echo::NAME, r#"{"name":"due"}"#, available).await;
+        assert!(
+            matches!(ops.claim_published::<Echo>(17, id, expiration()).await,
+            Err(ClaimTaskError::TaskUnavailable { available_from: Some(at) }) if at <= Instant::now())
+        );
+    }
+    let singleton = ops
+        .claim_singleton::<Singleton>(18, expiration())
+        .await
+        .unwrap();
+    ops.finish::<Singleton>(18, singleton.task_id, String::new(), None)
+        .await
+        .unwrap();
+    assert!(
+        matches!(ops.claim_singleton::<Singleton>(17, expiration()).await,
+        Err(ClaimTaskError::TaskUnavailable { available_from: Some(at) }) if at <= Instant::now())
+    );
+    ops.close().await.unwrap();
+    f.cleanup().await;
+}
+
+#[tokio::test]
+async fn availability_hints_do_not_include_query_latency() {
+    let f = Fixture::new().await;
+    let ops = f.connect().await;
+    let at_ms = unix_timestamp_ms(SystemTime::now()) + 60_000;
+    let expected = unix_ms_to_instant(at_ms).unwrap();
+    let id = f
+        .insert(Echo::NAME, r#"{"name":"future"}"#, Some(at_ms))
+        .await;
+    let (mut locker, driver) = f.caller_connection().await;
+    let tx = locker.transaction().await.unwrap();
+    tx.batch_execute(&format!("LOCK TABLE {} IN ACCESS EXCLUSIVE MODE", f.table))
+        .await
+        .unwrap();
+    let attempt = tokio::spawn({
+        let ops = ops.clone();
+        async move { ops.claim_published::<Echo>(17, id, expiration()).await }
+    });
+    f.wait_for_blocked_query().await;
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    tx.commit().await.unwrap();
+    let Err(ClaimTaskError::TaskUnavailable {
+        available_from: Some(actual),
+    }) = attempt.await.unwrap()
+    else {
+        panic!("expected a future availability hint");
+    };
+    assert!(actual.duration_since(expected) < Duration::from_millis(2));
+    assert!(expected.duration_since(actual) < Duration::from_millis(2));
+    drop(locker);
+    driver.await.unwrap().unwrap();
+    ops.close().await.unwrap();
+    f.cleanup().await;
+}
+
 static NEXT_FIXTURE: AtomicU32 = AtomicU32::new(0);
 
 #[test]

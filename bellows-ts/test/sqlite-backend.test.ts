@@ -1,3 +1,4 @@
+import { DatabaseSync } from "node:sqlite";
 import { afterEach, expect, test } from "vitest";
 import { SqliteBackend } from "../src/backends/sqlite.js";
 import {
@@ -5,6 +6,7 @@ import {
   defineSingletonTask,
   TaskFailure,
   TaskSuccess,
+  TaskUnavailableError,
   WorkerDispatcher,
   type WorkerFactory,
 } from "../src/index.js";
@@ -28,6 +30,52 @@ const reschedulingPublishedTask = definePublishTask<void, number>(
 const scheduledSingletonTask = defineSingletonTask("scheduled_singleton");
 
 const resources: Array<{ close: () => Promise<void> | void }> = [];
+
+test("failed claim follow-up never reports an existing due row missing", async () => {
+  const database = track(new TestSqliteDatabase());
+  const backend = track(await SqliteBackend.connect(database.url));
+  await backend.initialize();
+  const admin = new DatabaseSync(database.filePath);
+  try {
+    admin.exec(`CREATE TRIGGER skip_claim BEFORE UPDATE ON bellows_tasks
+      WHEN NEW.lease_worker_id = 17 BEGIN SELECT RAISE(IGNORE); END;`);
+    for (const available of [null, Date.now() - 1_000]) {
+      const task =
+        available === null
+          ? await backend.publish(ackTask, undefined)
+          : await backend.publishFuture(ackTask, undefined, available);
+      try {
+        await backend.claimPublished(
+          ackTask,
+          17,
+          task.taskId,
+          Date.now() + 60_000,
+        );
+        expect.unreachable("claim should have been suppressed");
+      } catch (error) {
+        expect(error).toBeInstanceOf(TaskUnavailableError);
+        expect(
+          (error as TaskUnavailableError).availableFromMs,
+        ).toBeLessThanOrEqual(Date.now());
+        if (available !== null)
+          expect((error as TaskUnavailableError).availableFromMs).toBe(
+            available,
+          );
+      }
+    }
+    const singleton = await backend.claimSingleton(
+      singletonTask,
+      18,
+      Date.now() + 60_000,
+    );
+    await backend.finish(singletonTask, 18, singleton.taskId, undefined, null);
+    await expect(
+      backend.claimSingleton(singletonTask, 17, Date.now() + 60_000),
+    ).rejects.toBeInstanceOf(TaskUnavailableError);
+  } finally {
+    admin.close();
+  }
+});
 
 afterEach(async () => {
   for (const resource of resources.splice(0)) {

@@ -15,6 +15,12 @@ import {
 const LEASE_DURATION_MS = 20_000;
 const LEASE_RENEWAL_THRESHOLD_MS = 10_000;
 
+/** A host scheduling instruction, not a business success status. */
+export type TaskAttemptOutcome =
+  | { readonly type: "done" }
+  | { readonly type: "retryAt"; readonly availableFromMs: number }
+  | { readonly type: "retry" };
+
 export interface RuntimeUpdate {
   readonly nextAvailableFromUpdate: {
     readonly availableFromMs: number | null;
@@ -41,15 +47,15 @@ export class WorkerRuntime<TTask extends TaskDefinition> {
 
   async runAndWait(
     dispatchToken: PublishDispatchToken | undefined,
-  ): Promise<void> {
-    await this.runInternal(dispatchToken).finally(() => {
+  ): Promise<TaskAttemptOutcome> {
+    return this.runInternal(dispatchToken).finally(() => {
       this.onExit();
     });
   }
 
   private async runInternal(
     dispatchToken: PublishDispatchToken | undefined,
-  ): Promise<void> {
+  ): Promise<TaskAttemptOutcome> {
     let taskId: number;
     let taskPayload: TaskPayload<TTask>;
     let leaseExpirationMs = Date.now() + LEASE_DURATION_MS;
@@ -57,7 +63,7 @@ export class WorkerRuntime<TTask extends TaskDefinition> {
     try {
       if (this.factory.task.kind === "publish") {
         if (dispatchToken === undefined) {
-          return;
+          return { type: "retry" };
         }
 
         const claimed =
@@ -93,7 +99,7 @@ export class WorkerRuntime<TTask extends TaskDefinition> {
           nextAvailableFromUpdate: { availableFromMs: error.expirationMs },
           claimedTask: false,
         });
-        return;
+        return { type: "retryAt", availableFromMs: error.expirationMs };
       }
 
       if (error instanceof TaskUnavailableError) {
@@ -101,14 +107,18 @@ export class WorkerRuntime<TTask extends TaskDefinition> {
           nextAvailableFromUpdate: { availableFromMs: error.availableFromMs },
           claimedTask: false,
         });
-        return;
+        return error.availableFromMs === null
+          ? { type: "retry" }
+          : { type: "retryAt", availableFromMs: error.availableFromMs };
       }
 
       if (error instanceof TaskNotFoundError) {
-        return;
+        return {
+          type: this.factory.task.kind === "publish" ? "done" : "retry",
+        };
       }
 
-      return;
+      return { type: "retry" };
     }
 
     this.onUpdate({ nextAvailableFromUpdate: null, claimedTask: true });
@@ -125,26 +135,30 @@ export class WorkerRuntime<TTask extends TaskDefinition> {
     });
 
     if (workerResult === null) {
-      return;
+      return { type: "retry" };
     }
 
     if (workerResult instanceof TaskFailure) {
+      let outcome: TaskAttemptOutcome;
       try {
         await this.backend.fail(
           this.workerId,
           taskId,
           workerResult.availableFromMs,
         );
-      } catch (error) {
-        if (!(error instanceof LeaseLostError)) {
-          // Ignore backend fail errors here to match the Rust runtime's exit behavior.
-        }
+        outcome = {
+          type: "retryAt",
+          availableFromMs: workerResult.availableFromMs ?? Date.now(),
+        };
+      } catch {
+        outcome = { type: "retry" };
       }
 
       this.onUpdate({ nextAvailableFromUpdate: null, claimedTask: false });
-      return;
+      return outcome;
     }
 
+    let outcome: TaskAttemptOutcome;
     try {
       await this.backend.finish(
         this.factory.task,
@@ -153,13 +167,20 @@ export class WorkerRuntime<TTask extends TaskDefinition> {
         workerResult.callbackPayload,
         workerResult.availableFromMs,
       );
-    } catch (error) {
-      if (!(error instanceof LeaseLostError)) {
-        // Ignore backend finish errors here to match the Rust runtime's exit behavior.
-      }
+      outcome =
+        workerResult.availableFromMs !== null ||
+        this.factory.task.kind === "singleton"
+          ? {
+              type: "retryAt",
+              availableFromMs: workerResult.availableFromMs ?? Date.now(),
+            }
+          : { type: "done" };
+    } catch {
+      outcome = { type: "retry" };
     }
 
     this.onUpdate({ nextAvailableFromUpdate: null, claimedTask: false });
+    return outcome;
   }
 
   private async waitForWorker(
@@ -211,12 +232,17 @@ export class WorkerRuntime<TTask extends TaskDefinition> {
   }
 }
 
+/**
+ * Claims and executes once, awaiting finalization before returning a scheduling instruction.
+ * Backend/ownership uncertainty returns `retry`; no retries happen internally.
+ * Lease loss ends the runtime, but does not cancel arbitrary business promises.
+ */
 export async function runTaskOnce<TTask extends TaskDefinition>(
   backend: TaskExecutionBackend,
   factory: WorkerFactory<TTask>,
   workerId: number,
   dispatchToken: PublishDispatchToken,
-): Promise<void> {
+): Promise<TaskAttemptOutcome> {
   const runtime = new WorkerRuntime(
     backend,
     factory,
@@ -225,7 +251,7 @@ export async function runTaskOnce<TTask extends TaskDefinition>(
     () => {},
   );
 
-  await runtime.runAndWait(dispatchToken);
+  return runtime.runAndWait(dispatchToken);
 }
 
 async function delay(durationMs: number): Promise<void> {

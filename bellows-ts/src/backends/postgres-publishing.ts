@@ -34,7 +34,7 @@ export { PostgresPublishedTaskIdError } from "./postgres-operations.js";
  * On Workers, use a request-scoped Hyperdrive connection. For `connect()`, await `close()` in
  * `finally` before returning the response; caller-owned executors require caller cleanup instead.
  * Never retain connections across requests.
- * For immediate publication followed by dispatch, `createPostgresPublisher` from
+ * For immediate or future publication followed by dispatch, `createPostgresPublisher` from
  * `cloudflare/postgres` owns that lifecycle and returns checked string receipts.
  */
 export class PostgresPublishingBackend implements TaskPublishingBackend {

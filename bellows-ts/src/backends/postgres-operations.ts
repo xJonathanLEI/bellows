@@ -389,7 +389,11 @@ WHERE task_name = $1
         throw new TaskUnavailableError(Number(current.available_from_unix_ms));
       }
 
-      throw new TaskNotFoundError();
+      throw new TaskUnavailableError(
+        current.available_from_unix_ms === null
+          ? Date.now()
+          : Number(current.available_from_unix_ms),
+      );
     }
 
     return {
@@ -606,7 +610,11 @@ WHERE task_id = $1
       return new TaskUnavailableError(Number(current.available_from_unix_ms));
     }
 
-    return new TaskNotFoundError();
+    return new TaskUnavailableError(
+      current.available_from_unix_ms === null
+        ? Date.now()
+        : Number(current.available_from_unix_ms),
+    );
   }
 }
 

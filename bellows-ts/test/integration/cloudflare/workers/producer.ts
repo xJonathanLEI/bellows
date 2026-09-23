@@ -5,7 +5,7 @@ import {
   type PostgresPublisherReceipt,
 } from "../../../../src/cloudflare/postgres.js";
 import { RetainedTaskDispatcher } from "../../../../src/cloudflare.js";
-import { fullNameTask, greetingTask } from "../task.js";
+import { fullNameTask, greetingTask, schedulingTask } from "../task.js";
 
 interface ProducerEnv {
   HYPERDRIVE: Hyperdrive;
@@ -23,6 +23,10 @@ const greetingPublisher = createPostgresPublisher((env: ProducerEnv) => ({
   ...publisherConfig(env),
   task: greetingTask,
 }));
+const schedulingPublisher = createPostgresPublisher((env: ProducerEnv) => ({
+  ...publisherConfig(env),
+  task: schedulingTask,
+}));
 const fullNamePublisher = createPostgresPublisher((env: ProducerEnv) => ({
   ...publisherConfig(env),
   task: fullNameTask,
@@ -36,8 +40,9 @@ function validName(value: unknown): value is string {
 
 export default {
   async fetch(request, env): Promise<Response> {
-    const path = new URL(request.url).pathname;
-    if (path !== "/tasks" && path !== "/full-names") {
+    const url = new URL(request.url);
+    const path = url.pathname;
+    if (path !== "/tasks" && path !== "/full-names" && path !== "/scheduled") {
       return Response.json({ error: "not-found" }, { status: 404 });
     }
     if (request.method !== "POST") {
@@ -66,7 +71,47 @@ export default {
     }
     try {
       let receipt: PostgresPublisherReceipt;
-      if (path === "/tasks") {
+      const at = url.searchParams.get("availableFromMs");
+      const availableFromMs = at === null ? undefined : Number(at);
+      if (
+        (at !== null && (at.length === 0 || /[^0-9]/.test(at))) ||
+        (availableFromMs !== undefined &&
+          (!Number.isSafeInteger(availableFromMs) ||
+            availableFromMs < 0 ||
+            availableFromMs > 8_640_000_000_000_000))
+      ) {
+        return Response.json(
+          { error: "invalid availability" },
+          { status: 400 },
+        );
+      }
+      if (path === "/scheduled") {
+        if (
+          body === null ||
+          typeof body !== "object" ||
+          !("name" in body) ||
+          !validName(body.name) ||
+          !("mode" in body) ||
+          (body.mode !== "failure" &&
+            body.mode !== "success" &&
+            body.mode !== "immediate") ||
+          !("availableFromMs" in body) ||
+          typeof body.availableFromMs !== "number" ||
+          !Number.isSafeInteger(body.availableFromMs) ||
+          body.availableFromMs < 0 ||
+          body.availableFromMs > 8_640_000_000_000_000
+        ) {
+          return Response.json(
+            { error: "invalid scheduling payload" },
+            { status: 400 },
+          );
+        }
+        receipt = await schedulingPublisher.publish(env, {
+          name: body.name,
+          mode: body.mode,
+          availableFromMs: body.availableFromMs,
+        });
+      } else if (path === "/tasks") {
         if (
           body === null ||
           typeof body !== "object" ||
@@ -82,7 +127,15 @@ export default {
             { status: 400 },
           );
         }
-        receipt = await greetingPublisher.publish(env, { name: body.name });
+        const payload = { name: body.name };
+        receipt =
+          availableFromMs === undefined
+            ? await greetingPublisher.publish(env, payload)
+            : await greetingPublisher.publishFuture(
+                env,
+                payload,
+                availableFromMs,
+              );
       } else {
         if (
           body === null ||
@@ -101,10 +154,18 @@ export default {
             { status: 400 },
           );
         }
-        receipt = await fullNamePublisher.publish(env, {
+        const payload = {
           firstName: body.firstName,
           lastName: body.lastName,
-        });
+        };
+        receipt =
+          availableFromMs === undefined
+            ? await fullNamePublisher.publish(env, payload)
+            : await fullNamePublisher.publishFuture(
+                env,
+                payload,
+                availableFromMs,
+              );
       }
       // Acceptance is not completion; the processor may still be running.
       return new Response(receipt.taskId, {
@@ -134,14 +195,36 @@ export default {
 } satisfies ExportedHandler<ProducerEnv>;
 
 export class TaskDispatcher extends DurableObject<ProducerEnv> {
-  private readonly dispatcher: RetainedTaskDispatcher;
+  private dispatcher: RetainedTaskDispatcher;
 
   constructor(ctx: DurableObjectState, env: ProducerEnv) {
     super(ctx, env);
     this.dispatcher = new RetainedTaskDispatcher(ctx.storage, env.PROCESSOR);
   }
 
-  fetch(request: Request): Promise<Response> {
+  async fetch(request: Request): Promise<Response> {
+    // Fixture-only inspection/reconstruction; these routes are not exposed by the producer HTTP API.
+    switch (new URL(request.url).pathname) {
+      case "/__test/clear":
+        await this.ctx.storage.deleteAll();
+        await this.ctx.storage.deleteAlarm();
+        return new Response(null);
+      case "/__test/reconstruct":
+        this.dispatcher = new RetainedTaskDispatcher(
+          this.ctx.storage,
+          this.env.PROCESSOR,
+        );
+        return new Response(null);
+      case "/__test/state":
+        return Response.json({
+          metadata: await this.ctx.storage.get("scheduler"),
+          tasks: Object.fromEntries(
+            await this.ctx.storage.list({ prefix: "task:" }),
+          ),
+          alarm: await this.ctx.storage.getAlarm(),
+          now: Date.now(),
+        });
+    }
     return this.dispatcher.fetch(request);
   }
 

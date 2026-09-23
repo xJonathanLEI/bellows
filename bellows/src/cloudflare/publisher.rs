@@ -3,6 +3,7 @@ use std::{error::Error, fmt};
 use super::{BoxDispatchError, DurableObjectNamespaceLike, dispatch_task};
 use crate::{
     PublishActivationStrategy, PublishDispatchToken, TaskDefinition, TaskPublishingBackend,
+    time::Instant,
 };
 
 /// An exact published ID. Success confirms dispatch acceptance, not processing success.
@@ -105,6 +106,7 @@ pub(super) trait Publisher {
 pub(super) async fn publish<P: Publisher>(
     publisher: &P,
     payload: <<P::Task as TaskDefinition>::Trigger as PublishActivationStrategy>::Payload,
+    available_from: Option<Instant>,
 ) -> Result<PostgresPublisherReceipt, PostgresPublisherError> {
     use PostgresPublisherStage::*;
 
@@ -115,7 +117,15 @@ pub(super) async fn publish<P: Publisher>(
         .acquire(scope.settings)
         .await
         .map_err(|cause| PostgresPublisherError::new(Acquisition, cause, None))?;
-    let publication = match backend.publish::<P::Task>(payload).await {
+    let published = match available_from {
+        Some(available_from) => {
+            backend
+                .publish_future::<P::Task>(payload, available_from)
+                .await
+        }
+        None => backend.publish::<P::Task>(payload).await,
+    };
+    let publication = match published {
         Ok(published) => {
             let receipt = PostgresPublisherReceipt {
                 task_id: published.task_id.to_string(),

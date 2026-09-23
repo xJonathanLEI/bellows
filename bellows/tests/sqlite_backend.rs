@@ -21,6 +21,53 @@ use tokio::sync::{
 
 struct EchoTaskSpec;
 
+#[tokio::test]
+async fn failed_claim_follow_up_never_reports_an_existing_due_row_missing() {
+    use bellows::{TaskExecutionBackend, backends::ClaimTaskError};
+    use sqlx::{Connection, Executor, SqliteConnection};
+
+    let database = TestDatabase::new();
+    let backend = SqliteBackend::connect(database.url()).await.unwrap();
+    backend.initialize().await.unwrap();
+    let mut admin = SqliteConnection::connect(database.url()).await.unwrap();
+    admin
+        .execute(
+            "CREATE TRIGGER skip_claim BEFORE UPDATE ON bellows_tasks
+         WHEN NEW.lease_worker_id = 17 BEGIN SELECT RAISE(IGNORE); END;",
+        )
+        .await
+        .unwrap();
+    for available in [None, Some(Instant::now() - Duration::from_secs(1))] {
+        let task = match available {
+            None => backend.publish::<AckTaskSpec>(()).await.unwrap(),
+            Some(at) => backend.publish_future::<AckTaskSpec>((), at).await.unwrap(),
+        };
+        let result = backend
+            .claim_published::<AckTaskSpec>(
+                17,
+                task.task_id,
+                Instant::now() + Duration::from_secs(60),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(ClaimTaskError::TaskUnavailable { available_from: Some(at) }) if at <= Instant::now())
+        );
+    }
+    let singleton = backend
+        .claim_singleton::<SingletonTaskSpec>(18, Instant::now() + Duration::from_secs(60))
+        .await
+        .unwrap();
+    backend
+        .finish::<SingletonTaskSpec>(18, singleton.task_id, (), None)
+        .await
+        .unwrap();
+    assert!(matches!(backend.claim_singleton::<SingletonTaskSpec>(
+        17, Instant::now() + Duration::from_secs(60),
+    ).await, Err(ClaimTaskError::TaskUnavailable { available_from: Some(at) }) if at <= Instant::now()));
+    admin.close().await.unwrap();
+    drop(backend);
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct EchoTaskPayload {
     pub name: String,

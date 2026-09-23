@@ -9,8 +9,8 @@ use std::{
 };
 
 use bellows::cloudflare::{
-    AlarmStorage, BoxDispatchError, DurableObjectNamespaceLike, ProcessorFetcher,
-    RetainedTaskDispatcher, TextBody, dispatch_task,
+    BoxDispatchError, DispatcherState, DispatcherStorage, DurableObjectNamespaceLike,
+    ProcessorFetcher, RetainedTaskDispatcher, ScheduleUpdate, TextBody, dispatch_task,
 };
 use http::{Request, Response};
 use serde_json::{Value, json};
@@ -23,19 +23,167 @@ fn now() -> i64 {
     NOW
 }
 
+#[tokio::test]
+async fn healthy_dispatch_and_unsaved_completion_do_not_write_or_scan_schedules() {
+    let storage = FakeAlarmStorage::default();
+    storage.0.lock().unwrap().alarm = Some(NOW + 10_000);
+    let processor = DeferredProcessor::default();
+    let dispatcher = RetainedTaskDispatcher::with_clock(storage.clone(), processor.clone(), now);
+    dispatcher.fetch(dispatch_request("id")).await;
+    dispatcher.fetch(named_request("ignored", "id")).await;
+    wait_for(|| processor.count() == 1).await;
+    assert_eq!(storage.0.lock().unwrap().task_reads, 0);
+    reply(&processor, 0, json!({"type": "done"})).await;
+    let state = storage.0.lock().unwrap();
+    assert_eq!(state.task_reads, 1);
+    assert_eq!(state.transactions, 0);
+    assert!(state.scheduled.is_empty());
+    assert!(state.durable.tasks.is_empty());
+    assert!(state.durable.metadata.is_none());
+}
+
+#[tokio::test]
+async fn unsaved_uncertainty_retries_in_memory_until_a_valid_hint_starts_persistence() {
+    let storage = FakeAlarmStorage::default();
+    let processor = DeferredProcessor::default();
+    let dispatcher = RetainedTaskDispatcher::with_clock(storage.clone(), processor.clone(), now);
+    dispatcher.fetch(dispatch_request("id")).await;
+    wait_for(|| processor.count() == 1).await;
+    processor.complete(0, Err("network".into()));
+    wait_for(|| storage.0.lock().unwrap().task_reads == 1).await;
+    assert_eq!(storage.0.lock().unwrap().transactions, 0);
+    assert_eq!(storage.0.lock().unwrap().scheduled.len(), 1);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while processor.count() != 2 {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
+    reply(&processor, 1, json!({"type": "retryAt", "atMs": NOW - 1})).await;
+    assert_eq!(
+        stored_task(&storage, "id").unwrap().infrastructure_failures,
+        0
+    );
+    dispatcher.alarm().await.unwrap();
+    finish(&processor, 2).await;
+}
+
+#[tokio::test]
+async fn explicit_redispatch_reconciles_saved_schedules_only_after_its_response() {
+    let storage = FakeAlarmStorage::default();
+    seed_schedule(&storage, "old");
+    storage.0.lock().unwrap().alarm = Some(NOW - 1);
+    let before = stored_task(&storage, "id");
+    let processor = DeferredProcessor::default();
+    let dispatcher = RetainedTaskDispatcher::with_clock(storage.clone(), processor.clone(), now);
+    dispatcher.fetch(named_request("corrected", "id")).await;
+    dispatcher.fetch(named_request("ignored", "id")).await;
+    assert_eq!(storage.0.lock().unwrap().transactions, 0);
+    assert_eq!(stored_task(&storage, "id"), before);
+    assert!(storage.0.lock().unwrap().scheduled.is_empty());
+    dispatcher.alarm().await.unwrap();
+    wait_for(|| processor.count() == 1).await;
+    assert!(stored_task(&storage, "id").is_some());
+    reply(
+        &processor,
+        0,
+        json!({"type": "retryAt", "atMs": NOW + 10_000}),
+    )
+    .await;
+    assert_eq!(stored_task(&storage, "id").unwrap().task_name, "corrected");
+    dispatcher.fetch(dispatch_request("id")).await;
+    reply(&processor, 1, json!({"type": "done"})).await;
+    assert!(stored_task(&storage, "id").is_none());
+}
+
+#[tokio::test]
+async fn first_delayed_hint_preserves_the_already_armed_warming_deadline() {
+    let storage = FakeAlarmStorage::default();
+    let processor = DeferredProcessor::default();
+    let dispatcher =
+        RetainedTaskDispatcher::with_clock(storage.clone(), processor.clone(), scheduler_now);
+    dispatcher.fetch(dispatch_request("id")).await;
+    let heartbeat = storage.0.lock().unwrap().alarm;
+    advance(10_000);
+    reply(
+        &processor,
+        0,
+        json!({"type": "retryAt", "atMs": scheduler_now() + 60_000}),
+    )
+    .await;
+    assert_eq!(storage.0.lock().unwrap().alarm, heartbeat);
+}
+
+#[tokio::test]
+async fn dispatch_launches_through_blocked_outcome_bookkeeping_and_preserves_its_earlier_alarm() {
+    let storage = FakeAlarmStorage::default();
+    let processor = DeferredProcessor::default();
+    let dispatcher = Arc::new(RetainedTaskDispatcher::with_clock(
+        storage.clone(),
+        processor.clone(),
+        now,
+    ));
+    dispatcher.fetch(dispatch_request("id")).await;
+    let (release, gate) = oneshot::channel();
+    storage.0.lock().unwrap().get_gate = Some(gate);
+    reply(
+        &processor,
+        0,
+        json!({"type": "retryAt", "atMs": NOW + 1_000}),
+    )
+    .await;
+    wait_for(|| storage.0.lock().unwrap().get_gate.is_none()).await;
+    let dispatch = tokio::spawn({
+        let dispatcher = dispatcher.clone();
+        async move { dispatcher.fetch(dispatch_request("other")).await }
+    });
+    wait_for(|| processor.count() == 2).await;
+    assert!(storage.0.lock().unwrap().durable.tasks.is_empty());
+    release.send(()).unwrap();
+    assert_eq!(dispatch.await.unwrap().status(), 200);
+    assert_eq!(storage.0.lock().unwrap().alarm, Some(NOW + 1_000));
+    assert!(stored_task(&storage, "other").is_none());
+    finish(&processor, 1).await;
+}
+
+fn seed_schedule(storage: &FakeAlarmStorage, name: &str) {
+    use bellows::cloudflare::{DispatcherTask, SchedulerMetadata, TaskSchedule};
+    let mut state = storage.0.lock().unwrap();
+    state.durable.metadata = Some(SchedulerMetadata {
+        next_heartbeat_at_ms: scheduler_now() + 30_000,
+        next_attempt_id: 0,
+    });
+    state.durable.tasks.insert(
+        "id".into(),
+        DispatcherTask {
+            task_id: "id".into(),
+            task_name: name.into(),
+            next_attempt_at_ms: scheduler_now(),
+            infrastructure_failures: 0,
+            state: TaskSchedule::Pending,
+        },
+    );
+}
+
 #[derive(Default)]
 struct AlarmState {
+    durable: DispatcherState,
+    transactions: usize,
+    task_reads: usize,
     alarm: Option<i64>,
     scheduled: Vec<i64>,
     get_error: Option<&'static str>,
     set_error: Option<&'static str>,
+    set_failures: usize,
+    uncertain_commit: bool,
     get_gate: Option<oneshot::Receiver<()>>,
 }
 
 #[derive(Clone, Default)]
 struct FakeAlarmStorage(Arc<Mutex<AlarmState>>);
 
-impl AlarmStorage for FakeAlarmStorage {
+impl DispatcherStorage for FakeAlarmStorage {
     async fn get_alarm(&self) -> IoResult<Option<i64>> {
         let gate = self.0.lock().unwrap().get_gate.take();
         if let Some(gate) = gate {
@@ -48,14 +196,53 @@ impl AlarmStorage for FakeAlarmStorage {
         Ok(state.alarm)
     }
 
-    async fn set_alarm(&self, alarm_time: i64) -> IoResult<()> {
+    async fn set_alarm(&self, at_ms: i64) -> IoResult<()> {
         let mut state = self.0.lock().unwrap();
         if let Some(error) = state.set_error {
             return Err(error.into());
         }
-        state.alarm = Some(alarm_time);
-        state.scheduled.push(alarm_time);
+        state.alarm = Some(at_ms);
+        state.scheduled.push(at_ms);
         Ok(())
+    }
+
+    async fn contains_task(&self, id: &str) -> IoResult<bool> {
+        let mut state = self.0.lock().unwrap();
+        state.task_reads += 1;
+        Ok(state.durable.tasks.contains_key(id))
+    }
+
+    async fn transaction<T>(&self, update: ScheduleUpdate<T>) -> IoResult<T>
+    where
+        T: Send + 'static,
+    {
+        let gate = self.0.lock().unwrap().get_gate.take();
+        if let Some(gate) = gate {
+            gate.await?;
+        }
+        let mut state = self.0.lock().unwrap();
+        state.transactions += 1;
+        if let Some(error) = state.get_error {
+            return Err(error.into());
+        }
+        let mut durable = state.durable.clone();
+        durable.alarm = state.alarm;
+        let result = update(&mut durable)?;
+        if state.set_failures > 0 {
+            state.set_failures -= 1;
+            return Err("alarm storage failed".into());
+        }
+        if let Some(error) = state.set_error {
+            return Err(error.into());
+        }
+        state.alarm = Some(durable.alarm_at_ms());
+        state.scheduled.push(durable.alarm_at_ms());
+        state.durable = durable;
+        if state.uncertain_commit {
+            state.uncertain_commit = false;
+            return Err("commit acknowledgement lost".into());
+        }
+        Ok(result)
     }
 }
 
@@ -204,14 +391,43 @@ async fn finish(processor: &DeferredProcessor, index: usize) {
     wait_for(|| processor.count() > index).await;
     let (body, control) = controlled_body();
     processor.complete(index, Ok(response(200, body)));
-    control.sender.send(Ok("finished".into())).unwrap();
+    let id = serde_json::from_str::<Value>(processor.0.lock().unwrap()[index].request.body())
+        .unwrap()["taskId"]
+        .clone();
+    control
+        .sender
+        .send(Ok(
+            json!({"taskId": id, "nextAction": {"type": "done"}}).to_string()
+        ))
+        .unwrap();
     wait_for(|| control.finished.load(Ordering::SeqCst)).await;
 }
 
-// A thread-local subscriber is sufficient: these deterministic tests use Tokio's current-thread
-// executor. It records actual library diagnostics, not an injected replacement logger.
+// One subscriber avoids global callsite-cache races between concurrent test registrations.
+// Each current-thread Tokio test still captures only its own actual library diagnostics.
 #[derive(Clone, Default)]
 struct Logs(Arc<Mutex<Vec<HashMap<String, String>>>>);
+
+thread_local! {
+    static ACTIVE_LOGS: std::cell::RefCell<Option<Logs>> = const { std::cell::RefCell::new(None) };
+}
+
+struct LogCapture;
+
+impl Logs {
+    fn capture(&self) -> LogCapture {
+        static SUBSCRIBER: std::sync::Once = std::sync::Once::new();
+        SUBSCRIBER.call_once(|| tracing::subscriber::set_global_default(LogCapture).unwrap());
+        ACTIVE_LOGS.set(Some(self.clone()));
+        LogCapture
+    }
+}
+
+impl Drop for LogCapture {
+    fn drop(&mut self) {
+        ACTIVE_LOGS.set(None);
+    }
+}
 
 struct Fields(HashMap<String, String>);
 
@@ -224,7 +440,11 @@ impl tracing::field::Visit for Fields {
     }
 }
 
-impl tracing::Subscriber for Logs {
+impl tracing::Subscriber for LogCapture {
+    fn max_level_hint(&self) -> Option<tracing::metadata::LevelFilter> {
+        Some(tracing::metadata::LevelFilter::ERROR)
+    }
+
     fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
         *metadata.level() == tracing::Level::ERROR
     }
@@ -238,7 +458,11 @@ impl tracing::Subscriber for Logs {
     fn event(&self, event: &tracing::Event<'_>) {
         let mut fields = Fields(HashMap::new());
         event.record(&mut fields);
-        self.0.lock().unwrap().push(fields.0);
+        ACTIVE_LOGS.with_borrow(|logs| {
+            if let Some(logs) = logs {
+                logs.0.lock().unwrap().push(fields.0);
+            }
+        });
     }
 }
 
@@ -331,7 +555,12 @@ async fn retained_dispatch_accepts_early_and_suppresses_duplicates_through_body_
         duplicate,
     );
     assert_eq!(processor.count(), 1);
-    control.sender.send(Ok("finished".into())).unwrap();
+    control
+        .sender
+        .send(Ok(
+            json!({"taskId": "task-1", "nextAction": {"type": "done"}}).to_string(),
+        ))
+        .unwrap();
     wait_for(|| control.finished.load(Ordering::SeqCst)).await;
 
     // Successful responses release IDs too: a later dispatch is a new attempt.
@@ -396,14 +625,22 @@ async fn dispatch_and_alarm_schedule_the_30_second_heartbeat_even_when_idle() {
     );
     finish(&processor, 0).await;
     dispatcher.alarm().await.unwrap();
-    assert_eq!(storage.0.lock().unwrap().scheduled, [NOW + 30_000; 3]);
+    assert!(
+        storage
+            .0
+            .lock()
+            .unwrap()
+            .scheduled
+            .iter()
+            .all(|time| *time == NOW + 30_000)
+    );
 }
 
 #[tokio::test]
-async fn processor_http_failures_are_consumed_observed_and_release_the_id() {
+async fn processor_http_failures_are_consumed_and_permit_explicit_redispatch() {
     for (status, message) in [(500, "failed"), (404, r#"{"error":"unknown task name"}"#)] {
         let logs = Logs::default();
-        let _subscriber = tracing::subscriber::set_default(logs.clone());
+        let _subscriber = logs.capture();
         let processor = DeferredProcessor::default();
         let dispatcher =
             RetainedTaskDispatcher::with_clock(FakeAlarmStorage::default(), processor.clone(), now);
@@ -654,7 +891,7 @@ async fn exact_names_round_trip_both_hops_without_forwarding_payloads() {
 }
 
 #[tokio::test]
-async fn heartbeat_preserves_only_future_alarms_no_later_than_the_next_heartbeat() {
+async fn dispatch_only_repairs_a_missing_or_too_late_heartbeat_alarm() {
     for alarm in [
         None,
         Some(NOW - 1),
@@ -668,10 +905,10 @@ async fn heartbeat_preserves_only_future_alarms_no_later_than_the_next_heartbeat
         let processor = DeferredProcessor::default();
         let dispatcher =
             RetainedTaskDispatcher::with_clock(storage.clone(), processor.clone(), now);
-        let expected = if alarm.is_some_and(|time| time > NOW && time <= NOW + 30_000) {
-            vec![]
-        } else {
+        let expected = if alarm.is_none_or(|at| at > NOW + 30_000) {
             vec![NOW + 30_000]
+        } else {
+            vec![]
         };
         for duplicate in [false, true] {
             {
@@ -692,10 +929,10 @@ async fn heartbeat_preserves_only_future_alarms_no_later_than_the_next_heartbeat
 }
 
 #[tokio::test]
-async fn rejected_processor_fetches_and_body_reads_are_observed_and_release_the_id() {
+async fn rejected_processor_fetches_and_body_reads_permit_explicit_redispatch() {
     for status in [None, Some(200), Some(503)] {
         let logs = Logs::default();
-        let _subscriber = tracing::subscriber::set_default(logs.clone());
+        let _subscriber = logs.capture();
         let processor = DeferredProcessor::default();
         let dispatcher =
             RetainedTaskDispatcher::with_clock(FakeAlarmStorage::default(), processor.clone(), now);
@@ -778,7 +1015,7 @@ async fn diagnostic_truncation_is_unicode_safe_and_never_limits_body_consumption
     let prefix = "task processor returned HTTP 500: ";
     for status in [None, Some(500)] {
         let logs = Logs::default();
-        let _subscriber = tracing::subscriber::set_default(logs.clone());
+        let _subscriber = logs.capture();
         let processor = DeferredProcessor::default();
         let dispatcher =
             RetainedTaskDispatcher::with_clock(FakeAlarmStorage::default(), processor.clone(), now);
@@ -849,13 +1086,13 @@ async fn request_read_errors_and_storage_errors_use_the_existing_error_envelope(
 }
 
 #[tokio::test]
-async fn pending_storage_io_does_not_hold_the_registry_lock_or_delay_processor_progress() {
+async fn launch_precedes_heartbeat_storage_and_never_persists_acceptance() {
     let storage = FakeAlarmStorage::default();
     let (release, gate) = oneshot::channel();
     storage.0.lock().unwrap().get_gate = Some(gate);
     let processor = DeferredProcessor::default();
     let dispatcher = Arc::new(RetainedTaskDispatcher::with_clock(
-        storage,
+        storage.clone(),
         processor.clone(),
         now,
     ));
@@ -863,8 +1100,16 @@ async fn pending_storage_io_does_not_hold_the_registry_lock_or_delay_processor_p
         let dispatcher = dispatcher.clone();
         async move { dispatcher.fetch(dispatch_request("id")).await }
     });
-    wait_for(|| processor.count() == 1).await;
+    wait_for(|| storage.0.lock().unwrap().get_gate.is_none()).await;
     assert!(!acceptance.is_finished());
+    wait_for(|| processor.count() == 1).await;
+    assert_eq!(storage.0.lock().unwrap().transactions, 0);
+    release.send(()).unwrap();
+    assert_json(
+        acceptance.await.unwrap(),
+        200,
+        json!({ "ok": true, "taskId": "id" }),
+    );
     assert_json(
         dispatcher.fetch(dispatch_request("id")).await,
         200,
@@ -877,17 +1122,13 @@ async fn pending_storage_io_does_not_hold_the_registry_lock_or_delay_processor_p
     );
     finish(&processor, 0).await;
     finish(&processor, 1).await;
-    release.send(()).unwrap();
-    assert_json(
-        acceptance.await.unwrap(),
-        200,
-        json!({ "ok": true, "taskId": "id" }),
-    );
+    assert_eq!(storage.0.lock().unwrap().transactions, 0);
+    assert!(storage.0.lock().unwrap().durable.metadata.is_none());
 }
 
 // Native-only coverage of the unwind guard, rather than a claim that wasm traps are recoverable.
 #[tokio::test]
-async fn native_processor_panics_release_the_id_and_are_logged() {
+async fn native_processor_panics_are_logged_and_permit_explicit_redispatch() {
     struct PanickingProcessor;
     impl ProcessorFetcher for PanickingProcessor {
         async fn fetch(&self, _: Request<String>) -> IoResult<Response<TextBody>> {
@@ -895,7 +1136,7 @@ async fn native_processor_panics_release_the_id_and_are_logged() {
         }
     }
     let logs = Logs::default();
-    let _subscriber = tracing::subscriber::set_default(logs.clone());
+    let _subscriber = logs.capture();
     let dispatcher =
         RetainedTaskDispatcher::with_clock(FakeAlarmStorage::default(), PanickingProcessor, now);
     for count in 1..=2 {
@@ -905,9 +1146,483 @@ async fn native_processor_panics_release_the_id_and_are_logged() {
             json!({ "ok": true, "taskId": "id" }),
         );
         wait_for(|| logs.0.lock().unwrap().len() == count).await;
+        tokio::task::yield_now().await;
         assert_eq!(
             logs.0.lock().unwrap()[count - 1]["error"],
             "processor task exited without an observed response"
         );
+    }
+}
+
+#[tokio::test]
+async fn failed_alarm_bookkeeping_rolls_back_launches_and_rearms_from_current_records() {
+    let storage = FakeAlarmStorage::default();
+    let processor = DeferredProcessor::default();
+    let dispatcher =
+        RetainedTaskDispatcher::with_clock(storage.clone(), processor.clone(), scheduler_now);
+    seed_schedule(&storage, "contract");
+    dispatcher.alarm().await.unwrap();
+    reply(
+        &processor,
+        0,
+        json!({"type": "retryAt", "atMs": NOW + 1_000}),
+    )
+    .await;
+    advance(1_000);
+    storage.0.lock().unwrap().set_failures = 1;
+    assert_eq!(
+        dispatcher.alarm().await.unwrap_err().to_string(),
+        "alarm storage failed"
+    );
+    assert_eq!(processor.count(), 1);
+    assert!(matches!(
+        stored_task(&storage, "id").unwrap().state,
+        bellows::cloudflare::TaskSchedule::Pending
+    ));
+    assert_eq!(storage.0.lock().unwrap().alarm, Some(scheduler_now()));
+    dispatcher.alarm().await.unwrap();
+    wait_for(|| processor.count() == 2).await;
+    finish(&processor, 1).await;
+}
+
+#[tokio::test]
+async fn result_persistence_is_awaited_before_retiring_local_tracking() {
+    let storage = FakeAlarmStorage::default();
+    let processor = DeferredProcessor::default();
+    let dispatcher = RetainedTaskDispatcher::with_clock(storage.clone(), processor.clone(), now);
+    seed_schedule(&storage, "contract");
+    dispatcher.alarm().await.unwrap();
+    let (release, gate) = oneshot::channel();
+    storage.0.lock().unwrap().get_gate = Some(gate);
+    reply(&processor, 0, json!({"type": "done"})).await;
+    wait_for(|| storage.0.lock().unwrap().get_gate.is_none()).await;
+    assert!(matches!(
+        stored_task(&storage, "id").unwrap().state,
+        bellows::cloudflare::TaskSchedule::Running { .. }
+    ));
+    assert_eq!(processor.count(), 1);
+    release.send(()).unwrap();
+    wait_for(|| stored_task(&storage, "id").is_none()).await;
+}
+
+#[tokio::test]
+async fn stale_done_retry_and_body_errors_cannot_affect_an_id_accepted_again_after_completion() {
+    for action in ["done", "retryAt", "body-error"] {
+        let storage = FakeAlarmStorage::default();
+        let processor = DeferredProcessor::default();
+        let original = RetainedTaskDispatcher::with_clock(storage.clone(), processor.clone(), now);
+        seed_schedule(&storage, "contract");
+        original.alarm().await.unwrap();
+        wait_for(|| processor.count() == 1).await;
+        let (body, control) = controlled_body();
+        processor.complete(0, Ok(response(200, body)));
+        wait_for(|| control.started.load(Ordering::SeqCst)).await;
+        let successor = RetainedTaskDispatcher::with_clock(storage.clone(), processor.clone(), now);
+        successor.fetch(dispatch_request("id")).await;
+        reply(&processor, 1, json!({"type": "done"})).await;
+        assert!(stored_task(&storage, "id").is_none());
+        successor.fetch(named_request("new", "id")).await;
+        let current = stored_task(&storage, "id");
+        control
+            .sender
+            .send(if action == "body-error" {
+                Err("late body error".into())
+            } else {
+                Ok(json!({"taskId": "id", "nextAction": if action == "done" {
+                    json!({"type": "done"})
+                } else {
+                    json!({"type": "retryAt", "atMs": 0})
+                }})
+                .to_string())
+            })
+            .unwrap();
+        wait_for(|| control.finished.load(Ordering::SeqCst)).await;
+        original.alarm().await.unwrap();
+        assert_eq!(stored_task(&storage, "id"), current);
+        assert_json(
+            successor.fetch(named_request("wrong", "id")).await,
+            200,
+            json!({"duplicate": true, "ok": true, "taskId": "id"}),
+        );
+        wait_for(|| processor.count() == 3).await;
+        finish(&processor, 2).await;
+    }
+}
+
+#[tokio::test]
+async fn later_results_and_duplicates_cannot_postpone_earlier_deadlines() {
+    let storage = FakeAlarmStorage::default();
+    let processor = DeferredProcessor::default();
+    let dispatcher = RetainedTaskDispatcher::with_clock(storage.clone(), processor.clone(), now);
+    for id in ["early", "late", "active"] {
+        dispatcher.fetch(dispatch_request(id)).await;
+    }
+    reply(
+        &processor,
+        0,
+        json!({"type": "retryAt", "atMs": NOW + 1_000}),
+    )
+    .await;
+    reply(
+        &processor,
+        1,
+        json!({"type": "retryAt", "atMs": NOW + 20_000}),
+    )
+    .await;
+    dispatcher.fetch(dispatch_request("active")).await;
+    dispatcher.alarm().await.unwrap();
+    assert_eq!(storage.0.lock().unwrap().alarm, Some(NOW + 1_000));
+    assert_eq!(processor.count(), 3);
+}
+
+thread_local! {
+    static SCHEDULER_NOW: std::cell::Cell<i64> = const { std::cell::Cell::new(NOW) };
+}
+
+fn scheduler_now() -> i64 {
+    SCHEDULER_NOW.get()
+}
+
+#[tokio::test]
+async fn uncertain_scheduling_commit_retains_a_recoverable_schedule() {
+    let storage = FakeAlarmStorage::default();
+    let processor = DeferredProcessor::default();
+    let dispatcher =
+        RetainedTaskDispatcher::with_clock(storage.clone(), processor.clone(), scheduler_now);
+    assert_eq!(dispatcher.fetch(dispatch_request("id")).await.status(), 200);
+    assert!(stored_task(&storage, "id").is_none());
+    storage.0.lock().unwrap().uncertain_commit = true;
+    reply(
+        &processor,
+        0,
+        json!({"type": "retryAt", "atMs": NOW + 1_000}),
+    )
+    .await;
+    assert!(matches!(
+        stored_task(&storage, "id").unwrap().state,
+        bellows::cloudflare::TaskSchedule::Pending
+    ));
+    let dispatcher =
+        RetainedTaskDispatcher::with_clock(storage.clone(), processor.clone(), scheduler_now);
+    advance(1_000);
+    dispatcher.alarm().await.unwrap();
+    wait_for(|| processor.count() == 2).await;
+    finish(&processor, 1).await;
+}
+
+fn advance(ms: i64) {
+    SCHEDULER_NOW.set(scheduler_now() + ms);
+}
+
+fn stored_task(
+    storage: &FakeAlarmStorage,
+    id: &str,
+) -> Option<bellows::cloudflare::DispatcherTask> {
+    storage.0.lock().unwrap().durable.tasks.get(id).cloned()
+}
+
+async fn reply(processor: &DeferredProcessor, index: usize, action: Value) {
+    wait_for(|| processor.count() > index).await;
+    let id = serde_json::from_str::<Value>(processor.0.lock().unwrap()[index].request.body())
+        .unwrap()["taskId"]
+        .clone();
+    processor.complete(
+        index,
+        Ok(response(
+            200,
+            text_body(json!({"taskId": id, "nextAction": action}).to_string()),
+        )),
+    );
+    tokio::task::yield_now().await;
+}
+
+#[tokio::test]
+async fn future_hints_survive_reconstruction_and_preserve_independent_heartbeat() {
+    let storage = FakeAlarmStorage::default();
+    let processor = DeferredProcessor::default();
+    let dispatcher =
+        RetainedTaskDispatcher::with_clock(storage.clone(), processor.clone(), scheduler_now);
+    dispatcher.fetch(dispatch_request("id")).await;
+    reply(
+        &processor,
+        0,
+        json!({"type": "retryAt", "atMs": NOW + 10_000}),
+    )
+    .await;
+    let dispatcher =
+        RetainedTaskDispatcher::with_clock(storage.clone(), processor.clone(), scheduler_now);
+    dispatcher.alarm().await.unwrap();
+    assert_eq!(storage.0.lock().unwrap().alarm, Some(NOW + 10_000));
+    advance(9_999);
+    dispatcher.alarm().await.unwrap();
+    assert_eq!(processor.count(), 1);
+    advance(1);
+    dispatcher.alarm().await.unwrap();
+    wait_for(|| processor.count() == 2).await;
+    assert_eq!(storage.0.lock().unwrap().alarm, Some(NOW + 30_000));
+    dispatcher.alarm().await.unwrap();
+    assert_eq!(processor.count(), 2);
+    reply(&processor, 1, json!({"type": "done"})).await;
+    assert!(stored_task(&storage, "id").is_none());
+    advance(25_000);
+    dispatcher.alarm().await.unwrap();
+    assert_eq!(
+        storage.0.lock().unwrap().alarm,
+        Some(scheduler_now() + 30_000)
+    );
+}
+
+#[tokio::test]
+async fn watchdog_recovers_hung_and_reconstructed_attempts_and_ignores_stale_results() {
+    for reconstruct in [false, true] {
+        SCHEDULER_NOW.set(NOW);
+        let storage = FakeAlarmStorage::default();
+        let processor = DeferredProcessor::default();
+        let mut dispatcher =
+            RetainedTaskDispatcher::with_clock(storage.clone(), processor.clone(), scheduler_now);
+        seed_schedule(&storage, "old");
+        dispatcher.alarm().await.unwrap();
+        wait_for(|| processor.count() == 1).await;
+        let first = stored_task(&storage, "id").unwrap().state;
+        if reconstruct {
+            dispatcher = RetainedTaskDispatcher::with_clock(
+                storage.clone(),
+                processor.clone(),
+                scheduler_now,
+            );
+        }
+        advance(59_999);
+        dispatcher.alarm().await.unwrap();
+        assert_eq!(processor.count(), 1);
+        advance(1);
+        dispatcher.alarm().await.unwrap();
+        assert_eq!(
+            stored_task(&storage, "id").unwrap().next_attempt_at_ms,
+            scheduler_now() + 1_000
+        );
+        advance(1_000);
+        dispatcher.alarm().await.unwrap();
+        wait_for(|| processor.count() == 2).await;
+        assert_ne!(stored_task(&storage, "id").unwrap().state, first);
+        reply(
+            &processor,
+            1,
+            json!({"type": "retryAt", "atMs": scheduler_now() + 20_000}),
+        )
+        .await;
+        if reconstruct {
+            // The old delegate still has a response future; real eviction is not claimed here.
+            reply(&processor, 0, json!({"type": "done"})).await;
+        }
+        assert_eq!(
+            stored_task(&storage, "id").unwrap().next_attempt_at_ms,
+            scheduler_now() + 20_000
+        );
+        dispatcher.fetch(named_request("corrected", "id")).await;
+        dispatcher
+            .fetch(named_request("must-not-replace", "id"))
+            .await;
+        wait_for(|| processor.count() == 3).await;
+        assert_eq!(stored_task(&storage, "id").unwrap().task_name, "old");
+        assert_eq!(
+            serde_json::from_str::<Value>(processor.0.lock().unwrap()[2].request.body()).unwrap()["taskName"],
+            "corrected"
+        );
+        reply(&processor, 2, json!({"type": "done"})).await;
+        assert!(stored_task(&storage, "id").is_none());
+        dispatcher.fetch(dispatch_request("id")).await;
+        assert!(stored_task(&storage, "id").is_none());
+        finish(&processor, 3).await;
+    }
+}
+
+#[tokio::test]
+async fn all_300_due_ids_launch_while_every_response_is_gated() {
+    use bellows::cloudflare::{DispatcherTask, SchedulerMetadata, TaskSchedule};
+    let storage = FakeAlarmStorage::default();
+    {
+        let mut state = storage.0.lock().unwrap();
+        state.durable.metadata = Some(SchedulerMetadata {
+            next_heartbeat_at_ms: NOW + 30_000,
+            next_attempt_id: 0,
+        });
+        for id in 0..300 {
+            state.durable.tasks.insert(
+                id.to_string(),
+                DispatcherTask {
+                    task_id: id.to_string(),
+                    task_name: if id % 2 == 0 { "first" } else { "second" }.into(),
+                    next_attempt_at_ms: NOW + 1_000,
+                    infrastructure_failures: 0,
+                    state: TaskSchedule::Pending,
+                },
+            );
+        }
+    }
+    let processor = DeferredProcessor::default();
+    let dispatcher =
+        RetainedTaskDispatcher::with_clock(storage.clone(), processor.clone(), scheduler_now);
+    advance(35_000);
+    dispatcher.alarm().await.unwrap();
+    wait_for(|| processor.count() == 300).await;
+    assert_eq!(
+        storage.0.lock().unwrap().alarm,
+        Some(scheduler_now() + 30_000)
+    );
+    dispatcher.alarm().await.unwrap();
+    assert_eq!(processor.count(), 300);
+    assert!(
+        storage
+            .0
+            .lock()
+            .unwrap()
+            .durable
+            .tasks
+            .values()
+            .all(|task| matches!(task.state, TaskSchedule::Running { .. }))
+    );
+}
+
+#[tokio::test]
+async fn uncertain_envelopes_retain_durable_tracking_and_back_off() {
+    let mut invalid = vec![
+        "".to_owned(),
+        "{}".to_owned(),
+        "{".to_owned(),
+        "null".to_owned(),
+        r#"{"taskId":"id","attemptFinished":true}"#.to_owned(),
+        r#"{"taskId":"other","nextAction":{"type":"done"}}"#.to_owned(),
+        r#"{"taskId":"id","nextAction":{"type":"unknown"}}"#.to_owned(),
+    ];
+    for at in [
+        json!(-1),
+        json!(0.5),
+        json!(8_640_000_000_000_001_i64),
+        json!(9_007_199_254_740_992_i64),
+        json!("1"),
+        Value::Null,
+    ] {
+        invalid.push(
+            json!({"taskId": "id", "nextAction": {"type": "retryAt", "atMs": at}}).to_string(),
+        );
+    }
+    for body in invalid {
+        let storage = FakeAlarmStorage::default();
+        let processor = DeferredProcessor::default();
+        let dispatcher =
+            RetainedTaskDispatcher::with_clock(storage.clone(), processor.clone(), scheduler_now);
+        seed_schedule(&storage, "contract");
+        dispatcher.alarm().await.unwrap();
+        wait_for(|| processor.count() == 1).await;
+        processor.complete(0, Ok(response(200, text_body(body))));
+        wait_for(|| stored_task(&storage, "id").unwrap().infrastructure_failures == 1).await;
+        assert_eq!(
+            stored_task(&storage, "id").unwrap().next_attempt_at_ms,
+            NOW + 1_000
+        );
+    }
+}
+
+#[tokio::test]
+async fn backoff_survives_reconstruction_saturates_and_resets_on_valid_past_hint() {
+    let storage = FakeAlarmStorage::default();
+    let processor = DeferredProcessor::default();
+    let mut dispatcher =
+        RetainedTaskDispatcher::with_clock(storage.clone(), processor.clone(), scheduler_now);
+    seed_schedule(&storage, "unknown");
+    dispatcher.alarm().await.unwrap();
+    for index in 0..8 {
+        wait_for(|| processor.count() == index + 1).await;
+        processor.complete(index, Ok(response(404, text_body("unknown"))));
+        wait_for(|| {
+            matches!(
+                stored_task(&storage, "id").unwrap().state,
+                bellows::cloudflare::TaskSchedule::Pending
+            )
+        })
+        .await;
+        let delay = (1_000 << index).min(30_000);
+        assert_eq!(
+            stored_task(&storage, "id").unwrap().next_attempt_at_ms,
+            scheduler_now() + delay
+        );
+        assert_eq!(
+            stored_task(&storage, "id").unwrap().infrastructure_failures,
+            (index as u32 + 1).min(6)
+        );
+        dispatcher =
+            RetainedTaskDispatcher::with_clock(storage.clone(), processor.clone(), scheduler_now);
+        advance(delay);
+        dispatcher.alarm().await.unwrap();
+    }
+    reply(
+        &processor,
+        8,
+        json!({"type": "retryAt", "atMs": scheduler_now() - 1}),
+    )
+    .await;
+    assert_eq!(
+        stored_task(&storage, "id").unwrap().infrastructure_failures,
+        0
+    );
+    dispatcher.alarm().await.unwrap();
+    wait_for(|| processor.count() == 10).await;
+    processor.complete(9, Err("network".into()));
+    wait_for(|| stored_task(&storage, "id").unwrap().infrastructure_failures == 1).await;
+    assert_eq!(
+        stored_task(&storage, "id").unwrap().next_attempt_at_ms,
+        scheduler_now() + 1_000
+    );
+}
+
+#[tokio::test]
+async fn failed_result_persistence_retains_a_scheduled_attempts_watchdog() {
+    let storage = FakeAlarmStorage::default();
+    let processor = DeferredProcessor::default();
+    let dispatcher =
+        RetainedTaskDispatcher::with_clock(storage.clone(), processor.clone(), scheduler_now);
+    seed_schedule(&storage, "contract");
+    dispatcher.alarm().await.unwrap();
+    storage.0.lock().unwrap().set_error = Some("commit failed");
+    reply(&processor, 0, json!({"type": "done"})).await;
+    wait_for(|| storage.0.lock().unwrap().transactions == 2).await;
+    assert!(matches!(
+        stored_task(&storage, "id").unwrap().state,
+        bellows::cloudflare::TaskSchedule::Running { .. }
+    ));
+    assert_eq!(storage.0.lock().unwrap().alarm, Some(NOW + 30_000));
+    storage.0.lock().unwrap().set_error = None;
+    let dispatcher =
+        RetainedTaskDispatcher::with_clock(storage.clone(), processor.clone(), scheduler_now);
+    advance(60_000);
+    dispatcher.alarm().await.unwrap();
+    advance(1_000);
+    dispatcher.alarm().await.unwrap();
+    wait_for(|| processor.count() == 2).await;
+    finish(&processor, 1).await;
+}
+
+#[tokio::test]
+async fn corrupt_current_records_never_become_an_empty_queue() {
+    use bellows::cloudflare::SchedulerMetadata;
+    for metadata in [
+        SchedulerMetadata {
+            next_heartbeat_at_ms: -1,
+            next_attempt_id: 0,
+        },
+        SchedulerMetadata {
+            next_heartbeat_at_ms: NOW,
+            next_attempt_id: u64::MAX,
+        },
+    ] {
+        let storage = FakeAlarmStorage::default();
+        storage.0.lock().unwrap().durable.metadata = Some(metadata.clone());
+        let processor = DeferredProcessor::default();
+        let dispatcher =
+            RetainedTaskDispatcher::with_clock(storage.clone(), processor.clone(), scheduler_now);
+        assert_eq!(dispatcher.fetch(dispatch_request("id")).await.status(), 200);
+        assert!(dispatcher.alarm().await.is_err());
+        wait_for(|| processor.count() == 1).await;
+        assert_eq!(storage.0.lock().unwrap().durable.metadata, Some(metadata));
     }
 }

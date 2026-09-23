@@ -359,7 +359,7 @@ impl PostgresTaskOperations {
             .map_err(|error| claim_error(PostgresWorkerError::InvalidWorkerId(error)))?;
         let now_system = SystemTime::now();
         let now = unix_timestamp_ms(now_system);
-        let expiration = instant_to_unix_ms(lease_expiration, now_system);
+        let expiration = instant_to_unix_ms(lease_expiration);
         let client = self.client().await.map_err(claim_error)?;
         let row = client
             .query_typed_opt(
@@ -388,7 +388,7 @@ impl PostgresTaskOperations {
             )
             .await
             .map_err(claim_error)?;
-        Err(unclaimed(current, now, now_system))
+        Err(unclaimed(current))
     }
 
     pub(super) async fn claim_earliest_published<T>(
@@ -404,7 +404,7 @@ impl PostgresTaskOperations {
             .map_err(|error| claim_error(PostgresWorkerError::InvalidWorkerId(error)))?;
         let now_system = SystemTime::now();
         let now = unix_timestamp_ms(now_system);
-        let expiration = instant_to_unix_ms(lease_expiration, now_system);
+        let expiration = instant_to_unix_ms(lease_expiration);
         let client = self.client().await.map_err(claim_error)?;
         let row = client
             .query_typed_opt(
@@ -435,7 +435,7 @@ impl PostgresTaskOperations {
         let available_from = row
             .try_get::<_, Option<i64>>("available_from_unix_ms")
             .map_err(claim_error)?
-            .map(|time| unix_ms_to_instant(time, now_system));
+            .and_then(unix_ms_to_instant);
         Err(ClaimTaskError::TaskUnavailable { available_from })
     }
 
@@ -451,7 +451,7 @@ impl PostgresTaskOperations {
             .map_err(|error| claim_error(PostgresWorkerError::InvalidWorkerId(error)))?;
         let now_system = SystemTime::now();
         let now = unix_timestamp_ms(now_system);
-        let expiration = instant_to_unix_ms(lease_expiration, now_system);
+        let expiration = instant_to_unix_ms(lease_expiration);
         let client = self.client().await.map_err(claim_error)?;
         let row = client
             .query_typed_opt(
@@ -480,7 +480,7 @@ impl PostgresTaskOperations {
             )
             .await
             .map_err(claim_error)?;
-        Err(unclaimed(current, now, now_system))
+        Err(unclaimed(current))
     }
 
     pub(super) async fn renew(
@@ -493,7 +493,7 @@ impl PostgresTaskOperations {
             .map_err(|error| renew_error(PostgresWorkerError::InvalidTaskId(error)))?;
         let worker_id_db = i64::try_from(worker_id)
             .map_err(|error| renew_error(PostgresWorkerError::InvalidWorkerId(error)))?;
-        let expiration = instant_to_unix_ms(lease_expiration, SystemTime::now());
+        let expiration = instant_to_unix_ms(lease_expiration);
         let affected = self
             .client()
             .await
@@ -527,7 +527,7 @@ impl PostgresTaskOperations {
             .map_err(|error| fail_error(PostgresWorkerError::InvalidTaskId(error)))?;
         let worker_id_db = i64::try_from(worker_id)
             .map_err(|error| fail_error(PostgresWorkerError::InvalidWorkerId(error)))?;
-        let available = available_from.map(|time| instant_to_unix_ms(time, SystemTime::now()));
+        let available = available_from.map(instant_to_unix_ms);
         let affected = self
             .client()
             .await
@@ -566,7 +566,7 @@ impl PostgresTaskOperations {
         let callback_payload_json = serde_json::to_string(&callback_payload).map_err(|error| {
             finish_error(PostgresWorkerError::CallbackSerialization(Arc::new(error)))
         })?;
-        let available = available_from.map(|time| instant_to_unix_ms(time, SystemTime::now()));
+        let available = available_from.map(instant_to_unix_ms);
         let mut client = self.client().await.map_err(finish_error)?;
         let tx = client.transaction().await.map_err(finish_error)?;
         let result = async {
@@ -639,7 +639,7 @@ fn decode_payload<P: serde::de::DeserializeOwned>(row: &Row) -> Result<P, ClaimT
         .map_err(|error| claim_error(PostgresWorkerError::PayloadDeserialization(Arc::new(error))))
 }
 
-fn unclaimed(row: Option<Row>, now: i64, now_system: SystemTime) -> ClaimTaskError {
+fn unclaimed(row: Option<Row>) -> ClaimTaskError {
     let Some(row) = row else {
         return ClaimTaskError::TaskNotFound;
     };
@@ -647,19 +647,8 @@ fn unclaimed(row: Option<Row>, now: i64, now_system: SystemTime) -> ClaimTaskErr
         Ok(available) => available,
         Err(error) => return claim_error(error),
     };
-    match available {
-        Some(time) if time > now => {
-            let deadline = unix_ms_to_instant(time, now_system);
-            match row.try_get::<_, Option<i64>>("lease_worker_id") {
-                Ok(Some(_)) => ClaimTaskError::TaskLeased {
-                    expiration: deadline,
-                },
-                Ok(None) => ClaimTaskError::TaskUnavailable {
-                    available_from: Some(deadline),
-                },
-                Err(error) => claim_error(error),
-            }
-        }
-        _ => ClaimTaskError::TaskNotFound,
+    match row.try_get::<_, Option<i64>>("lease_worker_id") {
+        Ok(worker_id) => super::postgres_common::unclaimed_task(worker_id, available),
+        Err(error) => claim_error(error),
     }
 }

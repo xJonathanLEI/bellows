@@ -203,7 +203,7 @@ test("application cleanup is optional", async () => {
   }));
   await envelope(await processor.fetch(request(), env), 200, {
     taskId: "17",
-    attemptFinished: true,
+    nextAction: { type: "done" },
   });
   expect(f.cleanup).not.toHaveBeenCalled();
   expect(f.backend.close).toHaveBeenCalledTimes(1);
@@ -376,7 +376,7 @@ test.each([
   const { fetch } = f.processor;
   await envelope(await fetch(input, env), 200, {
     taskId,
-    attemptFinished: true,
+    nextAction: { type: "done" },
   });
   expect(rng).toHaveBeenCalledTimes(2);
   expect(f.configure).toHaveBeenCalledExactlyOnceWith(env);
@@ -531,7 +531,7 @@ test.each([
       env,
     ),
     200,
-    { taskId: "17", attemptFinished: true },
+    { taskId: "17", nextAction: { type: "done" } },
   );
   expect(f.backend.claimPublished).toHaveBeenCalledExactlyOnceWith(
     definition,
@@ -606,7 +606,7 @@ test("a persisted-name mismatch cannot decode or build either worker", async () 
   const otherDecode = vi.spyOn(countTask.codec, "decode");
   await envelope(await f.processor.fetch(request(), env), 200, {
     taskId: "17",
-    attemptFinished: true,
+    nextAction: { type: "done" },
   });
   expect(f.backend.claimPublished).toHaveBeenCalledExactlyOnceWith(
     task,
@@ -643,7 +643,7 @@ test.each([
   await envelope(
     await processor.fetch(request({ taskId: "17", taskName: name }), env),
     200,
-    { taskId: "17", attemptFinished: true },
+    { taskId: "17", nextAction: { type: "done" } },
   );
   expect(f.factory.build).toHaveBeenCalledExactlyOnceWith(23);
   expect(f.backend.claimPublished).toHaveBeenCalledExactlyOnceWith(
@@ -722,22 +722,32 @@ test("annotated environments infer task payload and callback types", () => {
 });
 
 test.each([
-  new TaskNotFoundError(),
-  new TaskLeasedError(Date.now() + 60_000),
-  new TaskUnavailableError(null),
-  secret,
-])("no claim (%s) is a cleaned-up normal attempt", async (error) => {
+  [new TaskNotFoundError(), { type: "done" }],
+  [
+    new TaskLeasedError(1_700_000_000_000),
+    { type: "retryAt", atMs: 1_700_000_000_000 },
+  ],
+  [
+    new TaskUnavailableError(1_900_000_000_000),
+    { type: "retryAt", atMs: 1_900_000_000_000 },
+  ],
+  [new TaskUnavailableError(null), null],
+  [secret, null],
+] as const)("no claim (%s) reports its disposition after cleanup", async (error, nextAction) => {
   const f = fixture();
   random();
   f.backend.claimError = error;
-  await envelope(await f.processor.fetch(request(), env), 200, {
-    taskId: "17",
-    attemptFinished: true,
-  });
+  await envelope(
+    await f.processor.fetch(request(), env),
+    nextAction ? 200 : 500,
+    nextAction
+      ? { taskId: "17", nextAction }
+      : { error: "task processing attempt failed" },
+  );
   expect(f.factory.build).not.toHaveBeenCalled();
   expect(f.cleanup).toHaveBeenCalledTimes(1);
   expect(f.backend.close).toHaveBeenCalledTimes(1);
-  expect(console.error).not.toHaveBeenCalled();
+  expect(console.error).toHaveBeenCalledTimes(nextAction ? 0 : 1);
 });
 
 test.each([
@@ -790,7 +800,13 @@ test.each([
   await f.backend.closing.wait();
   stillPending();
   f.backend.closeGate.release();
-  await envelope(await response, 200, { taskId: "17", attemptFinished: true });
+  await envelope(await response, 200, {
+    taskId: "17",
+    nextAction:
+      outcome === "success"
+        ? { type: "done" }
+        : { type: "retryAt", atMs: Date.now() },
+  });
   expect(
     outcome === "success" ? f.backend.finish : f.backend.fail,
   ).toHaveBeenCalledTimes(1);
@@ -800,32 +816,155 @@ test.each([
 });
 
 test.each([
-  false,
-  true,
-])("runtime-swallowed finalization errors remain normal (failure=%s)", async (failed) => {
-  const f = fixture();
-  f.backend.finalizationError = secret;
-  const factory: WorkerFactory<typeof task> = {
-    task,
-    build: () => ({
-      process: async () =>
-        failed
-          ? TaskFailure.retryImmediately()
-          : TaskSuccess.done({ greeting: "done" }),
-    }),
-  };
-  await envelope(
-    await createPostgresProcessor((env: Env) => ({
+  "success",
+  "failure",
+  "reschedule",
+  "scheduled-failure",
+] as const)("finalization errors return uncertainty (%s)", async (outcome) => {
+  for (const error of [secret, new LeaseLostError()]) {
+    const f = fixture();
+    const atMs = Date.now() + 60_000;
+    f.backend.finalizationError = error;
+    f.backend.recordingGate = new Gate();
+    const factory: WorkerFactory<typeof task> = {
+      task,
+      build: () => ({
+        process: async () => {
+          switch (outcome) {
+            case "success":
+              return TaskSuccess.done({ greeting: "done" });
+            case "failure":
+              return TaskFailure.retryImmediately();
+            case "reschedule":
+              return TaskSuccess.scheduleNextRun({ greeting: "done" }, atMs);
+            case "scheduled-failure":
+              return TaskFailure.retryAt(atMs);
+          }
+        },
+      }),
+    };
+    const response = createPostgresProcessor((env: Env) => ({
       connectionString: env.url,
       tasks: [createPostgresProcessorTask(factory)],
       cleanup: f.cleanup,
-    })).fetch(request(), env),
-    200,
-    { taskId: "17", attemptFinished: true },
+    })).fetch(request(), env);
+    const stillPending = pending(response);
+    await f.backend.recording.wait();
+    stillPending();
+    expect(f.cleanup).not.toHaveBeenCalled();
+    f.backend.recordingGate.release();
+    await envelope(await response, 500, {
+      error: "task processing attempt failed",
+    });
+    expect(f.cleanup).toHaveBeenCalledTimes(1);
+    expect(f.backend.close).toHaveBeenCalledTimes(1);
+  }
+  expect(vi.mocked(console.error).mock.calls).toEqual([
+    ["task processing attempt failed 17 attempt"],
+    ["task processing attempt failed 17 attempt"],
+  ]);
+});
+
+test.each([
+  "future",
+  "leased",
+  "failure",
+  "reschedule",
+] as const)("preserves %s deadlines through delayed query, cleanup and close", async (kind) => {
+  for (const offset of [-60_000, 60_000]) {
+    const f = fixture();
+    const atMs = Date.now() + offset;
+    const query = new Gate();
+    const querying = new Gate();
+    const cleaning = new Gate();
+    const cleanupGate = new Gate();
+    f.backend.closeGate = new Gate();
+    if (kind === "future" || kind === "leased") {
+      vi.mocked(f.backend.claimPublished).mockImplementation(async () => {
+        querying.release();
+        await query.wait();
+        throw kind === "future"
+          ? new TaskUnavailableError(atMs)
+          : new TaskLeasedError(atMs);
+      });
+    }
+    const factory: WorkerFactory<typeof task> = {
+      task,
+      build: () => ({
+        process: async () =>
+          kind === "failure"
+            ? TaskFailure.retryAt(atMs)
+            : TaskSuccess.scheduleNextRun({ greeting: "done" }, atMs),
+      }),
+    };
+    f.cleanup.mockImplementation(async () => {
+      cleaning.release();
+      await cleanupGate.wait();
+    });
+    const response = createPostgresProcessor(() => ({
+      connectionString: env.url,
+      tasks: [createPostgresProcessorTask(factory)],
+      cleanup: f.cleanup,
+    })).fetch(request(), env);
+    const stillPending = pending(response);
+    if (kind === "future" || kind === "leased") {
+      await querying.wait();
+      stillPending();
+      await vi.advanceTimersByTimeAsync(321);
+      query.release();
+    }
+    await cleaning.wait();
+    stillPending();
+    await vi.advanceTimersByTimeAsync(321);
+    cleanupGate.release();
+    await f.backend.closing.wait();
+    stillPending();
+    await vi.advanceTimersByTimeAsync(321);
+    f.backend.closeGate.release();
+    await envelope(await response, 200, {
+      taskId: "17",
+      nextAction: { type: "retryAt", atMs },
+    });
+    expect(f.backend.finish).toHaveBeenCalledTimes(
+      kind === "reschedule" ? 1 : 0,
+    );
+    expect(f.backend.fail).toHaveBeenCalledTimes(kind === "failure" ? 1 : 0);
+  }
+  expect(console.error).not.toHaveBeenCalled();
+});
+
+test.each([
+  NaN,
+  Infinity,
+  -Infinity,
+  -1,
+  1.5,
+  8_640_000_000_000_001,
+  Number.MAX_SAFE_INTEGER,
+])("rejects an unrepresentable deadline %s after owned cleanup", async (atMs) => {
+  const f = fixture();
+  f.process.mockResolvedValue(
+    TaskSuccess.scheduleNextRun({ greeting: "done" }, atMs),
   );
+  await envelope(await f.processor.fetch(request(), env), 500, {
+    error: "task processing attempt failed",
+  });
   expect(f.cleanup).toHaveBeenCalledTimes(1);
   expect(f.backend.close).toHaveBeenCalledTimes(1);
-  expect(console.error).not.toHaveBeenCalled();
+  expect(console.error).toHaveBeenCalledExactlyOnceWith(
+    "task processing attempt failed 17 attempt",
+  );
+});
+
+test.each([
+  0, 8_640_000_000_000_000,
+])("accepts the Date boundary %s", async (atMs) => {
+  const f = fixture();
+  f.backend.claimError = new TaskUnavailableError(atMs);
+  await envelope(await f.processor.fetch(request(), env), 200, {
+    taskId: "17",
+    nextAction: { type: "retryAt", atMs },
+  });
 });
 
 test.each([
@@ -914,10 +1053,16 @@ test("fresh concurrent scopes and backends do not share cleanup", async () => {
   firstPending();
   secondPending();
   gates[1].release();
-  await envelope(await second, 200, { taskId: "18", attemptFinished: true });
+  await envelope(await second, 200, {
+    taskId: "18",
+    nextAction: { type: "done" },
+  });
   firstPending();
   gates[0].release();
-  await envelope(await first, 200, { taskId: "17", attemptFinished: true });
+  await envelope(await first, 200, {
+    taskId: "17",
+    nextAction: { type: "done" },
+  });
   expect(configure).toHaveBeenCalledTimes(2);
   expect(connect.mock.calls).toEqual([
     ["first", { schema: undefined }],
@@ -987,11 +1132,15 @@ test("renewal loss does not cancel business work; registered cleanup drains it",
   expect(businessFinished).toBe(false);
   expect(f.backend.close).not.toHaveBeenCalled();
   businessGate.release();
-  await envelope(await response, 200, { taskId: "17", attemptFinished: true });
+  await envelope(await response, 500, {
+    error: "task processing attempt failed",
+  });
   expect(businessFinished).toBe(true);
   expect(cleanup).toHaveBeenCalledTimes(1);
   expect(f.backend.close).toHaveBeenCalledTimes(1);
   expect(f.backend.finish).not.toHaveBeenCalled();
   expect(f.backend.fail).not.toHaveBeenCalled();
-  expect(console.error).not.toHaveBeenCalled();
+  expect(console.error).toHaveBeenCalledExactlyOnceWith(
+    "task processing attempt failed 17 attempt",
+  );
 });

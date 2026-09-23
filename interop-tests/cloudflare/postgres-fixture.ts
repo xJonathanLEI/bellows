@@ -190,6 +190,23 @@ CREATE TABLE ${this.processedTable} (
     execution_count INTEGER NOT NULL CHECK (execution_count > 0)
 )
     `);
+    // Statement start precedes the SQL gate's lock wait, so releasing a gate late cannot
+    // hide early business execution behind a later commit/trigger timestamp.
+    await this.admin.query(`
+CREATE TABLE "${this.schema}".task_executions (
+    task_id BIGINT NOT NULL,
+    execution_count INTEGER NOT NULL,
+    executed_at_ms BIGINT NOT NULL DEFAULT floor(extract(epoch FROM statement_timestamp()) * 1000)
+);
+CREATE FUNCTION "${this.schema}".record_execution() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    INSERT INTO "${this.schema}".task_executions (task_id, execution_count)
+    VALUES (NEW.task_id, NEW.execution_count);
+    RETURN NEW;
+END $$;
+CREATE TRIGGER record_execution AFTER INSERT OR UPDATE ON ${this.processedTable}
+FOR EACH ROW EXECUTE FUNCTION "${this.schema}".record_execution()
+    `);
     await deadline(
       this.server.listen(),
       "starting both Wrangler projects",
@@ -221,6 +238,43 @@ CREATE TABLE ${this.processedTable} (
       2_000,
     );
     return env.DISPATCHER.getByName("global");
+  }
+
+  async schedule() {
+    const dispatcher = await this.dispatcher();
+    const response = await this.consume(
+      dispatcher.fetch("https://dispatcher/__test/state"),
+      "inspect durable schedule",
+    );
+    if (response.status !== 200) throw new Error(response.body);
+    return JSON.parse(response.body) as {
+      metadata: { nextHeartbeatAtMs: number; nextAttemptId: number };
+      tasks: Record<
+        string,
+        {
+          taskId: string;
+          taskName: string;
+          state: { type: "pending" | "running"; attemptId?: number };
+          nextAttemptAtMs: number;
+          infrastructureFailures: number;
+        }
+      >;
+      alarm: number;
+      now: number;
+    };
+  }
+
+  async executions(taskId: string) {
+    return (
+      await this.admin.query<{
+        execution_count: number;
+        executed_at_ms: string;
+      }>(
+        `SELECT execution_count, executed_at_ms FROM "${this.schema}".task_executions
+       WHERE task_id = $1 ORDER BY execution_count`,
+        [taskId],
+      )
+    ).rows;
   }
 
   get processor() {

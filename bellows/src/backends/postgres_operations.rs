@@ -318,7 +318,7 @@ impl PostgresTaskOperations {
         })?;
         let now_system = SystemTime::now();
         let now_unix_ms = unix_timestamp_ms(now_system);
-        let lease_expiration_unix_ms = instant_to_unix_ms(lease_expiration, now_system);
+        let lease_expiration_unix_ms = instant_to_unix_ms(lease_expiration);
 
         let claimed_row = sqlx::query(&claim_published_sql(&self.table_name))
             .bind(worker_id_db)
@@ -359,23 +359,10 @@ impl PostgresTaskOperations {
                     return Err(ClaimTaskError::TaskNotFound);
                 };
 
-                match current.get::<Option<i64>, _>("available_from_unix_ms") {
-                    Some(available_from_unix_ms) if available_from_unix_ms > now_unix_ms => {
-                        if current.get::<Option<i64>, _>("lease_worker_id").is_some() {
-                            Err(ClaimTaskError::TaskLeased {
-                                expiration: unix_ms_to_instant(available_from_unix_ms, now_system),
-                            })
-                        } else {
-                            Err(ClaimTaskError::TaskUnavailable {
-                                available_from: Some(unix_ms_to_instant(
-                                    available_from_unix_ms,
-                                    now_system,
-                                )),
-                            })
-                        }
-                    }
-                    Some(_) | None => Err(ClaimTaskError::TaskNotFound),
-                }
+                Err(super::postgres_common::unclaimed_task(
+                    current.get("lease_worker_id"),
+                    current.get("available_from_unix_ms"),
+                ))
             }
         }
     }
@@ -397,7 +384,7 @@ impl PostgresTaskOperations {
         })?;
         let now_system = SystemTime::now();
         let now_unix_ms = unix_timestamp_ms(now_system);
-        let lease_expiration_unix_ms = instant_to_unix_ms(lease_expiration, now_system);
+        let lease_expiration_unix_ms = instant_to_unix_ms(lease_expiration);
 
         let claimed_row = sqlx::query(&claim_earliest_sql(&self.table_name))
             .bind(T::NAME)
@@ -438,7 +425,7 @@ impl PostgresTaskOperations {
                             ClaimTaskError::Backend(Box::new(PostgresBackendError::Sqlx(err)))
                         })?
                         .get::<Option<i64>, _>("available_from_unix_ms")
-                        .map(|unix_ms| unix_ms_to_instant(unix_ms, now_system));
+                        .and_then(unix_ms_to_instant);
 
                 Err(ClaimTaskError::TaskUnavailable {
                     available_from: earliest_available_from,
@@ -460,7 +447,7 @@ impl PostgresTaskOperations {
         })?;
         let now_system = SystemTime::now();
         let now_unix_ms = unix_timestamp_ms(now_system);
-        let lease_expiration_unix_ms = instant_to_unix_ms(lease_expiration, now_system);
+        let lease_expiration_unix_ms = instant_to_unix_ms(lease_expiration);
 
         let claimed_row = sqlx::query(&claim_singleton_sql(&self.table_name))
             .bind(T::NAME)
@@ -499,23 +486,10 @@ impl PostgresTaskOperations {
                     return Err(ClaimTaskError::TaskNotFound);
                 };
 
-                match current.get::<Option<i64>, _>("available_from_unix_ms") {
-                    Some(available_from_unix_ms) if available_from_unix_ms > now_unix_ms => {
-                        if current.get::<Option<i64>, _>("lease_worker_id").is_some() {
-                            Err(ClaimTaskError::TaskLeased {
-                                expiration: unix_ms_to_instant(available_from_unix_ms, now_system),
-                            })
-                        } else {
-                            Err(ClaimTaskError::TaskUnavailable {
-                                available_from: Some(unix_ms_to_instant(
-                                    available_from_unix_ms,
-                                    now_system,
-                                )),
-                            })
-                        }
-                    }
-                    Some(_) | None => Err(ClaimTaskError::TaskNotFound),
-                }
+                Err(super::postgres_common::unclaimed_task(
+                    current.get("lease_worker_id"),
+                    current.get("available_from_unix_ms"),
+                ))
             }
         }
     }
@@ -532,7 +506,7 @@ impl PostgresTaskOperations {
         let worker_id_db = i64::try_from(worker_id).map_err(|err| {
             RenewTaskError::Backend(Box::new(PostgresBackendError::InvalidWorkerId(err)))
         })?;
-        let lease_expiration_unix_ms = instant_to_unix_ms(lease_expiration, SystemTime::now());
+        let lease_expiration_unix_ms = instant_to_unix_ms(lease_expiration);
 
         let result = sqlx::query(&renew_sql(&self.table_name))
             .bind(lease_expiration_unix_ms)
@@ -563,8 +537,7 @@ impl PostgresTaskOperations {
         let worker_id_db = i64::try_from(worker_id).map_err(|err| {
             FailTaskError::Backend(Box::new(PostgresBackendError::InvalidWorkerId(err)))
         })?;
-        let available_from_unix_ms =
-            available_from.map(|instant| instant_to_unix_ms(instant, SystemTime::now()));
+        let available_from_unix_ms = available_from.map(instant_to_unix_ms);
 
         let result = sqlx::query(&fail_sql(&self.table_name))
             .bind(available_from_unix_ms)
@@ -600,9 +573,7 @@ impl PostgresTaskOperations {
         let callback_payload_json = serde_json::to_string(&callback_payload).map_err(|err| {
             FinishTaskError::Backend(Box::new(PostgresBackendError::CallbackSerialization(err)))
         })?;
-        let now_system = SystemTime::now();
-        let available_from_unix_ms =
-            available_from.map(|available_from| instant_to_unix_ms(available_from, now_system));
+        let available_from_unix_ms = available_from.map(instant_to_unix_ms);
 
         let mut tx =
             self.pool.begin().await.map_err(|err| {

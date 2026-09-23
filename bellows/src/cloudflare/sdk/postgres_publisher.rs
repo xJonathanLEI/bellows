@@ -10,13 +10,14 @@ use crate::{
         BoxDispatchError,
         publisher::{self, Publisher, Scope},
     },
+    time::Instant,
 };
 
 pub use crate::cloudflare::publisher::{
     PostgresPublisherError, PostgresPublisherReceipt, PostgresPublisherStage,
 };
 
-/// Configuration for one immediate publication, using an existing schema.
+/// Configuration for one publication, using an existing schema.
 pub struct PostgresPublisherConfig {
     /// Obtain this URL from the request's Hyperdrive binding.
     pub connection_string: String,
@@ -49,8 +50,8 @@ impl PostgresPublisherConfig {
 /// Await publication within your request. Normal error paths await shutdown, but dropping the
 /// future, termination, or a wasm trap cannot guarantee cleanup. This does not extend request
 /// lifetime, own an HTTP endpoint, retry publication, or make publication and dispatch atomic.
-/// No future/awaitable publication, callback delivery, application cleanup hooks, transaction
-/// participation, or durable recovery is provided.
+/// No awaitable publication, callback delivery, application cleanup hooks, transaction
+/// participation, or recovery of the publication-to-dispatch gap is provided.
 pub struct PostgresPublisher<T, C> {
     configure: C,
     task: PhantomData<fn() -> T>,
@@ -81,6 +82,30 @@ where
                 task: PhantomData,
             },
             payload,
+            None,
+        )
+        .await
+    }
+
+    /// Publishes with future availability, then immediately dispatches the exact ID and name.
+    ///
+    /// The processor observes PostgreSQL's availability and instructs the durable dispatcher
+    /// when to invoke again. Returns only after shutdown and complete dispatch acceptance;
+    /// neither the receipt nor the dispatch request includes the deadline.
+    pub async fn publish_future(
+        &self,
+        env: &Env,
+        payload: <T::Trigger as PublishActivationStrategy>::Payload,
+        available_from: Instant,
+    ) -> Result<PostgresPublisherReceipt, PostgresPublisherError> {
+        publisher::publish(
+            &RequestPublisher::<T, C> {
+                configure: &self.configure,
+                env,
+                task: PhantomData,
+            },
+            payload,
+            Some(available_from),
         )
         .await
     }

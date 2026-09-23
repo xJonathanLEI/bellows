@@ -299,7 +299,11 @@ WHERE task_name = ?
         throw new TaskUnavailableError(currentRow.available_from_unix_ms);
       }
 
-      throw new TaskNotFoundError();
+      throw new TaskUnavailableError(
+        currentRow.available_from_unix_ms === null
+          ? Date.now()
+          : currentRow.available_from_unix_ms,
+      );
     }
 
     this.emitSignal(task.name, claimedRow.task_id, leaseExpirationMs);
@@ -547,7 +551,11 @@ WHERE task_id = ?
       return new TaskUnavailableError(currentRow.available_from_unix_ms);
     }
 
-    return new TaskNotFoundError();
+    return new TaskUnavailableError(
+      currentRow.available_from_unix_ms === null
+        ? Date.now()
+        : currentRow.available_from_unix_ms,
+    );
   }
 
   private emitSignal(

@@ -1,14 +1,10 @@
 //! Driver-independent PostgreSQL configuration, SQL, notification codec, and clocks.
 
-use std::{io, sync::Arc, time::Duration};
+use std::{io, sync::Arc};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    PublishActivationStrategy, TaskDefinition,
-    backends::PublishedTask,
-    time::clock::{Instant, SystemTime, UNIX_EPOCH},
-};
+use crate::{PublishActivationStrategy, TaskDefinition, backends::PublishedTask, time::Instant};
 
 use super::postgres_publishing::PostgresPublishQuery;
 
@@ -92,14 +88,12 @@ impl PreparedPublication {
         T::Trigger: PublishActivationStrategy,
     {
         let payload_json = serde_json::to_string(&payload)?;
-        let now_system = SystemTime::now();
         Ok(Self {
             sql: publish_sql(table_name),
             task_name: T::NAME,
             payload_json,
             callback_id,
-            available_from_unix_ms: available_from
-                .map(|available_from| instant_to_unix_ms(available_from, now_system)),
+            available_from_unix_ms: available_from.map(instant_to_unix_ms),
         })
     }
 
@@ -324,31 +318,22 @@ pub(super) enum NotificationPayload {
     },
 }
 
-pub(super) fn unix_timestamp_ms(time: SystemTime) -> i64 {
-    let duration = time.duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO);
-    i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
-}
+pub(super) use crate::time::deadlines::{
+    instant_to_unix_ms, unix_ms_to_instant, unix_timestamp_ms,
+};
 
-pub(super) fn instant_to_unix_ms(instant: Instant, now_system: SystemTime) -> i64 {
-    let now_instant = Instant::now();
-    let system_deadline = if instant >= now_instant {
-        now_system + instant.duration_since(now_instant)
-    } else {
-        now_system
-            .checked_sub(now_instant.duration_since(instant))
-            .unwrap_or(UNIX_EPOCH)
-    };
-    unix_timestamp_ms(system_deadline)
-}
-
-pub(super) fn unix_ms_to_instant(unix_ms: i64, now_system: SystemTime) -> Instant {
-    let now_instant = Instant::now();
-    let now_unix_ms = unix_timestamp_ms(now_system);
-    if unix_ms <= now_unix_ms {
-        now_instant
-    } else {
-        let delta_ms = u64::try_from(unix_ms - now_unix_ms).unwrap_or(u64::MAX);
-        now_instant + Duration::from_millis(delta_ms)
+/// The follow-up SELECT found a matching row; even a now-due row is not missing.
+pub(super) fn unclaimed_task(
+    lease_worker_id: Option<i64>,
+    available_ms: Option<i64>,
+) -> crate::backends::ClaimTaskError {
+    use crate::backends::ClaimTaskError;
+    let available_from = available_ms.map_or_else(|| Some(Instant::now()), unix_ms_to_instant);
+    match available_from {
+        Some(expiration) if lease_worker_id.is_some() && expiration > Instant::now() => {
+            ClaimTaskError::TaskLeased { expiration }
+        }
+        _ => ClaimTaskError::TaskUnavailable { available_from },
     }
 }
 

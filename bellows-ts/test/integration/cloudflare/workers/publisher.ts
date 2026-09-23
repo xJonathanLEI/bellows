@@ -26,10 +26,18 @@ const publisher = createPostgresPublisher((env: Env) => ({
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const path = new URL(request.url).pathname;
-    if (path === "/publisher/publish") {
+    if (path === "/publisher/publish" || path === "/publisher/publish-future") {
       try {
+        const payload: [string, number[]] = ['hello "🦀"\n', [1, 2, 3]];
         return Response.json(
-          await publisher.publish(env, ['hello "🦀"\n', [1, 2, 3]]),
+          path === "/publisher/publish-future"
+            ? await publisher.publishFuture(
+                env,
+                payload,
+                (await request.json<{ availableFromMs: number }>())
+                  .availableFromMs,
+              )
+            : await publisher.publish(env, payload),
         );
       } catch (error) {
         if (!(error instanceof PostgresPublisherError)) throw error;

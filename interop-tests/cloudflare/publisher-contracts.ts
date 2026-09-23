@@ -66,113 +66,121 @@ export function publisherContracts(
       }
     }, 10_000);
 
-    for (const status of [200, 503]) {
-      const title =
-        status === 200
-          ? "closes before dispatch and consumes the complete gated success body"
-          : "retains a dispatch failure through body consumption and redispatches without republishing";
-      test(title, async () => {
-        await control("/publisher/response", { status });
-        const gate = await fixture.gate("bellows_tasks");
-        let ended = false;
-        const response = consume("/publisher/publish").finally(() => {
-          ended = true;
-        });
-        const pids = await gate.blocked(1);
-        expect(
-          (await fixture.activeRequestClients()).map(({ pid }) => pid),
-        ).toEqual(pids);
-        expect(await fixture.state()).toEqual({ tasks: [], processed: [] });
-        expect(await state()).toEqual({ dispatches: [], drained: 0 });
-        expect(ended).toBe(false);
-
-        await gate.release();
-        await poll(
-          "dispatch headers and prefix with the response tail withheld",
-          state,
-          (value) => value.dispatches.length === 1,
-        );
-        const receipt = { taskId: "1" };
-        const dispatch = { ...receipt, taskName: "publisher_contract" };
-        expect(await state()).toEqual({
-          dispatches: [dispatch],
-          drained: 0,
-        });
-        await fixture.waitForClientExit(pids);
-        expect(await fixture.activeRequestClients()).toHaveLength(0);
-        const committed = {
-          tasks: [
-            {
-              task_id: "1",
-              task_name: "publisher_contract",
-              task_unique_key: null,
-              payload_json: JSON.stringify(['hello "🦀"\n', [1, 2, 3]]),
-              callback_id: null,
-              lease_worker_id: null,
-              available_from_unix_ms: null,
-            },
-          ],
-          processed: [],
-        };
-        expect(await fixture.state()).toEqual(committed);
-        expect(await sequence()).toEqual([
-          { last_value: "1", is_called: true },
-        ]);
-        expect(ended).toBe(false);
-
-        await control("/publisher/release");
-        const result = await response;
-        expect(result.status, result.body).toBe(status);
-        expect(JSON.parse(result.body)).toEqual(
+    for (const future of [false, true]) {
+      for (const status of [200, 503]) {
+        const title =
           status === 200
-            ? receipt
-            : {
-                stage: "dispatch",
-                receipt,
-                error: "PostgreSQL publisher failed at dispatch",
-              },
-        );
-        expect(result.body).not.toContain("fixture-secret");
-        expect(await state()).toEqual({ dispatches: [dispatch], drained: 1 });
-        expect(await fixture.state()).toEqual(committed);
-
-        if (status === 503) {
-          await control("/publisher/response", { status: 200 });
-          // Recover from the typed error's receipt, not a fresh publication.
-          const retained = JSON.parse(result.body).receipt;
-          ended = false;
-          const redispatched = consume(
-            "/publisher/redispatch",
-            retained,
+            ? "closes before dispatch and consumes the complete gated success body"
+            : "retains a dispatch failure through body consumption and redispatches without republishing";
+        test(`${future ? "future" : "immediate"}: ${title}`, async () => {
+          const availableFromMs = future ? Date.now() + 60_000 : undefined;
+          await control("/publisher/response", { status });
+          const gate = await fixture.gate("bellows_tasks");
+          let ended = false;
+          const response = consume(
+            future ? "/publisher/publish-future" : "/publisher/publish",
+            { availableFromMs },
           ).finally(() => {
             ended = true;
           });
-          await poll(
-            "explicit redispatch of the retained ID",
-            state,
-            (value) => value.dispatches.length === 2,
-          );
-          expect(await state()).toEqual({
-            dispatches: [dispatch, dispatch],
-            drained: 1,
-          });
-          expect(await fixture.activeRequestClients()).toHaveLength(0);
+          const pids = await gate.blocked(1);
+          expect(
+            (await fixture.activeRequestClients()).map(({ pid }) => pid),
+          ).toEqual(pids);
+          expect(await fixture.state()).toEqual({ tasks: [], processed: [] });
+          expect(await state()).toEqual({ dispatches: [], drained: 0 });
           expect(ended).toBe(false);
-          await control("/publisher/release");
-          const recovered = await redispatched;
-          expect(recovered.status, recovered.body).toBe(200);
-          expect(JSON.parse(recovered.body)).toEqual(receipt);
+
+          await gate.release();
+          await poll(
+            "dispatch headers and prefix with the response tail withheld",
+            state,
+            (value) => value.dispatches.length === 1,
+          );
+          const receipt = { taskId: "1" };
+          const dispatch = { ...receipt, taskName: "publisher_contract" };
           expect(await state()).toEqual({
-            dispatches: [dispatch, dispatch],
-            drained: 2,
+            dispatches: [dispatch],
+            drained: 0,
           });
-        }
-        expect(await fixture.state()).toEqual(committed);
-        expect(await sequence()).toEqual([
-          { last_value: "1", is_called: true },
-        ]);
-        await fixture.waitForIdle();
-      }, 10_000);
+          if (future)
+            expect(Date.now()).toBeLessThan(availableFromMs as number);
+          await fixture.waitForClientExit(pids);
+          expect(await fixture.activeRequestClients()).toHaveLength(0);
+          const committed = {
+            tasks: [
+              {
+                task_id: "1",
+                task_name: "publisher_contract",
+                task_unique_key: null,
+                payload_json: JSON.stringify(['hello "🦀"\n', [1, 2, 3]]),
+                callback_id: null,
+                lease_worker_id: null,
+                available_from_unix_ms: future ? String(availableFromMs) : null,
+              },
+            ],
+            processed: [],
+          };
+          expect(await fixture.state()).toEqual(committed);
+          expect(await sequence()).toEqual([
+            { last_value: "1", is_called: true },
+          ]);
+          expect(ended).toBe(false);
+
+          await control("/publisher/release");
+          const result = await response;
+          expect(result.status, result.body).toBe(status);
+          expect(JSON.parse(result.body)).toEqual(
+            status === 200
+              ? receipt
+              : {
+                  stage: "dispatch",
+                  receipt,
+                  error: "PostgreSQL publisher failed at dispatch",
+                },
+          );
+          expect(result.body).not.toContain("fixture-secret");
+          expect(await state()).toEqual({ dispatches: [dispatch], drained: 1 });
+          expect(await fixture.state()).toEqual(committed);
+
+          if (status === 503) {
+            await control("/publisher/response", { status: 200 });
+            // Recover from the typed error's receipt, not a fresh publication.
+            const retained = JSON.parse(result.body).receipt;
+            ended = false;
+            const redispatched = consume(
+              "/publisher/redispatch",
+              retained,
+            ).finally(() => {
+              ended = true;
+            });
+            await poll(
+              "explicit redispatch of the retained ID",
+              state,
+              (value) => value.dispatches.length === 2,
+            );
+            expect(await state()).toEqual({
+              dispatches: [dispatch, dispatch],
+              drained: 1,
+            });
+            expect(await fixture.activeRequestClients()).toHaveLength(0);
+            expect(ended).toBe(false);
+            await control("/publisher/release");
+            const recovered = await redispatched;
+            expect(recovered.status, recovered.body).toBe(200);
+            expect(JSON.parse(recovered.body)).toEqual(receipt);
+            expect(await state()).toEqual({
+              dispatches: [dispatch, dispatch],
+              drained: 2,
+            });
+          }
+          expect(await fixture.state()).toEqual(committed);
+          expect(await sequence()).toEqual([
+            { last_value: "1", is_called: true },
+          ]);
+          await fixture.waitForIdle();
+        }, 10_000);
+      }
     }
   });
 }

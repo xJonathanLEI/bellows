@@ -69,8 +69,9 @@ impl PostgresProcessorConfig {
 /// Unknown names return 404 without acquisition; claims still check the persisted definition name.
 /// The synchronous callback reads bindings only after validation. Construction performs no I/O.
 /// If configuration fails before returning, it owns its partially created resources.
-/// Connections are never retained between requests. HTTP 200 means an attempt ended, not task
-/// success. This does not extend request lifetime, retry tasks, or recover from wasm traps.
+/// Connections are never retained between requests. HTTP 200 reports `nextAction`: `done` or
+/// `retryAt` with absolute Unix `atMs`, not business success. Uncertain runtime outcomes return
+/// a sanitized HTTP 500. This does not extend request lifetime, retry tasks, or recover from wasm traps.
 pub struct PostgresProcessor<C> {
     configure: C,
 }

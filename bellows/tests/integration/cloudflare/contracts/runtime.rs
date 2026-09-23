@@ -10,8 +10,9 @@ use std::{
 };
 
 use bellows::{
-    PublishActivationStrategy, PublishDispatchToken, PublishTrigger, TaskDefinition,
-    TaskExecutionBackend, TaskFailure, TaskResult, TaskSuccess, Worker, WorkerFactory,
+    PublishActivationStrategy, PublishDispatchToken, PublishTrigger, TaskAttemptOutcome,
+    TaskDefinition, TaskExecutionBackend, TaskFailure, TaskResult, TaskSuccess, Worker,
+    WorkerFactory,
     backends::{
         ClaimTaskError, ClaimedTask, FailTaskError, FailedTask, FinishTaskError, FinishedTask,
         RenewTaskError, RenewedTaskLease,
@@ -214,11 +215,11 @@ pub async fn run(mode: &str) -> Value {
     let factory = Factory(signals.clone());
     let before = Instant::now();
     worker::wasm_bindgen_futures::spawn_local(async move {
-        run_task_once(backend, factory, 42, PublishDispatchToken::Task(7)).await;
-        send.send(()).unwrap();
+        let outcome = run_task_once(backend, factory, 42, PublishDispatchToken::Task(7)).await;
+        send.send(outcome).unwrap();
     });
     if mode == "no-claim" {
-        done.await.unwrap();
+        assert_eq!(done.await.unwrap(), TaskAttemptOutcome::Done);
         assert_eq!(signals.builds.load(Ordering::SeqCst), 0);
     } else {
         take(&signals.started).await;
@@ -252,7 +253,21 @@ pub async fn run(mode: &str) -> Value {
             ));
             signals.record.add_permits(1);
         }
-        done.await.unwrap();
+        let outcome = done.await.unwrap();
+        if mode == "fail" {
+            assert!(
+                matches!(outcome, TaskAttemptOutcome::RetryAt { available_from } if available_from <= Instant::now())
+            );
+        } else {
+            assert_eq!(
+                outcome,
+                if successful_renewal {
+                    TaskAttemptOutcome::Done
+                } else {
+                    TaskAttemptOutcome::Retry
+                }
+            );
+        }
         if !successful_renewal && !mode.ends_with("-completed") {
             // Await actual destruction of the spawned future, not just run_task_once's return.
             take(&signals.dropped).await;

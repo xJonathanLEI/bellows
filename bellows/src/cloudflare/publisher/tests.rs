@@ -87,6 +87,7 @@ struct State {
     status: u16,
     events: Mutex<Vec<&'static str>>,
     publications: Mutex<Vec<(String, Value)>>,
+    deadlines: Mutex<Vec<Option<Instant>>>,
     names: Mutex<Vec<String>>,
     requests: Mutex<Vec<Request<String>>>,
     publish_gate: Option<Arc<Semaphore>>,
@@ -105,6 +106,7 @@ impl Default for State {
             status: 200,
             events: Mutex::default(),
             publications: Mutex::default(),
+            deadlines: Mutex::default(),
             names: Mutex::default(),
             requests: Mutex::default(),
             publish_gate: None,
@@ -148,6 +150,33 @@ impl TaskPublishingBackend for Publishing {
         T: TaskDefinition,
         T::Trigger: PublishActivationStrategy,
     {
+        self.record::<T>(payload, None).await
+    }
+
+    async fn publish_future<T>(
+        &self,
+        payload: <T::Trigger as PublishActivationStrategy>::Payload,
+        available_from: Instant,
+    ) -> Result<PublishedTask, PublishTaskError>
+    where
+        T: TaskDefinition,
+        T::Trigger: PublishActivationStrategy,
+    {
+        self.record::<T>(payload, Some(available_from)).await
+    }
+}
+
+impl Publishing {
+    async fn record<T>(
+        &self,
+        payload: <T::Trigger as PublishActivationStrategy>::Payload,
+        available_from: Option<Instant>,
+    ) -> Result<PublishedTask, PublishTaskError>
+    where
+        T: TaskDefinition,
+        T::Trigger: PublishActivationStrategy,
+    {
+        self.0.deadlines.lock().unwrap().push(available_from);
         self.0.event("publish");
         wait(&self.0.publish_gate).await;
         let payload = serde_json::to_value(payload)
@@ -161,18 +190,6 @@ impl TaskPublishingBackend for Publishing {
             .fail(Fault::Publication)
             .map_err(PublishTaskError::Backend)?;
         Ok(PublishedTask { task_id: self.0.id })
-    }
-
-    async fn publish_future<T>(
-        &self,
-        _payload: <T::Trigger as PublishActivationStrategy>::Payload,
-        _available_from: Instant,
-    ) -> Result<PublishedTask, PublishTaskError>
-    where
-        T: TaskDefinition,
-        T::Trigger: PublishActivationStrategy,
-    {
-        panic!("must publish immediately")
     }
 }
 
@@ -326,255 +343,312 @@ fn assert_dispatch(state: &State, name: &str, id: &str) {
 
 #[tokio::test]
 async fn construction_is_inert_and_publication_forwards_the_bound_task_and_payload() {
-    let _logs = tracing::subscriber::set_default(NoLogs);
-    let state = Arc::new(State::default());
-    let publisher = harness::<Task>(vec![state.clone()]);
-    assert!(state.events.lock().unwrap().is_empty());
-    let receipt = publish(&publisher, payload("Ada")).await.unwrap();
-    assert_eq!(receipt.task_id, "17");
-    assert_eq!(
-        *state.publications.lock().unwrap(),
-        [(Task::NAME.into(), json!({ "name": "Ada" }))]
-    );
-    assert_dispatch(&state, Task::NAME, "17");
-    assert_eq!(
-        *state.events.lock().unwrap(),
-        [
-            "configure",
-            "acquire",
-            "publish",
-            "close",
-            "closed",
-            "lookup",
-            "dispatch",
-            "body-start",
-            "body-end"
-        ]
-    );
+    for available_from in [
+        None,
+        Some(Instant::now() + std::time::Duration::from_secs(3600)),
+    ] {
+        let _logs = tracing::subscriber::set_default(NoLogs);
+        let state = Arc::new(State::default());
+        let publisher = harness::<Task>(vec![state.clone()]);
+        assert!(state.events.lock().unwrap().is_empty());
+        let receipt = publish(&publisher, payload("Ada"), available_from)
+            .await
+            .unwrap();
+        assert_eq!(receipt.task_id, "17");
+        assert_eq!(
+            *state.publications.lock().unwrap(),
+            [(Task::NAME.into(), json!({ "name": "Ada" }))]
+        );
+        assert_dispatch(&state, Task::NAME, "17");
+        assert_eq!(*state.deadlines.lock().unwrap(), [available_from]);
+        assert_eq!(
+            *state.events.lock().unwrap(),
+            [
+                "configure",
+                "acquire",
+                "publish",
+                "close",
+                "closed",
+                "lookup",
+                "dispatch",
+                "body-start",
+                "body-end"
+            ]
+        );
+    }
 }
 
 #[tokio::test]
 async fn unit_payload_is_plain_publication() {
-    let state = Arc::new(State::default());
-    let publisher = harness::<UnitTask>(vec![state.clone()]);
-    assert_eq!(publish(&publisher, ()).await.unwrap().task_id, "17");
-    assert_dispatch(&state, UnitTask::NAME, "17");
-    assert_eq!(
-        *state.publications.lock().unwrap(),
-        [(UnitTask::NAME.into(), Value::Null)]
-    );
-    assert_eq!(state.count("close"), 1);
+    for available_from in [
+        None,
+        Some(Instant::now() + std::time::Duration::from_secs(3600)),
+    ] {
+        let state = Arc::new(State::default());
+        let publisher = harness::<UnitTask>(vec![state.clone()]);
+        assert_eq!(
+            publish(&publisher, (), available_from)
+                .await
+                .unwrap()
+                .task_id,
+            "17"
+        );
+        assert_dispatch(&state, UnitTask::NAME, "17");
+        assert_eq!(
+            *state.publications.lock().unwrap(),
+            [(UnitTask::NAME.into(), Value::Null)]
+        );
+        assert_eq!(state.count("close"), 1);
+    }
 }
 
 #[tokio::test]
 async fn safe_ids_dispatch_exactly() {
-    for id in [1, 9_007_199_254_740_991] {
-        let state = Arc::new(State {
-            id,
-            ..State::default()
-        });
-        let publisher = harness::<Task>(vec![state.clone()]);
-        let receipt = publish(&publisher, payload("Ada")).await.unwrap();
-        assert_eq!(receipt.task_id, id.to_string());
-        assert_dispatch(&state, Task::NAME, &receipt.task_id);
+    for available_from in [
+        None,
+        Some(Instant::now() + std::time::Duration::from_secs(3600)),
+    ] {
+        for id in [1, 9_007_199_254_740_991] {
+            let state = Arc::new(State {
+                id,
+                ..State::default()
+            });
+            let publisher = harness::<Task>(vec![state.clone()]);
+            let receipt = publish(&publisher, payload("Ada"), available_from)
+                .await
+                .unwrap();
+            assert_eq!(receipt.task_id, id.to_string());
+            assert_dispatch(&state, Task::NAME, &receipt.task_id);
+        }
     }
 }
 
 #[tokio::test]
 async fn unsupported_ids_retain_exact_receipts_close_once_and_never_dispatch() {
-    for id in [
-        0,
-        9_007_199_254_740_992,
-        9_007_199_254_740_993,
-        9_223_372_036_854_775_807,
-        u64::MAX,
+    for available_from in [
+        None,
+        Some(Instant::now() + std::time::Duration::from_secs(3600)),
     ] {
-        let state = Arc::new(State {
-            id,
-            ..State::default()
-        });
-        let publisher = harness::<Task>(vec![state.clone()]);
-        let error = publish(&publisher, payload("Ada")).await.unwrap_err();
-        assert_error(
-            &error,
-            PostgresPublisherStage::TaskId,
-            Some(&id.to_string()),
-        );
-        assert!(error.backend_close_error.is_none());
-        assert_eq!(state.count("publish"), 1);
-        assert_eq!(state.count("close"), 1);
-        assert_eq!(state.count("lookup"), 0);
+        for id in [
+            0,
+            9_007_199_254_740_992,
+            9_007_199_254_740_993,
+            9_223_372_036_854_775_807,
+            u64::MAX,
+        ] {
+            let state = Arc::new(State {
+                id,
+                ..State::default()
+            });
+            let publisher = harness::<Task>(vec![state.clone()]);
+            let error = publish(&publisher, payload("Ada"), available_from)
+                .await
+                .unwrap_err();
+            assert_error(
+                &error,
+                PostgresPublisherStage::TaskId,
+                Some(&id.to_string()),
+            );
+            assert!(error.backend_close_error.is_none());
+            assert_eq!(state.count("publish"), 1);
+            assert_eq!(state.count("close"), 1);
+            assert_eq!(state.count("lookup"), 0);
+        }
     }
 }
 
 #[tokio::test]
 async fn publication_close_and_full_success_or_error_body_are_awaited_in_order() {
-    for status in [200, 503] {
-        let publication = Arc::new(Semaphore::new(0));
-        let close = Arc::new(Semaphore::new(0));
-        let body = Arc::new(Semaphore::new(0));
-        let state = Arc::new(State {
-            status,
-            publish_gate: Some(publication.clone()),
-            close_gate: Some(close.clone()),
-            body_gate: Some(body.clone()),
-            ..State::default()
-        });
-        let publisher = harness::<Task>(vec![state.clone()]);
-        let mut operation = pin!(publish(&publisher, payload("Ada")));
-        assert_pending(operation.as_mut()).await;
-        assert_eq!(state.count("publish"), 1);
-        assert_eq!(state.count("close"), 0);
-        assert_eq!(state.count("dispatch"), 0);
-        publication.add_permits(1);
-        assert_pending(operation.as_mut()).await;
-        assert_eq!(state.count("close"), 1);
-        assert_eq!(state.count("dispatch"), 0);
-        close.add_permits(1);
-        assert_pending(operation.as_mut()).await;
-        assert_eq!(state.count("closed"), 1);
-        assert_eq!(state.count("dispatch"), 1);
-        assert_eq!(state.count("body-start"), 1);
-        assert_eq!(state.count("body-end"), 0);
-        body.add_permits(1);
-        let result = operation.await;
-        if status == 200 {
-            assert_eq!(result.unwrap().task_id, "17");
-        } else {
-            let error = result.unwrap_err();
-            assert_error(&error, PostgresPublisherStage::Dispatch, Some("17"));
-            assert_eq!(
-                error.cause.to_string(),
-                format!(
-                    "task dispatcher returned HTTP 503: {}",
-                    &response_body()[..500]
-                )
-            );
-            assert!(error.backend_close_error.is_none());
+    for available_from in [
+        None,
+        Some(Instant::now() + std::time::Duration::from_secs(3600)),
+    ] {
+        for status in [200, 503] {
+            let publication = Arc::new(Semaphore::new(0));
+            let close = Arc::new(Semaphore::new(0));
+            let body = Arc::new(Semaphore::new(0));
+            let state = Arc::new(State {
+                status,
+                publish_gate: Some(publication.clone()),
+                close_gate: Some(close.clone()),
+                body_gate: Some(body.clone()),
+                ..State::default()
+            });
+            let publisher = harness::<Task>(vec![state.clone()]);
+            let mut operation = pin!(publish(&publisher, payload("Ada"), available_from));
+            assert_pending(operation.as_mut()).await;
+            assert_eq!(state.count("publish"), 1);
+            assert_eq!(state.count("close"), 0);
+            assert_eq!(state.count("dispatch"), 0);
+            publication.add_permits(1);
+            assert_pending(operation.as_mut()).await;
+            assert_eq!(state.count("close"), 1);
+            assert_eq!(state.count("dispatch"), 0);
+            close.add_permits(1);
+            assert_pending(operation.as_mut()).await;
+            assert_eq!(state.count("closed"), 1);
+            assert_eq!(state.count("dispatch"), 1);
+            assert_eq!(state.count("body-start"), 1);
+            assert_eq!(state.count("body-end"), 0);
+            body.add_permits(1);
+            let result = operation.await;
+            if status == 200 {
+                assert_eq!(result.unwrap().task_id, "17");
+            } else {
+                let error = result.unwrap_err();
+                assert_error(&error, PostgresPublisherStage::Dispatch, Some("17"));
+                assert_eq!(
+                    error.cause.to_string(),
+                    format!(
+                        "task dispatcher returned HTTP 503: {}",
+                        &response_body()[..500]
+                    )
+                );
+                assert!(error.backend_close_error.is_none());
+            }
+            assert_eq!(state.count("body-end"), 1);
+            assert_eq!(state.count("publish"), 1);
+            assert_eq!(state.count("close"), 1);
+            assert_dispatch(&state, Task::NAME, "17");
         }
-        assert_eq!(state.count("body-end"), 1);
-        assert_eq!(state.count("publish"), 1);
-        assert_eq!(state.count("close"), 1);
-        assert_dispatch(&state, Task::NAME, "17");
     }
 }
 
 #[tokio::test]
 async fn failures_preserve_sources_receipts_and_cleanup_without_logging() {
-    use PostgresPublisherStage::*;
-    let _logs = tracing::subscriber::set_default(NoLogs);
-    for (fault, stage, acquired, known) in [
-        (Fault::Configuration, Configuration, false, false),
-        (Fault::Acquisition, Acquisition, false, false),
-        (Fault::Publication, Publication, true, false),
-        (Fault::Close, BackendClose, true, true),
-        (Fault::Lookup, Dispatch, true, true),
-        (Fault::Fetch, Dispatch, true, true),
-        (Fault::Body, Dispatch, true, true),
+    for available_from in [
+        None,
+        Some(Instant::now() + std::time::Duration::from_secs(3600)),
     ] {
-        let state = Arc::new(State {
-            fault: Some(fault),
-            ..State::default()
-        });
-        let publisher = harness::<Task>(vec![state.clone()]);
-        let error = publish(&publisher, payload("Ada")).await.unwrap_err();
-        assert_error(&error, stage, known.then_some("17"));
-        let cause = if fault == Fault::Publication {
-            error
-                .cause
-                .downcast_ref::<PublishTaskError>()
-                .unwrap()
-                .source()
-                .unwrap()
-        } else {
-            error.cause.as_ref()
-        };
-        assert_eq!(cause.downcast_ref::<Cause>().unwrap().0, fault);
-        assert!(error.backend_close_error.is_none());
-        assert_eq!(state.count("configure"), 1);
-        assert_eq!(state.count("publish"), usize::from(acquired));
-        assert_eq!(state.count("close"), usize::from(acquired));
-        assert_eq!(state.count("lookup"), usize::from(stage == Dispatch));
+        use PostgresPublisherStage::*;
+        let _logs = tracing::subscriber::set_default(NoLogs);
+        for (fault, stage, acquired, known) in [
+            (Fault::Configuration, Configuration, false, false),
+            (Fault::Acquisition, Acquisition, false, false),
+            (Fault::Publication, Publication, true, false),
+            (Fault::Close, BackendClose, true, true),
+            (Fault::Lookup, Dispatch, true, true),
+            (Fault::Fetch, Dispatch, true, true),
+            (Fault::Body, Dispatch, true, true),
+        ] {
+            let state = Arc::new(State {
+                fault: Some(fault),
+                ..State::default()
+            });
+            let publisher = harness::<Task>(vec![state.clone()]);
+            let error = publish(&publisher, payload("Ada"), available_from)
+                .await
+                .unwrap_err();
+            assert_error(&error, stage, known.then_some("17"));
+            let cause = if fault == Fault::Publication {
+                error
+                    .cause
+                    .downcast_ref::<PublishTaskError>()
+                    .unwrap()
+                    .source()
+                    .unwrap()
+            } else {
+                error.cause.as_ref()
+            };
+            assert_eq!(cause.downcast_ref::<Cause>().unwrap().0, fault);
+            assert!(error.backend_close_error.is_none());
+            assert_eq!(state.count("configure"), 1);
+            assert_eq!(state.count("publish"), usize::from(acquired));
+            assert_eq!(state.count("close"), usize::from(acquired));
+            assert_eq!(state.count("lookup"), usize::from(stage == Dispatch));
+        }
     }
 }
 
 #[tokio::test]
 async fn serialization_failure_is_an_unknown_publication_outcome() {
-    let state = Arc::new(State::default());
-    let publisher = harness::<BadTask>(vec![state.clone()]);
-    let error = publish(&publisher, BadPayload).await.unwrap_err();
-    assert_error(&error, PostgresPublisherStage::Publication, None);
-    let source = error
-        .cause
-        .downcast_ref::<PublishTaskError>()
-        .unwrap()
-        .source()
-        .unwrap();
-    assert_eq!(
-        source
-            .downcast_ref::<serde_json::Error>()
+    for available_from in [
+        None,
+        Some(Instant::now() + std::time::Duration::from_secs(3600)),
+    ] {
+        let state = Arc::new(State::default());
+        let publisher = harness::<BadTask>(vec![state.clone()]);
+        let error = publish(&publisher, BadPayload, available_from)
+            .await
+            .unwrap_err();
+        assert_error(&error, PostgresPublisherStage::Publication, None);
+        let source = error
+            .cause
+            .downcast_ref::<PublishTaskError>()
             .unwrap()
-            .to_string(),
-        SECRET
-    );
-    assert_eq!(state.count("publish"), 1);
-    assert_eq!(state.count("close"), 1);
-    assert_eq!(state.count("lookup"), 0);
-}
-
-#[tokio::test]
-async fn primary_publication_and_id_failures_survive_a_later_close_failure() {
-    for id in [17, 9_007_199_254_740_993] {
-        let close = Arc::new(Semaphore::new(0));
-        let state = Arc::new(State {
-            id,
-            fault: (id == 17).then_some(Fault::Publication),
-            close_failure: true,
-            close_gate: Some(close.clone()),
-            ..State::default()
-        });
-        let publisher = harness::<Task>(vec![state.clone()]);
-        let mut operation = pin!(publish(&publisher, payload("Ada")));
-        assert_pending(operation.as_mut()).await;
-        assert_eq!(state.count("close"), 1);
-        assert_eq!(state.count("lookup"), 0);
-        close.add_permits(1);
-        let error = operation.await.unwrap_err();
-        if id == 17 {
-            assert_error(&error, PostgresPublisherStage::Publication, None);
-            let source = error
-                .cause
-                .downcast_ref::<PublishTaskError>()
-                .unwrap()
-                .source()
-                .unwrap();
-            assert_eq!(
-                source.downcast_ref::<Cause>().unwrap().0,
-                Fault::Publication
-            );
-        } else {
-            assert_error(
-                &error,
-                PostgresPublisherStage::TaskId,
-                Some("9007199254740993"),
-            );
-            assert_eq!(
-                error.cause.to_string(),
-                "task ID must be a canonical positive safe integer"
-            );
-        }
+            .source()
+            .unwrap();
         assert_eq!(
-            error
-                .backend_close_error
+            source
+                .downcast_ref::<serde_json::Error>()
                 .unwrap()
-                .downcast_ref::<Cause>()
-                .unwrap()
-                .0,
-            Fault::Close
+                .to_string(),
+            SECRET
         );
         assert_eq!(state.count("publish"), 1);
         assert_eq!(state.count("close"), 1);
         assert_eq!(state.count("lookup"), 0);
+    }
+}
+
+#[tokio::test]
+async fn primary_publication_and_id_failures_survive_a_later_close_failure() {
+    for available_from in [
+        None,
+        Some(Instant::now() + std::time::Duration::from_secs(3600)),
+    ] {
+        for id in [17, 9_007_199_254_740_993] {
+            let close = Arc::new(Semaphore::new(0));
+            let state = Arc::new(State {
+                id,
+                fault: (id == 17).then_some(Fault::Publication),
+                close_failure: true,
+                close_gate: Some(close.clone()),
+                ..State::default()
+            });
+            let publisher = harness::<Task>(vec![state.clone()]);
+            let mut operation = pin!(publish(&publisher, payload("Ada"), available_from));
+            assert_pending(operation.as_mut()).await;
+            assert_eq!(state.count("close"), 1);
+            assert_eq!(state.count("lookup"), 0);
+            close.add_permits(1);
+            let error = operation.await.unwrap_err();
+            if id == 17 {
+                assert_error(&error, PostgresPublisherStage::Publication, None);
+                let source = error
+                    .cause
+                    .downcast_ref::<PublishTaskError>()
+                    .unwrap()
+                    .source()
+                    .unwrap();
+                assert_eq!(
+                    source.downcast_ref::<Cause>().unwrap().0,
+                    Fault::Publication
+                );
+            } else {
+                assert_error(
+                    &error,
+                    PostgresPublisherStage::TaskId,
+                    Some("9007199254740993"),
+                );
+                assert_eq!(
+                    error.cause.to_string(),
+                    "task ID must be a canonical positive safe integer"
+                );
+            }
+            assert_eq!(
+                error
+                    .backend_close_error
+                    .unwrap()
+                    .downcast_ref::<Cause>()
+                    .unwrap()
+                    .0,
+                Fault::Close
+            );
+            assert_eq!(state.count("publish"), 1);
+            assert_eq!(state.count("close"), 1);
+            assert_eq!(state.count("lookup"), 0);
+        }
     }
 }
 
@@ -593,8 +667,9 @@ async fn concurrent_and_sequential_calls_keep_scopes_connections_receipts_and_fa
         })
         .collect();
     let publisher = harness::<Task>(states.clone());
-    let mut first = pin!(publish(&publisher, payload("first")));
-    let mut second = pin!(publish(&publisher, payload("second")));
+    let deadline = Instant::now() + std::time::Duration::from_secs(3600);
+    let mut first = pin!(publish(&publisher, payload("first"), None));
+    let mut second = pin!(publish(&publisher, payload("second"), Some(deadline)));
     assert_pending(first.as_mut()).await;
     assert_pending(second.as_mut()).await;
     states[1].close_gate.as_ref().unwrap().add_permits(1);
@@ -608,10 +683,17 @@ async fn concurrent_and_sequential_calls_keep_scopes_connections_receipts_and_fa
     );
     states[2].close_gate.as_ref().unwrap().add_permits(1);
     assert_eq!(
-        publish(&publisher, payload("third")).await.unwrap().task_id,
+        publish(&publisher, payload("third"), None)
+            .await
+            .unwrap()
+            .task_id,
         "3"
     );
     for (i, name) in ["first", "second", "third"].into_iter().enumerate() {
+        assert_eq!(
+            *states[i].deadlines.lock().unwrap(),
+            [if i == 1 { Some(deadline) } else { None }]
+        );
         assert_eq!(states[i].count("configure"), 1);
         assert_eq!(states[i].count("acquire"), 1);
         assert_eq!(states[i].count("publish"), 1);

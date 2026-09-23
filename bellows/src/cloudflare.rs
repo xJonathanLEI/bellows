@@ -1,7 +1,9 @@
 //! Cloudflare PostgreSQL publication, dispatch, and processing with TypeScript-compatible IDs.
 //!
-//! Keep one [`RetainedTaskDispatcher`] per Durable Object. It acknowledges early and suppresses
-//! duplicates until the processor response is consumed. A response ends an attempt, not necessarily successfully.
+//! Keep one [`RetainedTaskDispatcher`] per SQLite-backed Durable Object, using the named object
+//! `global`. Dispatch launches with in-memory tracking before checking the warming alarm; active same-ID duplicates
+//! cannot change routing and remain suppressed through full response consumption and result persistence.
+//! A pending ID can be explicitly redispatched immediately with a corrected name.
 //! Generic dispatch accepts opaque IDs; the wasm `sdk::PostgresPublisher` and
 //! `sdk::PostgresProcessor` delegates require canonical positive decimal IDs up to 9007199254740991.
 //!
@@ -15,7 +17,9 @@
 //! Applications own HTTP endpoints, business validation, and side-effect clients. Direct
 //! `PostgresPublishingBackend` plus [`dispatch_task`] remains a caller-managed alternative.
 //!
-//! Both dispatch hops require `{ taskId, taskName }`, never a payload. The processor selects a typed
+//! `publish_future` records availability but dispatches immediately so PostgreSQL supplies the hint.
+//! Both dispatch hops require only `{ taskId, taskName }`, never payloads or scheduling metadata.
+//! The processor selects a typed
 //! registration by exact definition name; names must be non-empty and unique within the registry.
 //! Unknown names return 404 without acquisition; the database claim still checks both ID and name.
 //! The processor validates before calling your synchronous environment-to-config callback. For a
@@ -23,9 +27,18 @@
 //! backend shutdown. Applications still own business resources. Use `PostgresExecutionBackend` with
 //! [`crate::run_task_once`] for lower-level integrations with caller-owned cleanup.
 //!
-//! State is in-memory; the 30-second heartbeat provides no lease renewal, retry, or eviction recovery.
-//! Publication gaps and rediscovery remain application concerns. Publication and dispatch are not
-//! atomic; there is no automatic republishing, callback delivery, future-request scheduling, or
+//! Only a successful, fully consumed, matching-ID `nextAction: { type: "done" }` deletes tracking.
+//! `retryAt` with absolute Unix `atMs` persists the hint and resets infrastructure backoff; HTTP 200
+//! describes a known action, not business success. Invalid responses and transport/body failures
+//! retry with exponential backoff from one to thirty seconds, in memory until a hint is persisted.
+//! One alarm selects the earliest pending/60-second watchdog deadline or independent 30-second
+//! heartbeat. Every due distinct ID launches without a Bellows concurrency cap, subject to platform
+//! limits. The watchdog applies to scheduled attempts, not unsaved external dispatches.
+//! Watchdog supersession ignores stale responses but does not guarantee business cancellation.
+//! PostgreSQL remains the execution/lease authority; renewed leases can move hints later.
+//! Durability starts when a scheduling hint is persisted. Earlier loss requires application recovery, with no PostgreSQL
+//! discovery or Cron. Alarms and attempts are at-least-once, not exactly-once side effects.
+//! Publication and dispatch are not atomic; there is no automatic republishing, callback delivery, or
 //! application-transaction participation. Await delegate calls within requests; ordinary error
 //! paths await shutdown, but future cancellation, abrupt termination, and wasm traps cannot guarantee it.
 //!
@@ -52,11 +65,17 @@ mod processor;
 #[cfg(any(target_arch = "wasm32", test))]
 mod publisher;
 
+mod scheduler;
+use scheduler::HEARTBEAT_INTERVAL_MS;
+pub use scheduler::{
+    DispatcherState, DispatcherStorage, DispatcherTask, ScheduleUpdate, SchedulerMetadata,
+    TaskSchedule,
+};
+
 const DISPATCHER_NAME: &str = "global";
 const DISPATCH_URL: &str = "https://dispatcher/dispatch";
 const PROCESSOR_URL: &str = "https://processor/process";
 const MAX_TASK_ID_LENGTH: usize = 200;
-const HEARTBEAT_INTERVAL_MS: i64 = 30_000;
 const MAX_ERROR_LENGTH: usize = 500;
 const INVALID_TASK_ID: &str = "taskId must be a non-empty string no longer than 200 characters";
 const INVALID_TASK_NAME: &str = "taskName must be a non-empty string";
@@ -76,6 +95,59 @@ pub trait ProcessorFetcher: Send + Sync + 'static {
     ) -> impl Future<Output = Result<Response<TextBody>, BoxDispatchError>> + Send;
 }
 
+fn deserialize_timestamp<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<i64, D::Error> {
+    let value = <f64 as serde::Deserialize>::deserialize(deserializer)?;
+    if !value.is_finite()
+        || value.fract() != 0.0
+        || !(0.0..=scheduler::MAX_DATE_MS as f64).contains(&value)
+    {
+        return Err(serde::de::Error::custom("invalid timestamp"));
+    }
+    Ok(value as i64)
+}
+
+#[derive(serde::Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
+enum NextAction {
+    Done,
+    RetryAt {
+        #[serde(rename = "atMs", deserialize_with = "deserialize_timestamp")]
+        at_ms: i64,
+    },
+}
+
+async fn processor_action(
+    response: Response<TextBody>,
+    task_id: &str,
+) -> Result<NextAction, BoxDispatchError> {
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct Envelope {
+        task_id: String,
+        next_action: NextAction,
+    }
+    let status = response.status();
+    let body = response.into_body().await?;
+    if !status.is_success() {
+        return Err(format!(
+            "task processor returned HTTP {}: {}",
+            status.as_u16(),
+            truncate_text(&body, MAX_ERROR_LENGTH)
+        )
+        .into());
+    }
+    let envelope: Envelope = serde_json::from_str(&body)
+        .map_err(|_| BoxDispatchError::from("invalid processor next action"))?;
+    if envelope.task_id != task_id
+        || matches!(envelope.next_action, NextAction::RetryAt { at_ms } if !scheduler::timestamp(at_ms))
+    {
+        return Err("invalid processor next action".into());
+    }
+    Ok(envelope.next_action)
+}
+
 fn validate_task_name(task_name: &str) -> Result<(), BoxDispatchError> {
     if task_name.is_empty() {
         Err(INVALID_TASK_NAME.into())
@@ -89,15 +161,6 @@ pub trait DurableObjectNamespaceLike {
     type Stub: ProcessorFetcher;
 
     fn get_by_name(&self, name: &str) -> Result<Self::Stub, BoxDispatchError>;
-}
-
-/// Alarm storage with **absolute Unix millisecond timestamps**, not relative offsets.
-pub trait AlarmStorage {
-    fn get_alarm(&self) -> impl Future<Output = Result<Option<i64>, BoxDispatchError>> + Send;
-    fn set_alarm(
-        &self,
-        alarm_time: i64,
-    ) -> impl Future<Output = Result<(), BoxDispatchError>> + Send;
 }
 
 /// Dispatches a definition's exact name and an opaque ID of 1–200 UTF-16 units to object `global`.
@@ -122,23 +185,31 @@ pub async fn dispatch_task(
 }
 
 struct RetainedAttempt {
-    token: Arc<()>,
+    task: Arc<DispatcherTask>,
     // Holding a handle alone does not execute a future: platform::spawn drives it separately.
     _handle: Option<platform::JoinHandle<()>>,
 }
 
 type InFlight = Arc<Mutex<HashMap<String, RetainedAttempt>>>;
 
-/// An in-memory registry of concurrent processor requests, deduplicated through body consumption.
-/// Native panics release IDs; wasm traps are not recoverable.
+/// In-memory dispatch and outcome-driven durable scheduling with unrestricted fan-out.
+/// Dispatch only checks/repairs the warming alarm; it never persists task acceptance.
+/// Uncertainty backs off in memory until a hint is saved. A sixty-second watchdog recovers
+/// scheduled attempts. Superseding transport does not imply cancellation of business work.
 pub struct RetainedTaskDispatcher<S, P> {
+    core: Arc<DispatcherCore<S, P>>,
+}
+
+struct DispatcherCore<S, P> {
     storage: S,
     processor: Arc<P>,
     in_flight: InFlight,
+    memory_retries: Mutex<HashMap<String, Arc<DispatcherTask>>>,
+    bookkeeping: tokio::sync::Mutex<()>,
     now: fn() -> i64,
 }
 
-impl<S: AlarmStorage, P: ProcessorFetcher> RetainedTaskDispatcher<S, P> {
+impl<S: DispatcherStorage, P: ProcessorFetcher> RetainedTaskDispatcher<S, P> {
     pub fn new(storage: S, processor: P) -> Self {
         Self::with_clock(storage, processor, unix_ms)
     }
@@ -146,10 +217,14 @@ impl<S: AlarmStorage, P: ProcessorFetcher> RetainedTaskDispatcher<S, P> {
     /// Constructs a delegate with an absolute Unix millisecond clock, for deterministic tests.
     pub fn with_clock(storage: S, processor: P, now: fn() -> i64) -> Self {
         Self {
-            storage,
-            processor: Arc::new(processor),
-            in_flight: Arc::default(),
-            now,
+            core: Arc::new(DispatcherCore {
+                storage,
+                processor: Arc::new(processor),
+                in_flight: Arc::default(),
+                memory_retries: Mutex::default(),
+                bookkeeping: tokio::sync::Mutex::new(()),
+                now,
+            }),
         }
     }
 
@@ -171,11 +246,83 @@ impl<S: AlarmStorage, P: ProcessorFetcher> RetainedTaskDispatcher<S, P> {
         }
     }
 
-    /// Schedules a heartbeat, even when idle.
+    /// Persists every due transition and the shared alarm before launching any processor request.
     pub async fn alarm(&self) -> Result<(), BoxDispatchError> {
-        self.storage
-            .set_alarm((self.now)() + HEARTBEAT_INTERVAL_MS)
-            .await
+        let core = &self.core;
+        let _lock = core.bookkeeping.lock().await;
+        let now = (core.now)();
+        let in_flight = core.in_flight.clone();
+        let result = core
+            .storage
+            .transaction(Box::new(move |state| {
+                state.validate(now)?;
+                let metadata = state.metadata.as_mut().unwrap();
+                if metadata.next_heartbeat_at_ms <= now {
+                    metadata.next_heartbeat_at_ms = now + HEARTBEAT_INTERVAL_MS;
+                }
+                let due: Vec<_> = state
+                    .tasks
+                    .values()
+                    .filter(|task| task.next_attempt_at_ms <= now)
+                    .map(|task| task.task_id.clone())
+                    .collect();
+                let mut launches = Vec::new();
+                let mut expired = Vec::new();
+                for id in due {
+                    let task = state.tasks.get_mut(&id).unwrap();
+                    if in_flight
+                        .lock()
+                        .unwrap()
+                        .get(&id)
+                        .is_some_and(|active| active.task.attempt_id().is_none())
+                    {
+                        task.next_attempt_at_ms = now + scheduler::ATTEMPT_WATCHDOG_MS;
+                        continue;
+                    }
+                    if let Some(attempt_id) = task.attempt_id() {
+                        expired.push((id, attempt_id));
+                        task.retry(now);
+                    } else {
+                        launches.push(state.start(&id, now)?);
+                    }
+                }
+                Ok((launches, expired))
+            }))
+            .await;
+        match result {
+            Ok((launches, expired)) => {
+                let mut active = core.in_flight.lock().unwrap();
+                for (id, attempt_id) in expired {
+                    if active
+                        .get(&id)
+                        .is_some_and(|attempt| attempt.task.attempt_id() == Some(attempt_id))
+                        && let Some(attempt) = active.remove(&id)
+                        && let Some(handle) = attempt._handle
+                    {
+                        handle.abort();
+                    }
+                }
+                drop(active);
+                for task in launches {
+                    core.launch_processor(task);
+                }
+                Ok(())
+            }
+            Err(error) => {
+                // Re-read durable state rather than replacing a concurrently established earlier alarm.
+                let _ = core
+                    .storage
+                    .transaction(Box::new(move |state| {
+                        state.validate(now)?;
+                        let metadata = state.metadata.as_mut().unwrap();
+                        metadata.next_heartbeat_at_ms =
+                            metadata.next_heartbeat_at_ms.min(now + 1_000);
+                        Ok(())
+                    }))
+                    .await;
+                Err(error)
+            }
+        }
     }
 
     async fn dispatch(
@@ -208,8 +355,33 @@ impl<S: AlarmStorage, P: ProcessorFetcher> RetainedTaskDispatcher<S, P> {
             .ok_or(INVALID_TASK_NAME)?;
         validate_task_name(task_name)?;
 
-        let duplicate = !self.launch_processor(task_name, task_id);
-        self.schedule_heartbeat().await?;
+        let core = &self.core;
+        let now = (core.now)();
+        let failures = core
+            .memory_retries
+            .lock()
+            .unwrap()
+            .get(task_id)
+            .map_or(0, |task| task.infrastructure_failures);
+        let duplicate = !core.launch_processor(DispatcherTask {
+            task_id: task_id.to_owned(),
+            task_name: task_name.to_owned(),
+            next_attempt_at_ms: now,
+            infrastructure_failures: failures,
+            state: TaskSchedule::Pending,
+        });
+        // Launch before storage access. Serialize only the alarm check with other
+        // bookkeeping so heartbeat repair cannot overwrite an earlier task alarm.
+        let _lock = core.bookkeeping.lock().await;
+        let deadline = (core.now)() + HEARTBEAT_INTERVAL_MS;
+        if core
+            .storage
+            .get_alarm()
+            .await?
+            .is_none_or(|alarm| alarm > deadline)
+        {
+            core.storage.set_alarm(deadline).await?;
+        }
         Ok(json_response(
             if duplicate {
                 json!({ "duplicate": true, "ok": true, "taskId": task_id })
@@ -219,89 +391,178 @@ impl<S: AlarmStorage, P: ProcessorFetcher> RetainedTaskDispatcher<S, P> {
             StatusCode::OK,
         ))
     }
+}
 
-    fn launch_processor(&self, task_name: &str, task_id: &str) -> bool {
+impl<S: DispatcherStorage, P: ProcessorFetcher> DispatcherCore<S, P> {
+    fn launch_processor(self: &Arc<Self>, task: DispatcherTask) -> bool {
+        let task_id = task.task_id.clone();
+        let task = Arc::new(task);
         let mut in_flight = self.in_flight.lock().unwrap();
-        if in_flight.contains_key(task_id) {
+        if in_flight.contains_key(&task_id) {
             return false;
         }
-        let token = Arc::new(());
+        self.memory_retries.lock().unwrap().remove(&task_id);
         // Reserve before spawning, including on a multithreaded native executor. Insertion of the
         // handle and cleanup use the same short-lived lock, so immediate completion cannot race it.
         in_flight.insert(
-            task_id.to_owned(),
+            task_id.clone(),
             RetainedAttempt {
-                token: token.clone(),
+                task: task.clone(),
                 _handle: None,
             },
         );
         let mut cleanup = AttemptCleanup {
-            in_flight: self.in_flight.clone(),
-            task_id: task_id.to_owned(),
-            token,
+            core: self.clone(),
+            task_id: task_id.clone(),
+            task: task.clone(),
             observed: false,
         };
         let processor = self.processor.clone();
-        let task_name = task_name.to_owned();
+        let core = self.clone();
         let handle = platform::spawn(async move {
             let result = async {
                 let response = processor
                     .fetch(processor_request(
                         PROCESSOR_URL,
-                        &task_name,
+                        &task.task_name,
                         &cleanup.task_id,
                     ))
                     .await?;
-                consume_response(response, "processor").await
+                processor_action(response, &cleanup.task_id).await
             }
             .await;
-            if let Err(error) = result {
+            if let Err(error) = &result {
                 log_processor_failure(&cleanup.task_id, &error.to_string());
             }
+            core.complete(task, result.ok()).await;
             cleanup.observed = true;
             // Cleanup also runs if a native fetch/body future panics or the executor cancels it.
             drop(cleanup);
         });
-        in_flight.get_mut(task_id).unwrap()._handle = Some(handle);
+        in_flight.get_mut(&task_id).unwrap()._handle = Some(handle);
         true
     }
 
-    async fn schedule_heartbeat(&self) -> Result<(), BoxDispatchError> {
-        let now = (self.now)();
-        let next = now + HEARTBEAT_INTERVAL_MS;
-        if self
-            .storage
-            .get_alarm()
-            .await?
-            .is_none_or(|current| current <= now || current > next)
+    async fn complete(self: &Arc<Self>, attempt: Arc<DispatcherTask>, action: Option<NextAction>) {
+        let _lock = self.bookkeeping.lock().await;
+        if !self
+            .in_flight
+            .lock()
+            .unwrap()
+            .get(&attempt.task_id)
+            .is_some_and(|active| Arc::ptr_eq(&active.task, &attempt))
         {
-            self.storage.set_alarm(next).await?;
+            return;
         }
-        Ok(())
+        let now = (self.now)();
+        let task_id = attempt.task_id.clone();
+        let task = attempt.clone();
+        let result: Result<(), BoxDispatchError> = async {
+            // Reconcile prior schedules only after a response, never during acceptance.
+            if !matches!(action, Some(NextAction::RetryAt { .. }))
+                && !self.storage.contains_task(&task_id).await?
+            {
+                if action.is_none() && attempt.attempt_id().is_none() {
+                    self.retry_in_memory(&attempt);
+                }
+                return Ok(());
+            }
+            self.storage
+                .transaction(Box::new(move |state| {
+                    state.validate(now)?;
+                    let id = &task.task_id;
+                    if task.attempt_id().is_some()
+                        && state.tasks.get(id).and_then(DispatcherTask::attempt_id)
+                            != task.attempt_id()
+                    {
+                        return Ok(());
+                    }
+                    match action {
+                        Some(NextAction::Done) => {
+                            state.tasks.remove(id);
+                        }
+                        Some(NextAction::RetryAt { at_ms }) => {
+                            state.tasks.insert(
+                                id.clone(),
+                                DispatcherTask {
+                                    task_id: id.clone(),
+                                    task_name: task.task_name.clone(),
+                                    state: TaskSchedule::Pending,
+                                    next_attempt_at_ms: at_ms,
+                                    infrastructure_failures: 0,
+                                },
+                            );
+                        }
+                        None => {
+                            if let Some(current) = state.tasks.get_mut(id) {
+                                current.retry(now);
+                            }
+                        }
+                    }
+                    Ok(())
+                }))
+                .await
+        }
+        .await;
+        if let Err(error) = result {
+            log_processor_failure(&task_id, &error.to_string());
+            self.retry_in_memory(&attempt);
+        }
+    }
+
+    fn retry_in_memory(self: &Arc<Self>, task: &DispatcherTask) {
+        let mut pending = task.clone();
+        pending.retry((self.now)());
+        let delay = (pending.next_attempt_at_ms - (self.now)()).max(0) as u64;
+        let pending = Arc::new(pending);
+        self.memory_retries
+            .lock()
+            .unwrap()
+            .insert(pending.task_id.clone(), pending.clone());
+        let core = self.clone();
+        platform::spawn(async move {
+            platform::sleep_until(
+                crate::time::Instant::now() + std::time::Duration::from_millis(delay),
+            )
+            .await;
+            let _lock = core.bookkeeping.lock().await;
+            let current = core
+                .memory_retries
+                .lock()
+                .unwrap()
+                .get(&pending.task_id)
+                .is_some_and(|task| Arc::ptr_eq(task, &pending));
+            if current {
+                core.launch_processor((*pending).clone());
+            }
+        });
     }
 }
 
-struct AttemptCleanup {
-    in_flight: InFlight,
+struct AttemptCleanup<S: DispatcherStorage, P: ProcessorFetcher> {
+    core: Arc<DispatcherCore<S, P>>,
     task_id: String,
-    token: Arc<()>,
+    task: Arc<DispatcherTask>,
     observed: bool,
 }
 
-impl Drop for AttemptCleanup {
+impl<S: DispatcherStorage, P: ProcessorFetcher> Drop for AttemptCleanup<S, P> {
     fn drop(&mut self) {
+        let mut in_flight = self.core.in_flight.lock().unwrap();
+        if !in_flight
+            .get(&self.task_id)
+            .is_some_and(|attempt| Arc::ptr_eq(&attempt.task, &self.task))
+        {
+            return;
+        }
+        in_flight.remove(&self.task_id);
+        drop(in_flight);
         if !self.observed {
             log_processor_failure(
                 &self.task_id,
                 "processor task exited without an observed response",
             );
-        }
-        let mut in_flight = self.in_flight.lock().unwrap();
-        if in_flight
-            .get(&self.task_id)
-            .is_some_and(|attempt| Arc::ptr_eq(&attempt.token, &self.token))
-        {
-            in_flight.remove(&self.task_id);
+            self.core.retry_in_memory(&self.task);
         }
     }
 }

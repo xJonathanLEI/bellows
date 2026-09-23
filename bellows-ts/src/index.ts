@@ -1,5 +1,5 @@
 export { WorkerDispatcher, WorkerDispatcherHandle } from "./dispatcher.js";
-export type { PublishDispatchToken } from "./runtime.js";
+export type { PublishDispatchToken, TaskAttemptOutcome } from "./runtime.js";
 export { runTaskOnce } from "./runtime.js";
 export type {
   Backend,

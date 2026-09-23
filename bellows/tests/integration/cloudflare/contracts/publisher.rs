@@ -6,6 +6,7 @@ use std::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
+    time::Duration,
 };
 
 use bellows::{
@@ -15,6 +16,7 @@ use bellows::{
         dispatch_task,
         sdk::{PostgresPublisher, PostgresPublisherConfig},
     },
+    time::Instant,
 };
 use futures_util::stream;
 use serde_json::{Value, json};
@@ -30,7 +32,22 @@ impl TaskDefinition for PublisherTask {
 
 pub async fn fetch(mut request: Request, env: &Env) -> Result<Response> {
     match request.path().as_str() {
-        "/publisher/publish" => {
+        "/publisher/publish" | "/publisher/publish-future" => {
+            let available_from = if request.path() == "/publisher/publish-future" {
+                let body: Value = request.json().await?;
+                let at_ms = body["availableFromMs"].as_u64().unwrap();
+                // Pair the millisecond wall and monotonic samples without crossing a clock tick.
+                let (now_ms, now) = loop {
+                    let before = Date::now().as_millis();
+                    let now = Instant::now();
+                    if before == Date::now().as_millis() {
+                        break (before, now);
+                    }
+                };
+                Some(now + Duration::from_millis(at_ms - now_ms))
+            } else {
+                None
+            };
             let publisher = PostgresPublisher::<PublisherTask, _>::new(|env: &Env| {
                 Ok(PostgresPublisherConfig::new(
                     env.hyperdrive("HYPERDRIVE")?.connection_string(),
@@ -40,10 +57,12 @@ pub async fn fetch(mut request: Request, env: &Env) -> Result<Response> {
                     env.durable_object("DISPATCHER")?,
                 ))
             });
-            match publisher
-                .publish(env, ("hello \"🦀\"\n".into(), vec![1, 2, 3]))
-                .await
-            {
+            let payload = ("hello \"🦀\"\n".into(), vec![1, 2, 3]);
+            let result = match available_from {
+                Some(deadline) => publisher.publish_future(env, payload, deadline).await,
+                None => publisher.publish(env, payload).await,
+            };
+            match result {
                 Ok(receipt) => Response::from_json(&json!({ "taskId": receipt.task_id })),
                 Err(error) => Ok(Response::from_json(&json!({
                     "stage": error.stage.as_str(),

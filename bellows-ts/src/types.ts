@@ -201,6 +201,7 @@ export class TaskFailure {
 export type TaskResult<TCallback> = TaskSuccess<TCallback> | TaskFailure;
 
 export interface TaskExecutionBackend {
+  /** Missing means no matching definition/kind row; an existing now-due row is unavailable, not missing. */
   claimPublished<TPayload, TCallback>(
     task: PublishTaskDefinition<TPayload, TCallback>,
     workerId: number,

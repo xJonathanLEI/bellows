@@ -1,6 +1,7 @@
 import { afterEach, expect, test, vi } from "vitest";
 import {
-  type AlarmStorage,
+  type DispatcherRecords,
+  type DispatcherStorage,
   type DurableObjectNamespaceLike,
   type DurableObjectStubLike,
   dispatchTask,
@@ -29,12 +30,77 @@ class Deferred<T> {
   }
 }
 
-class FakeAlarmStorage implements AlarmStorage {
+function seedSchedule(storage: FakeAlarmStorage, taskName = "contract"): void {
+  storage.records.set("scheduler", {
+    nextHeartbeatAtMs: Date.now() + 30_000,
+    nextAttemptId: 0,
+  });
+  storage.records.set("task:id", {
+    taskId: "id",
+    taskName,
+    nextAttemptAtMs: Date.now(),
+    infrastructureFailures: 0,
+    state: { type: "pending" },
+  });
+}
+
+class FakeAlarmStorage implements DispatcherStorage {
+  records = new Map<string, unknown>();
+  private queue: Promise<unknown> = Promise.resolve();
+  private stagedAlarms: number[] | undefined;
   alarm: number | null = null;
   readonly scheduledAlarms: number[] = [];
   getError: Error | null = null;
   setError: Error | null = null;
+  setFailures = 0;
+  uncertainCommit = false;
   getGate: Deferred<void> | null = null;
+
+  async get<T>(key: string): Promise<T | undefined> {
+    return structuredClone(this.records.get(key)) as T | undefined;
+  }
+
+  async list<T>({ prefix }: { prefix: string }): Promise<Map<string, T>> {
+    return structuredClone(
+      new Map([...this.records].filter(([key]) => key.startsWith(prefix))),
+    ) as Map<string, T>;
+  }
+
+  async put<T>(key: string, value: T): Promise<void> {
+    this.records.set(key, structuredClone(value));
+  }
+
+  async delete(key: string): Promise<boolean> {
+    return this.records.delete(key);
+  }
+
+  transaction<T>(
+    closure: (transaction: DispatcherRecords) => Promise<T>,
+  ): Promise<T> {
+    const result = this.queue.then(async () => {
+      await this.getAlarm();
+      const draft = new FakeAlarmStorage();
+      draft.records = structuredClone(this.records);
+      this.stagedAlarms = [];
+      try {
+        const result = await closure(draft);
+        this.records = draft.records;
+        for (const alarm of this.stagedAlarms) {
+          this.alarm = alarm;
+          this.scheduledAlarms.push(alarm);
+        }
+        if (this.uncertainCommit) {
+          this.uncertainCommit = false;
+          throw new Error("commit acknowledgement lost");
+        }
+        return result;
+      } finally {
+        this.stagedAlarms = undefined;
+      }
+    });
+    this.queue = result.catch(() => undefined);
+    return result;
+  }
 
   async getAlarm(): Promise<number | null> {
     const gate = this.getGate;
@@ -49,17 +115,25 @@ class FakeAlarmStorage implements AlarmStorage {
   }
 
   async setAlarm(alarmTime: number): Promise<void> {
+    if (this.setFailures > 0) {
+      this.setFailures--;
+      throw new Error("alarm storage failed");
+    }
     if (this.setError !== null) {
       throw this.setError;
     }
-    this.alarm = alarmTime;
-    this.scheduledAlarms.push(alarmTime);
+    if (this.stagedAlarms) this.stagedAlarms.push(alarmTime);
+    else {
+      this.alarm = alarmTime;
+      this.scheduledAlarms.push(alarmTime);
+    }
   }
 }
 
 interface ProcessorCall {
   readonly request: Request;
   readonly response: Deferred<Response>;
+  readonly taskId: string;
 }
 
 class DeferredProcessor implements ProcessorFetcher {
@@ -70,6 +144,7 @@ class DeferredProcessor implements ProcessorFetcher {
     this.calls.push({
       request: new Request(input, init),
       response,
+      taskId: (JSON.parse(init?.body as string) as { taskId: string }).taskId,
     });
     return response.promise;
   }
@@ -158,7 +233,8 @@ function controlledResponse(status = 200) {
 async function finish(processor: DeferredProcessor, index: number) {
   const control = controlledResponse();
   processor.calls[index]?.response.resolve(control.response);
-  control.finish("finished");
+  const taskId = processor.calls[index]?.taskId;
+  control.finish(JSON.stringify({ taskId, nextAction: { type: "done" } }));
   await control.consumed;
 }
 
@@ -172,12 +248,13 @@ async function expectJson(response: Response, status: number, body: unknown) {
   expect(await response.json()).toEqual(body);
 }
 
-async function expectReleased(
+async function expectRedispatchAllowed(
   dispatcher: RetainedTaskDispatcher,
   taskId: string,
+  taskName = "contract",
 ) {
   for (let attempt = 0; attempt < 100; attempt += 1) {
-    const response = await dispatcher.fetch(dispatchRequest(taskId));
+    const response = await dispatcher.fetch(dispatchRequest(taskId, taskName));
     expect(response.status).toBe(200);
     const body = (await response.json()) as { duplicate?: boolean };
     if (body.duplicate === undefined) {
@@ -186,11 +263,471 @@ async function expectReleased(
     }
     expect(body).toEqual({ duplicate: true, ok: true, taskId });
   }
-  throw new Error("completed attempt did not release its ID");
+  throw new Error("completed attempt did not permit explicit redispatch");
 }
 
 afterEach(() => {
+  vi.useRealTimers();
   vi.restoreAllMocks();
+});
+
+test("healthy dispatch and unsaved completion perform no writes or schedule scans", async () => {
+  const storage = new FakeAlarmStorage();
+  storage.alarm = Date.now() + 10_000;
+  const processor = new DeferredProcessor();
+  const dispatcher = new RetainedTaskDispatcher(storage, processor);
+  const transaction = vi.spyOn(storage, "transaction");
+  const list = vi.spyOn(storage, "list");
+  const get = vi.spyOn(storage, "get");
+  const put = vi.spyOn(storage, "put");
+  const setAlarm = vi.spyOn(storage, "setAlarm");
+  await dispatcher.fetch(dispatchRequest("id"));
+  await dispatcher.fetch(dispatchRequest("id", "ignored"));
+  expect(processor.calls).toHaveLength(1);
+  expect(get).not.toHaveBeenCalled();
+  reply(processor, 0, { type: "done" });
+  await expectRedispatchAllowed(dispatcher, "id");
+  expect(get).toHaveBeenCalledExactlyOnceWith("task:id");
+  expect(transaction).not.toHaveBeenCalled();
+  expect(list).not.toHaveBeenCalled();
+  expect(put).not.toHaveBeenCalled();
+  expect(setAlarm).not.toHaveBeenCalled();
+  expect(storage.records.size).toBe(0);
+  await finish(processor, 1);
+});
+
+test("unsaved uncertainty retries in memory; only a valid hint starts persistence", async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(1_700_000_000_000);
+  vi.spyOn(console, "error").mockImplementation(() => undefined);
+  const storage = new FakeAlarmStorage();
+  const processor = new DeferredProcessor();
+  const dispatcher = new RetainedTaskDispatcher(storage, processor);
+  await dispatcher.fetch(dispatchRequest("id"));
+  processor.calls[0]?.response.reject(new Error("network"));
+  await vi.advanceTimersByTimeAsync(0);
+  expect(storage.records.size).toBe(0);
+  expect(storage.scheduledAlarms).toHaveLength(1);
+  await vi.advanceTimersByTimeAsync(999);
+  expect(processor.calls).toHaveLength(1);
+  await vi.advanceTimersByTimeAsync(1);
+  expect(processor.calls).toHaveLength(2);
+  reply(processor, 1, { type: "retryAt", atMs: Date.now() - 1 });
+  await waitFor(() => storedTask(storage)?.state.type === "pending");
+  expect(storedTask(storage)?.infrastructureFailures).toBe(0);
+  await dispatcher.alarm();
+  expect(processor.calls).toHaveLength(3);
+  await finish(processor, 2);
+});
+
+test("explicit redispatch reconciles a saved schedule only after its response", async () => {
+  const storage = new FakeAlarmStorage();
+  seedSchedule(storage, "old");
+  storage.alarm = Date.now() - 1;
+  const before = structuredClone(storage.records);
+  const transaction = vi.spyOn(storage, "transaction");
+  const processor = new DeferredProcessor();
+  const dispatcher = new RetainedTaskDispatcher(storage, processor);
+  await dispatcher.fetch(dispatchRequest("id", "corrected"));
+  await dispatcher.fetch(dispatchRequest("id", "ignored"));
+  expect(transaction).not.toHaveBeenCalled();
+  expect(storage.records).toEqual(before);
+  expect(storage.scheduledAlarms).toEqual([]);
+  await dispatcher.alarm();
+  expect(processor.calls).toHaveLength(1);
+  expect(storedTask(storage)).toBeDefined();
+  reply(processor, 0, { type: "retryAt", atMs: Date.now() + 10_000 });
+  await waitFor(() => storedTask(storage)?.taskName === "corrected");
+  await expectRedispatchAllowed(dispatcher, "id");
+  reply(processor, 1, { type: "done" });
+  await waitFor(() => !storedTask(storage));
+});
+
+test("first delayed scheduling response preserves the already armed warming deadline", async () => {
+  let now = 1_700_000_000_000;
+  vi.spyOn(Date, "now").mockImplementation(() => now);
+  const storage = new FakeAlarmStorage();
+  const processor = new DeferredProcessor();
+  const dispatcher = new RetainedTaskDispatcher(storage, processor);
+  await dispatcher.fetch(dispatchRequest("id"));
+  const heartbeat = storage.alarm;
+  now += 10_000;
+  reply(processor, 0, { type: "retryAt", atMs: now + 60_000 });
+  await waitFor(() => storedTask(storage) !== undefined);
+  expect(storage.alarm).toBe(heartbeat);
+});
+
+test("dispatch launches through blocked outcome bookkeeping without overwriting its earlier alarm", async () => {
+  const now = 1_700_000_000_000;
+  vi.spyOn(Date, "now").mockReturnValue(now);
+  const storage = new FakeAlarmStorage();
+  const processor = new DeferredProcessor();
+  const dispatcher = new RetainedTaskDispatcher(storage, processor);
+  await dispatcher.fetch(dispatchRequest("id"));
+  const gate = new Deferred<void>();
+  storage.getGate = gate;
+  reply(processor, 0, { type: "retryAt", atMs: now + 1_000 });
+  await waitFor(() => storage.getGate === null);
+  const dispatch = dispatcher.fetch(dispatchRequest("other"));
+  await waitFor(() => processor.calls.length === 2);
+  expect(storage.records.size).toBe(0);
+  gate.resolve(undefined);
+  expect((await dispatch).status).toBe(200);
+  expect(storage.alarm).toBe(now + 1_000);
+  expect(storedTask(storage, "other")).toBeUndefined();
+  await finish(processor, 1);
+});
+
+test("an uncertain scheduling commit retains a recoverable schedule", async () => {
+  vi.spyOn(console, "error").mockImplementation(() => undefined);
+  let now = 1_700_000_000_000;
+  vi.spyOn(Date, "now").mockImplementation(() => now);
+  const storage = new FakeAlarmStorage();
+  const processor = new DeferredProcessor();
+  let dispatcher = new RetainedTaskDispatcher(storage, processor);
+  expect((await dispatcher.fetch(dispatchRequest("id"))).status).toBe(200);
+  expect(storage.records.size).toBe(0);
+  storage.uncertainCommit = true;
+  reply(processor, 0, { type: "retryAt", atMs: now + 1_000 });
+  await waitFor(() => vi.mocked(console.error).mock.calls.length === 1);
+  expect(storedTask(storage)?.state.type).toBe("pending");
+  dispatcher = new RetainedTaskDispatcher(storage, processor);
+  now += 1_000;
+  await dispatcher.alarm();
+  expect(processor.calls).toHaveLength(2);
+  await finish(processor, 1);
+});
+
+test("failed alarm bookkeeping rolls back launches and re-arms from current records", async () => {
+  let now = 1_700_000_000_000;
+  vi.spyOn(Date, "now").mockImplementation(() => now);
+  const storage = new FakeAlarmStorage();
+  const processor = new DeferredProcessor();
+  const dispatcher = new RetainedTaskDispatcher(storage, processor);
+  seedSchedule(storage);
+  await dispatcher.alarm();
+  reply(processor, 0, { type: "retryAt", atMs: now + 1_000 });
+  await waitFor(() => storedTask(storage)?.state.type === "pending");
+  now += 1_000;
+  storage.setFailures = 1;
+  await expect(dispatcher.alarm()).rejects.toThrow("alarm storage failed");
+  expect(processor.calls).toHaveLength(1);
+  expect(storedTask(storage)?.state.type).toBe("pending");
+  expect(storage.alarm).toBe(now);
+  await dispatcher.alarm();
+  expect(processor.calls).toHaveLength(2);
+  await finish(processor, 1);
+});
+
+test("result persistence is awaited before retiring local tracking", async () => {
+  const storage = new FakeAlarmStorage();
+  const processor = new DeferredProcessor();
+  const dispatcher = new RetainedTaskDispatcher(storage, processor);
+  seedSchedule(storage);
+  await dispatcher.alarm();
+  const gate = new Deferred<void>();
+  storage.getGate = gate;
+  reply(processor, 0, { type: "done" });
+  await waitFor(() => storage.getGate === null);
+  expect(storedTask(storage)?.state.type).toBe("running");
+  expect(processor.calls).toHaveLength(1);
+  gate.resolve(undefined);
+  await waitFor(() => !storedTask(storage));
+});
+
+test.each([
+  "done",
+  "retryAt",
+  "body-error",
+])("a late %s cannot affect an ID accepted again after completion", async (action) => {
+  vi.spyOn(console, "error").mockImplementation(() => undefined);
+  const storage = new FakeAlarmStorage();
+  const processor = new DeferredProcessor();
+  const original = new RetainedTaskDispatcher(storage, processor);
+  seedSchedule(storage);
+  await original.alarm();
+  const body = controlledResponse();
+  processor.calls[0]?.response.resolve(body.response);
+  await waitFor(() => body.response.bodyUsed);
+  const successor = new RetainedTaskDispatcher(storage, processor);
+  await successor.fetch(dispatchRequest("id"));
+  reply(processor, 1, { type: "done" });
+  await waitFor(() => !storedTask(storage));
+  await expectRedispatchAllowed(successor, "id", "new");
+  const current = structuredClone(storedTask(storage));
+  if (action === "body-error") body.fail(new Error("late body error"));
+  else
+    body.finish(
+      JSON.stringify({
+        taskId: "id",
+        nextAction:
+          action === "done" ? { type: "done" } : { type: "retryAt", atMs: 0 },
+      }),
+    );
+  await body.consumed;
+  await original.alarm();
+  expect(storedTask(storage)).toEqual(current);
+  await expectJson(await successor.fetch(dispatchRequest("id", "wrong")), 200, {
+    duplicate: true,
+    ok: true,
+    taskId: "id",
+  });
+  expect(processor.calls).toHaveLength(3);
+  await finish(processor, 2);
+});
+
+test("later results and duplicate acknowledgements cannot postpone earlier deadlines", async () => {
+  const now = 1_700_000_000_000;
+  vi.spyOn(Date, "now").mockReturnValue(now);
+  const storage = new FakeAlarmStorage();
+  const processor = new DeferredProcessor();
+  const dispatcher = new RetainedTaskDispatcher(storage, processor);
+  for (const id of ["early", "late", "active"])
+    await dispatcher.fetch(dispatchRequest(id));
+  reply(processor, 0, { type: "retryAt", atMs: now + 1_000 });
+  await waitFor(() => storedTask(storage, "early")?.state.type === "pending");
+  reply(processor, 1, { type: "retryAt", atMs: now + 20_000 });
+  await waitFor(() => storedTask(storage, "late")?.state.type === "pending");
+  await dispatcher.fetch(dispatchRequest("active"));
+  await dispatcher.alarm();
+  expect(storage.alarm).toBe(now + 1_000);
+  expect(processor.calls).toHaveLength(3);
+});
+
+interface StoredTask {
+  taskId: string;
+  taskName: string;
+  nextAttemptAtMs: number;
+  infrastructureFailures: number;
+  state: { type: "pending" } | { type: "running"; attemptId: number };
+}
+
+function storedTask(
+  storage: FakeAlarmStorage,
+  id = "id",
+): StoredTask | undefined {
+  return storage.records.get(`task:${id}`) as StoredTask | undefined;
+}
+
+function reply(
+  processor: DeferredProcessor,
+  index: number,
+  action: unknown,
+): void {
+  const call = processor.calls[index];
+  if (!call) throw new Error("missing processor call");
+  call.response.resolve(
+    Response.json({ taskId: call.taskId, nextAction: action }),
+  );
+}
+
+test("future hints survive reconstruction, preserve heartbeat, and remove only on done", async () => {
+  let now = 1_700_000_000_000;
+  const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+  const storage = new FakeAlarmStorage();
+  const processor = new DeferredProcessor();
+  let dispatcher = new RetainedTaskDispatcher(storage, processor);
+  await dispatcher.fetch(dispatchRequest("id"));
+  reply(processor, 0, { type: "retryAt", atMs: now + 10_000 });
+  await waitFor(() => storedTask(storage)?.state.type === "pending");
+  dispatcher = new RetainedTaskDispatcher(storage, processor);
+  await dispatcher.alarm();
+  expect(storage.alarm).toBe(now + 10_000);
+  now += 9_999;
+  await dispatcher.alarm();
+  expect(processor.calls).toHaveLength(1);
+  now += 1;
+  await dispatcher.alarm();
+  expect(processor.calls).toHaveLength(2);
+  expect(storage.alarm).toBe(now + 20_000);
+  await dispatcher.alarm();
+  expect(processor.calls).toHaveLength(2);
+  reply(processor, 1, { type: "done" });
+  await waitFor(() => !storedTask(storage));
+  await dispatcher.alarm();
+  expect(storage.alarm).toBe(now + 20_000);
+  now += 25_000;
+  await dispatcher.alarm();
+  expect(storage.alarm).toBe(now + 30_000);
+  clock.mockRestore();
+});
+
+test.each([
+  false,
+  true,
+])("watchdog recovers hung attempts (reconstructed=%s) and rejects stale results", async (reconstruct) => {
+  let now = 1_700_000_000_000;
+  vi.spyOn(Date, "now").mockImplementation(() => now);
+  const storage = new FakeAlarmStorage();
+  const processor = new DeferredProcessor();
+  let dispatcher = new RetainedTaskDispatcher(storage, processor);
+  seedSchedule(storage, "old");
+  await dispatcher.alarm();
+  const first = storedTask(storage)?.state;
+  if (reconstruct) dispatcher = new RetainedTaskDispatcher(storage, processor);
+  now += 59_999;
+  await dispatcher.alarm();
+  expect(processor.calls).toHaveLength(1);
+  now += 1;
+  await dispatcher.alarm();
+  expect(storedTask(storage)?.nextAttemptAtMs).toBe(now + 1_000);
+  now += 1_000;
+  await dispatcher.alarm();
+  expect(processor.calls).toHaveLength(2);
+  expect(storedTask(storage)?.state).not.toEqual(first);
+  reply(processor, 1, { type: "retryAt", atMs: now + 20_000 });
+  await waitFor(() => storedTask(storage)?.state.type === "pending");
+  await dispatcher.alarm();
+  reply(processor, 0, { type: "done" });
+  await dispatcher.alarm();
+  expect(storedTask(storage)?.nextAttemptAtMs).toBe(now + 20_000);
+  // Explicit redispatch overrides the pending hint and can correct routing.
+  await dispatcher.fetch(dispatchRequest("id", "corrected"));
+  await dispatcher.fetch(dispatchRequest("id", "must-not-replace"));
+  expect(processor.calls).toHaveLength(3);
+  expect(await processor.calls[2]?.request.json()).toEqual({
+    taskId: "id",
+    taskName: "corrected",
+  });
+  expect(storedTask(storage)?.taskName).toBe("old");
+  reply(processor, 2, { type: "done" });
+  await waitFor(() => !storedTask(storage));
+  await expectRedispatchAllowed(dispatcher, "id");
+  expect(storedTask(storage)?.state).not.toEqual(first);
+  await finish(processor, 3);
+});
+
+test("all 300 due IDs launch while every processor response is gated", async () => {
+  let now = 1_700_000_000_000;
+  vi.spyOn(Date, "now").mockImplementation(() => now);
+  const storage = new FakeAlarmStorage();
+  const processor = new DeferredProcessor();
+  const dispatcher = new RetainedTaskDispatcher(storage, processor);
+  storage.records.set("scheduler", {
+    nextHeartbeatAtMs: now + 30_000,
+    nextAttemptId: 0,
+  });
+  for (let id = 0; id < 300; id++) {
+    storage.records.set(`task:${id}`, {
+      taskId: String(id),
+      taskName: id % 2 ? "first" : "second",
+      state: { type: "pending" },
+      infrastructureFailures: 0,
+      nextAttemptAtMs: now + 1_000,
+    });
+  }
+  now += 35_000; // Both heartbeat and every task are overdue.
+  await dispatcher.alarm();
+  expect(processor.calls).toHaveLength(300);
+  expect(storage.alarm).toBe(now + 30_000);
+  await dispatcher.alarm();
+  expect(processor.calls).toHaveLength(300);
+  for (const record of storage.records.values()) {
+    if ("taskId" in (record as object))
+      expect((record as StoredTask).state.type).toBe("running");
+  }
+});
+
+test.each([
+  "",
+  "{}",
+  "{",
+  "null",
+  '{"taskId":"id","attemptFinished":true}',
+  '{"taskId":"other","nextAction":{"type":"done"}}',
+  '{"taskId":"id","nextAction":{"type":"unknown"}}',
+  ...[-1, 0.5, 8_640_000_000_000_001, 9_007_199_254_740_992, "1", null].map(
+    (atMs) =>
+      JSON.stringify({ taskId: "id", nextAction: { type: "retryAt", atMs } }),
+  ),
+])("uncertain response %s remains durable with infrastructure backoff", async (body) => {
+  vi.spyOn(console, "error").mockImplementation(() => undefined);
+  const now = 1_700_000_000_000;
+  vi.spyOn(Date, "now").mockReturnValue(now);
+  const storage = new FakeAlarmStorage();
+  const processor = new DeferredProcessor();
+  const dispatcher = new RetainedTaskDispatcher(storage, processor);
+  seedSchedule(storage);
+  await dispatcher.alarm();
+  processor.calls[0]?.response.resolve(new Response(body));
+  await waitFor(() => storedTask(storage)?.state.type === "pending");
+  expect(storedTask(storage)?.nextAttemptAtMs).toBe(now + 1_000);
+  expect(storedTask(storage)?.infrastructureFailures).toBe(1);
+});
+
+test("backoff persists, saturates, and resets on a valid past retry instruction", async () => {
+  vi.spyOn(console, "error").mockImplementation(() => undefined);
+  let now = 1_700_000_000_000;
+  vi.spyOn(Date, "now").mockImplementation(() => now);
+  const storage = new FakeAlarmStorage();
+  const processor = new DeferredProcessor();
+  let dispatcher = new RetainedTaskDispatcher(storage, processor);
+  seedSchedule(storage, "unknown");
+  await dispatcher.alarm();
+  for (let index = 0; index < 8; index++) {
+    processor.calls[index]?.response.resolve(
+      new Response("unknown", { status: 404 }),
+    );
+    await waitFor(() => storedTask(storage)?.state.type === "pending");
+    const delay = Math.min(1_000 * 2 ** index, 30_000);
+    expect(storedTask(storage)?.nextAttemptAtMs).toBe(now + delay);
+    expect(storedTask(storage)?.infrastructureFailures).toBe(
+      Math.min(index + 1, 6),
+    );
+    dispatcher = new RetainedTaskDispatcher(storage, processor);
+    now += delay;
+    await dispatcher.alarm();
+    expect(processor.calls).toHaveLength(index + 2);
+  }
+  reply(processor, 8, { type: "retryAt", atMs: now - 1 });
+  await waitFor(() => storedTask(storage)?.state.type === "pending");
+  expect(storedTask(storage)?.infrastructureFailures).toBe(0);
+  await dispatcher.alarm();
+  expect(processor.calls).toHaveLength(10);
+  processor.calls[9]?.response.reject(new Error("network"));
+  await waitFor(() => storedTask(storage)?.infrastructureFailures === 1);
+  expect(storedTask(storage)?.nextAttemptAtMs).toBe(now + 1_000);
+});
+
+test("failed result persistence retains a scheduled attempt's watchdog", async () => {
+  vi.spyOn(console, "error").mockImplementation(() => undefined);
+  let now = 1_700_000_000_000;
+  vi.spyOn(Date, "now").mockImplementation(() => now);
+  const storage = new FakeAlarmStorage();
+  const processor = new DeferredProcessor();
+  let dispatcher = new RetainedTaskDispatcher(storage, processor);
+  seedSchedule(storage);
+  await dispatcher.alarm();
+  storage.setError = new Error("commit failed");
+  reply(processor, 0, { type: "done" });
+  await waitFor(() => vi.mocked(console.error).mock.calls.length === 1);
+  expect(storedTask(storage)?.state.type).toBe("running");
+  expect(storage.alarm).toBe(now + 30_000);
+  storage.setError = null;
+  dispatcher = new RetainedTaskDispatcher(storage, processor);
+  now += 60_000;
+  await dispatcher.alarm();
+  now += 1_000;
+  await dispatcher.alarm();
+  expect(processor.calls).toHaveLength(2);
+  await finish(processor, 1);
+});
+
+test("corrupt current records never become an empty queue", async () => {
+  for (const [key, value] of [
+    ["scheduler", {}],
+    ["scheduler", null],
+    ["task:id", { taskId: "id" }],
+  ] as const) {
+    const storage = new FakeAlarmStorage();
+    storage.records.set(key, value);
+    const processor = new DeferredProcessor();
+    const dispatcher = new RetainedTaskDispatcher(storage, processor);
+    expect((await dispatcher.fetch(dispatchRequest("id"))).status).toBe(200);
+    await expect(dispatcher.alarm()).rejects.toThrow();
+    expect(processor.calls).toHaveLength(1);
+    expect(storage.records.get(key)).toEqual(value);
+  }
 });
 
 test("dispatchTask targets the global object and consumes the response", async () => {
@@ -284,9 +821,11 @@ test("retained dispatch accepts before processor completion and observes its res
     taskId: "task-1",
   });
   expect(processor.calls).toHaveLength(1);
-  control.finish("finished");
+  control.finish(
+    JSON.stringify({ taskId: "task-1", nextAction: { type: "done" } }),
+  );
   await control.consumed;
-  await expectReleased(dispatcher, "task-1");
+  await expectRedispatchAllowed(dispatcher, "task-1");
   expect(processor.calls).toHaveLength(2);
   await finish(processor, 1);
 });
@@ -338,16 +877,14 @@ test("dispatch and alarm schedule the 30-second heartbeat", async () => {
   await finish(processor, 0);
   // Consuming the last response does not disable heartbeats.
   await dispatcher.alarm();
-  expect(storage.scheduledAlarms).toEqual([
-    now + 30_000,
-    now + 30_000,
-    now + 30_000,
-  ]);
+  expect(storage.scheduledAlarms.every((time) => time === now + 30_000)).toBe(
+    true,
+  );
 });
 
 test.each([
   404, 500,
-])("processor HTTP %s failures are observed and release the task ID", async (status) => {
+])("processor HTTP %s failures are retained and permit explicit redispatch", async (status) => {
   const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
   const storage = new FakeAlarmStorage();
   const processor = new DeferredProcessor();
@@ -373,7 +910,7 @@ test.each([
     `task processor returned HTTP ${status}: ${message}`,
   );
 
-  await expectReleased(dispatcher, "task-1");
+  await expectRedispatchAllowed(dispatcher, "task-1");
   expect(processor.calls).toHaveLength(2);
   await finish(processor, 1);
 });
@@ -495,7 +1032,7 @@ test("invalid routes and inputs do not launch work or schedule alarms", async ()
   expect(storage.scheduledAlarms).toEqual([]);
 });
 
-test("heartbeat preserves only future alarms no later than the next heartbeat", async () => {
+test("dispatch only repairs a missing or too-late heartbeat alarm", async () => {
   const now = 1_700_000_000_000;
   vi.spyOn(Date, "now").mockReturnValue(now);
   for (const alarm of [
@@ -510,9 +1047,7 @@ test("heartbeat preserves only future alarms no later than the next heartbeat", 
     const processor = new DeferredProcessor();
     const dispatcher = new RetainedTaskDispatcher(storage, processor);
     const expected =
-      alarm !== null && alarm > now && alarm <= now + 30_000
-        ? []
-        : [now + 30_000];
+      alarm === null || alarm > now + 30_000 ? [now + 30_000] : [];
     for (const duplicate of [false, true]) {
       storage.alarm = alarm;
       storage.scheduledAlarms.length = 0;
@@ -592,7 +1127,7 @@ test.each([
   await finish(processor, 0);
 });
 
-test("rejected processor fetches and body reads are observed and release the ID", async () => {
+test("rejected processor fetches and body reads are retained and permit explicit redispatch", async () => {
   const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
   for (const status of [null, 200, 503]) {
     log.mockClear();
@@ -617,7 +1152,7 @@ test("rejected processor fetches and body reads are observed and release the ID"
       "task-1",
       status === null ? "fetch rejected" : "body read rejected",
     );
-    await expectReleased(dispatcher, "task-1");
+    await expectRedispatchAllowed(dispatcher, "task-1");
     expect(processor.calls).toHaveLength(2);
     await finish(processor, 1);
   }
@@ -719,7 +1254,7 @@ test("request-read and storage errors use the existing error envelope", async ()
   await finish(processor, 0);
 });
 
-test("pending storage I/O does not block the registry or processor progress", async () => {
+test("launch precedes heartbeat storage and never persists acceptance", async () => {
   const storage = new FakeAlarmStorage();
   const gate = new Deferred<void>();
   storage.getGate = gate;
@@ -732,24 +1267,29 @@ test("pending storage I/O does not block the registry or processor progress", as
       accepted = true;
       return response;
     });
-  await waitFor(() => processor.calls.length === 1);
+  await waitFor(() => storage.getGate === null);
   expect(accepted).toBe(false);
-  await expectJson(await dispatcher.fetch(dispatchRequest("id")), 200, {
+  expect(processor.calls).toHaveLength(1);
+  const duplicate = dispatcher.fetch(dispatchRequest("id"));
+  const other = dispatcher.fetch(dispatchRequest("other"));
+  await waitFor(() => processor.calls.length === 2);
+  expect(storage.records.size).toBe(0);
+  gate.resolve(undefined);
+  await expectJson(await acceptance, 200, { ok: true, taskId: "id" });
+  await expectJson(await duplicate, 200, {
     duplicate: true,
     ok: true,
     taskId: "id",
   });
-  await expectJson(await dispatcher.fetch(dispatchRequest("other")), 200, {
+  await expectJson(await other, 200, {
     ok: true,
     taskId: "other",
   });
   await finish(processor, 0);
   await finish(processor, 1);
-  gate.resolve(undefined);
-  await expectJson(await acceptance, 200, { ok: true, taskId: "id" });
 });
 
-test("synchronously thrown processor errors are logged and release the ID", async () => {
+test("synchronously thrown processor errors are logged and permit explicit redispatch", async () => {
   const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
   const dispatcher = new RetainedTaskDispatcher(new FakeAlarmStorage(), {
     fetch() {
@@ -757,7 +1297,7 @@ test("synchronously thrown processor errors are logged and release the ID", asyn
     },
   });
   for (const count of [1, 2]) {
-    await expectReleased(dispatcher, "id");
+    await expectRedispatchAllowed(dispatcher, "id");
     await waitFor(() => log.mock.calls.length === count);
     expect(log).toHaveBeenLastCalledWith(
       "task processor failed",

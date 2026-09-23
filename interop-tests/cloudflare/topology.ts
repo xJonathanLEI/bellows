@@ -23,13 +23,320 @@ export function cloudflareTopology(
     await fixture.start();
   }, 10_000);
 
-  function assertAttempt(response: ConsumedResponse, taskId: string): void {
+  function assertAttempt(
+    response: ConsumedResponse,
+    taskId: string,
+    nextAction: { type: "done" } | { type: "retryAt"; atMs: number } = {
+      type: "done",
+    },
+  ): void {
     expect(response.status, response.body).toBe(200);
     expect(JSON.parse(response.body)).toEqual({
       taskId,
-      attemptFinished: true,
+      nextAction,
     });
   }
+
+  test("immediate dispatch and completion leave no scheduler records while preserving warming", async () => {
+    const gate = await fixture.gate();
+    const taskId = await publish("/tasks", { name: "Fast dispatch" });
+    await gate.blocked(1);
+    const accepted = await fixture.schedule();
+    expect(accepted.tasks).toEqual({});
+    expect(accepted.metadata ?? null).toBeNull();
+    expect(accepted.alarm).toBeGreaterThan(accepted.now);
+    await dispatch("cloudflare_greeting", taskId);
+    expect((await fixture.schedule()).alarm).toBe(accepted.alarm);
+    await gate.release();
+    await completed([{ taskId, name: "Fast dispatch" }]);
+    await fixture.waitForIdle();
+    const done = await fixture.schedule();
+    expect(done.tasks).toEqual({});
+    expect(done.metadata ?? null).toBeNull();
+    expect(done.alarm).toBe(accepted.alarm);
+  });
+
+  async function pending(taskId: string, atMs?: number) {
+    const state = await poll(
+      `persisted pending instruction for ${taskId}`,
+      () => fixture.schedule(),
+      ({ tasks }) => {
+        const task = tasks[`task:${taskId}`];
+        return (
+          task?.state.type === "pending" &&
+          (atMs === undefined ||
+            (task.nextAttemptAtMs >= atMs && task.nextAttemptAtMs <= atMs + 1))
+        );
+      },
+    );
+    return state.tasks[`task:${taskId}`];
+  }
+
+  async function forgotten() {
+    await poll(
+      "matching done instructions remove all accepted tasks",
+      () => fixture.schedule(),
+      ({ tasks }) => Object.keys(tasks).length === 0,
+    );
+  }
+
+  test("automatically follows an externally occupied and extended lease without building early", async () => {
+    const taskId = await seed("cloudflare_greeting", { name: "Lease hint" });
+    const firstExpiration = Date.now() + 1_000;
+    const secondExpiration = firstExpiration + 1_000;
+    await fixture.admin.query(
+      `UPDATE ${fixture.table} SET lease_worker_id = 123, available_from_unix_ms = $1 WHERE task_id = $2`,
+      [firstExpiration, taskId],
+    );
+    const gate = await fixture.gate();
+    await dispatch("cloudflare_greeting", taskId);
+    await pending(taskId, firstExpiration);
+    const first = await fixture.schedule();
+    expect(first.now).toBeLessThan(firstExpiration);
+    expect(await fixture.activeRequestClients()).toHaveLength(0);
+    expect(await fixture.executions(taskId)).toEqual([]);
+    await fixture.admin.query(
+      `UPDATE ${fixture.table} SET available_from_unix_ms = $1 WHERE task_id = $2 AND lease_worker_id = 123`,
+      [secondExpiration, taskId],
+    );
+    // No redispatch: the first alarm must observe the renewed lease and retain its later hint.
+    await pending(taskId, secondExpiration);
+    const extended = await fixture.schedule();
+    expect(extended.metadata.nextAttemptId).toBeGreaterThan(
+      first.metadata.nextAttemptId,
+    );
+    expect(extended.now).toBeLessThan(secondExpiration);
+    expect(extended.alarm).toBe(
+      extended.tasks[`task:${taskId}`].nextAttemptAtMs,
+    );
+    expect((await fixture.state()).tasks[0].lease_worker_id).toBe("123");
+    expect(await fixture.activeRequestClients()).toHaveLength(0);
+    expect(await fixture.executions(taskId)).toEqual([]);
+    await gate.blocked(1);
+    await gate.release();
+    await completed([{ taskId, name: "Lease hint" }]);
+    expect(
+      Number((await fixture.executions(taskId))[0].executed_at_ms),
+    ).toBeGreaterThanOrEqual(secondExpiration);
+    await forgotten();
+  }, 10_000);
+
+  for (const mode of ["failure", "success", "immediate"] as const) {
+    test(`automatically executes a committed ${mode} reschedule under the same ID`, async () => {
+      const atMs = Date.now() + 1_500;
+      const name = `${mode} reschedule`;
+      const taskId = await publish("/scheduled", {
+        name,
+        mode,
+        availableFromMs: atMs,
+      });
+      if (mode !== "immediate") {
+        const record = await pending(taskId, atMs);
+        expect(record.infrastructureFailures).toBe(0);
+        // The DO cannot act on an intended schedule before PostgreSQL has committed it.
+        const state = await fixture.state();
+        expect(state.tasks).toHaveLength(1);
+        expect(state.tasks[0]).toMatchObject({
+          task_id: taskId,
+          task_name: "cloudflare_scheduling",
+          lease_worker_id: null,
+          available_from_unix_ms: String(atMs),
+        });
+        expect(state.processed).toEqual([
+          { task_id: taskId, name, execution_count: 1 },
+        ]);
+        expect(Date.now()).toBeLessThan(atMs);
+      }
+      const done = await poll(
+        "second attempt completes without a producer request",
+        () => fixture.state(),
+        ({ tasks, processed }) =>
+          tasks.length === 0 && processed[0]?.execution_count === 2,
+      );
+      expect(done.processed).toEqual([
+        { task_id: taskId, name, execution_count: 2 },
+      ]);
+      const executions = await fixture.executions(taskId);
+      expect(executions.map(({ execution_count }) => execution_count)).toEqual([
+        1, 2,
+      ]);
+      if (mode !== "immediate") {
+        expect(Number(executions[0].executed_at_ms)).toBeLessThan(atMs);
+        expect(Number(executions[1].executed_at_ms)).toBeGreaterThanOrEqual(
+          atMs,
+        );
+      }
+      expect(
+        (
+          await fixture.admin.query(
+            `SELECT last_value FROM "${fixture.schema}".bellows_tasks_task_id_seq`,
+          )
+        ).rows,
+      ).toEqual([{ last_value: taskId }]);
+      await forgotten();
+      await fixture.waitForIdle();
+    }, 10_000);
+  }
+
+  test("recovers a scheduled task's lost committed response after real-storage reconstruction without republishing", async () => {
+    const taskId = await seed("cloudflare_greeting", { name: "Lost response" });
+    const atMs = Date.now() + 1_500;
+    await fixture.admin.query(
+      `UPDATE ${fixture.table} SET available_from_unix_ms = $1 WHERE task_id = $2`,
+      [atMs, taskId],
+    );
+    const gate = await fixture.gate();
+    await dispatch("cloudflare_greeting", taskId);
+    await pending(taskId, atMs);
+    await fixture.consume(
+      fixture.processor.fetch("/__test/lose-response", json({ taskId })),
+      "arm fixture response loss",
+    );
+    await gate.blocked(1);
+    const running = await fixture.schedule();
+    expect(running.tasks[`task:${taskId}`].state.type).toBe("running");
+    const dispatcher = await fixture.dispatcher();
+    await fixture.consume(
+      dispatcher.fetch("https://dispatcher/__test/reconstruct"),
+      "reconstruct with a persisted in-flight attempt",
+    );
+    expect(await fixture.schedule()).toMatchObject({
+      metadata: running.metadata,
+      tasks: running.tasks,
+      alarm: running.alarm,
+    });
+    await gate.release();
+    await completed([{ taskId, name: "Lost response" }]);
+    const retry = await pending(taskId);
+    expect(retry.infrastructureFailures).toBe(1);
+    expectedLogs.push({
+      level: "error",
+      message: `task processor failed ${taskId} task processor returned HTTP 503: fixture response lost`,
+    });
+    await fixture.consume(
+      dispatcher.fetch("https://dispatcher/__test/reconstruct"),
+      "reconstruct the persisted infrastructure retry",
+    );
+    expect((await fixture.schedule()).tasks[`task:${taskId}`]).toEqual(retry);
+    // Automatic retry observes the missing PostgreSQL row; no new business worker is built.
+    const missingGate = await fixture.gate("bellows_tasks");
+    const pids = await missingGate.blocked(1);
+    const retrying = await fixture.schedule();
+    expect(retrying.tasks[`task:${taskId}`].state.type).toBe("running");
+    expect(retrying.metadata.nextAttemptId).toBeGreaterThan(
+      running.metadata.nextAttemptId,
+    );
+    await missingGate.release();
+    await fixture.waitForClientExit(pids);
+    await forgotten();
+    await completed([{ taskId, name: "Lost response" }]);
+    expect(await fixture.executions(taskId)).toHaveLength(1);
+    expect(
+      (
+        await fixture.admin.query(
+          `SELECT last_value FROM "${fixture.schema}".bellows_tasks_task_id_seq`,
+        )
+      ).rows,
+    ).toEqual([{ last_value: taskId }]);
+  }, 10_000);
+
+  test("fans out simultaneous future deadlines across definitions while every business operation is gated", async () => {
+    const gate = await fixture.gate();
+    const atMs = Date.now() + 1_500;
+    const tasks = await Promise.all(
+      Array.from({ length: 12 }, async (_, index) => {
+        const fullName = index % 2 === 1;
+        const name = fullName ? `Family ${index}` : `Greeting ${index}`;
+        const taskId = await publish(
+          `${fullName ? "/full-names" : "/tasks"}?availableFromMs=${atMs}`,
+          fullName
+            ? { firstName: "Family", lastName: String(index) }
+            : { name },
+        );
+        return { taskId, name };
+      }),
+    );
+    await Promise.all(tasks.map(({ taskId }) => pending(taskId, atMs)));
+    expect(Date.now()).toBeLessThan(atMs);
+    expect((await fixture.state()).processed).toEqual([]);
+    // Every automatic attempt reaches its separate connection before any can finish.
+    await gate.blocked(tasks.length);
+    expect(
+      (await fixture.state()).tasks.every(
+        ({ lease_worker_id }) => lease_worker_id !== null,
+      ),
+    ).toBe(true);
+    await gate.release();
+    await completed(tasks.sort((a, b) => Number(a.taskId) - Number(b.taskId)));
+    for (const { taskId } of tasks) {
+      const executions = await fixture.executions(taskId);
+      expect(executions).toHaveLength(1);
+      expect(Number(executions[0].executed_at_ms)).toBeGreaterThanOrEqual(atMs);
+    }
+    await forgotten();
+  }, 10_000);
+
+  test("publishes future work once and reconstructs its real-storage schedule before an automatic alarm", async () => {
+    const atMs = Date.now() + 1_500;
+    const gate = await fixture.gate();
+    const dispatcher = await fixture.dispatcher();
+    const taskId = await publish(`/tasks?availableFromMs=${atMs}`, {
+      name: "Durable hint",
+    });
+    const inspect = () => fixture.schedule();
+    const pending = await poll(
+      "committed future hint",
+      inspect,
+      (state) => state.tasks[`task:${taskId}`]?.state.type === "pending",
+    );
+    expect(
+      pending.tasks[`task:${taskId}`].nextAttemptAtMs,
+    ).toBeGreaterThanOrEqual(atMs);
+    expect(pending.tasks[`task:${taskId}`].nextAttemptAtMs).toBeLessThanOrEqual(
+      atMs + 1,
+    );
+    expect(pending.alarm).toBe(pending.tasks[`task:${taskId}`].nextAttemptAtMs);
+    expect(pending.now).toBeLessThan(atMs);
+    expect((await fixture.state()).tasks[0].lease_worker_id).toBeNull();
+    expect((await fixture.state()).tasks[0].available_from_unix_ms).toBe(
+      String(atMs),
+    );
+    expect((await fixture.state()).processed).toEqual([]);
+    await fixture.consume(
+      dispatcher.fetch("https://dispatcher/__test/reconstruct"),
+      "reconstruct delegate, retaining real storage",
+    );
+    expect(await inspect()).toMatchObject({
+      metadata: pending.metadata,
+      tasks: pending.tasks,
+      alarm: pending.alarm,
+    });
+    // No second dispatch or manual alarm. This waits for a real service-bound worker
+    // admitted by PostgreSQL after the platform automatically delivers the shared alarm.
+    await gate.blocked(1);
+    expect(Date.now()).toBeGreaterThanOrEqual(atMs);
+    await gate.release();
+    await completed([{ taskId, name: "Durable hint" }]);
+    const executions = await fixture.executions(taskId);
+    expect(executions).toHaveLength(1);
+    expect(Number(executions[0].executed_at_ms)).toBeGreaterThanOrEqual(atMs);
+    expect(
+      (
+        await fixture.admin.query(
+          `SELECT last_value FROM "${fixture.schema}".bellows_tasks_task_id_seq`,
+        )
+      ).rows,
+    ).toEqual([{ last_value: taskId }]);
+    const done = await poll(
+      "done instruction deletes durable task",
+      inspect,
+      (state) => Object.keys(state.tasks).length === 0,
+    );
+    expect(done.metadata.nextAttemptId).toBeGreaterThan(
+      pending.metadata.nextAttemptId,
+    );
+    expect(done.alarm).toBe(pending.metadata.nextHeartbeatAtMs);
+  }, 10_000);
 
   afterEach(async ({ task }) => {
     try {
@@ -38,7 +345,16 @@ export function cloudflareTopology(
           await fixture.debug();
         }
       } finally {
-        await fixture.close();
+        // Stop fixture-owned retained retries before releasing gates or dropping its schema.
+        try {
+          const dispatcher = await fixture.dispatcher();
+          await fixture.consume(
+            dispatcher.fetch("https://dispatcher/__test/clear"),
+            "clear fixture schedule",
+          );
+        } finally {
+          await fixture.close();
+        }
       }
       // Check after shutdown too: canceled I/O and request-context warnings are
       // failures, not acceptable noise. Only explicit negative-test errors pass.
@@ -364,6 +680,10 @@ export function cloudflareTopology(
       JSON.stringify(payload),
     );
     await gate.blocked(1);
+    const leased = (await fixture.state()).tasks.find(
+      (row) => row.task_id === taskId,
+    );
+    const expiration = Number(leased?.available_from_unix_ms);
     const competing = await fixture.consume(
       fixture.processor.fetch(
         "/process",
@@ -375,7 +695,11 @@ export function cloudflareTopology(
       ),
       "competing processor attempt to finish without claiming or writing",
     );
-    assertAttempt(competing, taskId);
+    const action = JSON.parse(competing.body).nextAction;
+    assertAttempt(competing, taskId, { type: "retryAt", atMs: action.atMs });
+    // Rust conservatively rounds the local deadline up by at most one millisecond.
+    expect(action.atMs).toBeGreaterThanOrEqual(expiration);
+    expect(action.atMs).toBeLessThanOrEqual(expiration + 1);
     expect(
       await claimed(taskId, "cloudflare_greeting", JSON.stringify(payload)),
     ).toBe(owner);
@@ -397,7 +721,41 @@ export function cloudflareTopology(
     await completed([{ taskId, name: "Claimed payload" }]);
   }, 10_000);
 
-  test("releases a claim after a real constraint failure and permits explicit redispatch", async () => {
+  test("reports future availability without adding blocked query latency", async () => {
+    const taskId = await seed("cloudflare_greeting", { name: "Future" });
+    const atMs = Date.now() + 60_000;
+    await fixture.admin.query(
+      `UPDATE ${fixture.table} SET available_from_unix_ms = $1 WHERE task_id = $2`,
+      [atMs, taskId],
+    );
+    const gate = await fixture.gate("bellows_tasks");
+    const response = fixture.consume(
+      fixture.processor.fetch(
+        "/process",
+        json({ taskId, taskName: "cloudflare_greeting" }),
+      ),
+      "future scheduling instruction after blocked claim and backend shutdown",
+    );
+    await gate.blocked(1);
+    // Hold a real query long enough to distinguish a paired clock conversion from query latency.
+    await fixture.admin.query("SELECT pg_sleep(0.05)");
+    await gate.release();
+    const result = await response;
+    const action = JSON.parse(result.body).nextAction;
+    assertAttempt(result, taskId, { type: "retryAt", atMs: action.atMs });
+    expect(action.atMs).toBeGreaterThanOrEqual(atMs);
+    expect(action.atMs).toBeLessThanOrEqual(atMs + 1);
+    const state = await fixture.state();
+    expect(state.processed).toEqual([]);
+    expect(state.tasks[0]).toMatchObject({
+      task_id: taskId,
+      lease_worker_id: null,
+      available_from_unix_ms: String(atMs),
+    });
+    expect(await fixture.activeRequestClients()).toHaveLength(0);
+  }, 10_000);
+
+  test("retries a committed business failure automatically after repair", async () => {
     await fixture.admin.query(`
 ALTER TABLE ${fixture.processedTable}
 ADD CONSTRAINT reject_retry_name CHECK (name <> 'Retry after repair')
@@ -423,31 +781,13 @@ ADD CONSTRAINT reject_retry_name CHECK (name <> 'Retry after repair')
       payload_json: JSON.stringify({ name: "Retry after repair" }),
     });
     expect(failed.processed).toEqual([]);
-    await fixture.waitForIdle();
-
-    const retry = await fixture.consume(
-      fixture.processor.fetch(
-        "/process",
-        json({
-          taskId,
-          taskName: "cloudflare_greeting",
-          payload: { name: "Not the claimed payload" },
-        }),
-      ),
-      "handled constraint failure to finalize and drain before responding",
-    );
-    assertAttempt(retry, taskId);
-    expect(await fixture.activeRequestClients()).toHaveLength(0);
-    // HTTP 200 is not success, and the request cannot replace the failing claimed payload.
-    expect(await fixture.state()).toEqual(failed);
     await fixture.admin.query(
       `ALTER TABLE ${fixture.processedTable} DROP CONSTRAINT reject_retry_name`,
     );
-    await redispatch("cloudflare_greeting", taskId);
     await completed([{ taskId, name: "Retry after repair" }]);
   }, 10_000);
 
-  test("validates real routes and payloads and releases a rejected processor fetch", async () => {
+  test("validates real routes and payloads and retains rejected processor attempts", async () => {
     const assertError = (response: ConsumedResponse, status: number) => {
       expect(response.status, response.body).toBe(status);
       expect(JSON.parse(response.body)).toHaveProperty("error");
@@ -457,6 +797,35 @@ ADD CONSTRAINT reject_retry_name CHECK (name <> 'Retry after repair')
       ["/tasks", { method: "GET" }, 405],
       ["/tasks", { method: "POST", body: "{}" }, 415],
       ["/tasks", { ...json({}), body: "{" }, 400],
+      ...["", "-1", "+1", "1.5", "1e3", "Infinity", "8640000000000001"].flatMap(
+        (at) =>
+          [
+            [
+              `/tasks?availableFromMs=${encodeURIComponent(at)}`,
+              json({ name: "Future" }),
+              400,
+            ],
+            [
+              `/full-names?availableFromMs=${encodeURIComponent(at)}`,
+              json({ firstName: "Future", lastName: "Name" }),
+              400,
+            ],
+          ] as const,
+      ),
+      ...[
+        null,
+        [],
+        {},
+        { name: " ", mode: "success", availableFromMs: 1 },
+        { name: "Scheduled", mode: "unknown", availableFromMs: 1 },
+        { name: "Scheduled", mode: "failure", availableFromMs: -1 },
+        { name: "Scheduled", mode: "failure", availableFromMs: 1.5 },
+        {
+          name: "Scheduled",
+          mode: "failure",
+          availableFromMs: 8_640_000_000_000_001,
+        },
+      ].map((body) => ["/scheduled", json(body), 400] as const),
       ...[
         null,
         [],
@@ -588,7 +957,7 @@ ADD CONSTRAINT reject_retry_name CHECK (name <> 'Retry after repair')
     expect(await fixture.state()).toEqual({ tasks: [], processed: [] });
   }, 10_000);
 
-  test("rejects malformed and unknown task names and releases downstream rejection for named redispatch", async () => {
+  test("rejects malformed and unknown task names and permits corrected pending redispatch", async () => {
     const payload = { firstName: "Grace", lastName: "Hopper" };
     const taskId = await seed("cloudflare_full_name", payload);
     const unclaimed = await fixture.state();
