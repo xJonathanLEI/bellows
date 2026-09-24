@@ -1,9 +1,9 @@
 //! Built-in task backend implementations.
 //!
 //! Native defaults include in-memory, SQLite, and PostgreSQL. On wasm, disable defaults and enable
-//! `cloudflare` for listener-free PostgreSQL publishing and execution. Producers can depend on
-//! [`TaskPublishingBackend`], processors on [`TaskExecutionBackend`], and native dispatchers on the
-//! full [`Backend`]. Portable deadlines use [`crate::time::Instant`].
+//! `cloudflare` for listener-free PostgreSQL publishing, execution, and discovery. Producers can
+//! depend on [`TaskPublishingBackend`], processors on [`TaskExecutionBackend`], and native dispatchers
+//! on the full [`Backend`]. Portable deadlines use [`crate::time::Instant`].
 
 use std::{
     error::Error as StdError,
@@ -24,6 +24,11 @@ pub mod postgres;
     all(target_arch = "wasm32", feature = "cloudflare")
 ))]
 mod postgres_common;
+#[cfg(any(
+    all(not(target_arch = "wasm32"), feature = "postgres"),
+    all(target_arch = "wasm32", feature = "cloudflare")
+))]
+pub mod postgres_discovery;
 #[cfg(any(
     all(not(target_arch = "wasm32"), feature = "postgres"),
     all(target_arch = "wasm32", feature = "cloudflare")

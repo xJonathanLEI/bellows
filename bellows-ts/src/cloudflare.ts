@@ -222,8 +222,8 @@ export async function dispatchTask(
  *
  * PostgreSQL claims remain authoritative; renewed leases can move hints later. Watchdog supersession
  * only cancels transport on a best-effort basis, not business promises. Alarms and attempts are
- * at-least-once, not exactly-once side effects. There is no PostgreSQL discovery, Cron, or recovery
- * before a scheduling hint is persisted, and abrupt termination cannot guarantee async cleanup.
+ * at-least-once, not exactly-once side effects. Use `createPostgresSweeper` from `cloudflare/postgres`
+ * in a scheduled Worker to recover missed invocations. Abrupt termination cannot guarantee cleanup.
  */
 export class RetainedTaskDispatcher {
   private readonly inFlight = new Map<

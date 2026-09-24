@@ -1,18 +1,18 @@
-//! Cloudflare PostgreSQL publication, dispatch, and processing with TypeScript-compatible IDs.
+//! Cloudflare PostgreSQL publication, dispatch, processing, and read-only recovery.
 //!
 //! Keep one [`RetainedTaskDispatcher`] per SQLite-backed Durable Object, using the named object
 //! `global`. Dispatch launches with in-memory tracking before checking the warming alarm; active same-ID duplicates
 //! cannot change routing and remain suppressed through full response consumption and result persistence.
 //! A pending ID can be explicitly redispatched immediately with a corrected name.
-//! Generic dispatch accepts opaque IDs; the wasm `sdk::PostgresPublisher` and
-//! `sdk::PostgresProcessor` delegates require canonical positive decimal IDs up to 9007199254740991.
+//! Generic dispatch accepts opaque IDs; the wasm `sdk::PostgresPublisher`, `sdk::PostgresProcessor`,
+//! and `sdk::PostgresSweeper` delegates require canonical positive decimal IDs up to 9007199254740991.
 //!
 //! Bind a publisher to one published task and its dispatcher. Synchronous configuration runs once
 //! per call, not at construction. It publishes once, retains an exact string receipt, validates
 //! the ID, awaits listener-free backend shutdown, then awaits [`dispatch_task`]. Success confirms
-//! acceptance, not completion. Typed errors retain the first stage/cause, any known receipt, and any
-//! later close failure. Close/dispatch receipts permit trusted redispatch with the original
-//! definition name without republishing; `task-id` receipts are unsupported by the processor.
+//! in-memory acceptance, not durable tracking or completion. Typed errors retain the first stage/cause,
+//! any known receipt, and any later close failure. Close/dispatch receipts permit trusted redispatch
+//! with the original definition name without republishing; `task-id` receipts are unsupported by the processor.
 //! Missing receipts do not prove rollback.
 //! Applications own HTTP endpoints, business validation, and side-effect clients. Direct
 //! `PostgresPublishingBackend` plus [`dispatch_task`] remains a caller-managed alternative.
@@ -36,8 +36,10 @@
 //! limits. The watchdog applies to scheduled attempts, not unsaved external dispatches.
 //! Watchdog supersession ignores stale responses but does not guarantee business cancellation.
 //! PostgreSQL remains the execution/lease authority; renewed leases can move hints later.
-//! Durability starts when a scheduling hint is persisted. Earlier loss requires application recovery, with no PostgreSQL
-//! discovery or Cron. Alarms and attempts are at-least-once, not exactly-once side effects.
+//! Durability starts when a scheduling hint is persisted. The wasm `sdk::PostgresSweeper` provides
+//! read-only PostgreSQL rediscovery through the same dispatcher for earlier invocation gaps.
+//! Applications must install their own scheduled entrypoint and Cron Trigger; its selected schema
+//! must belong entirely to the target workload. Alarms and attempts are at-least-once, not exactly-once side effects.
 //! Publication and dispatch are not atomic; there is no automatic republishing, callback delivery, or
 //! application-transaction participation. Await delegate calls within requests; ordinary error
 //! paths await shutdown, but future cancellation, abrupt termination, and wasm traps cannot guarantee it.
@@ -64,6 +66,9 @@ mod processor;
 
 #[cfg(any(target_arch = "wasm32", test))]
 mod publisher;
+
+#[cfg(any(target_arch = "wasm32", test))]
+mod sweeper;
 
 mod scheduler;
 use scheduler::HEARTBEAT_INTERVAL_MS;

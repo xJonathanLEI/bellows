@@ -21,6 +21,10 @@
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
     },
+    "./backends/postgres-discovery": {
+      "types": "./dist/backends/postgres-discovery.d.ts",
+      "default": "./dist/backends/postgres-discovery.js"
+    },
     "./backends/in-memory": {
       "types": "./dist/backends/in-memory.d.ts",
       "default": "./dist/backends/in-memory.js"

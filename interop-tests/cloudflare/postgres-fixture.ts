@@ -114,6 +114,7 @@ export class CloudflarePostgresFixture {
   private lastState: DatabaseState | undefined;
   private readonly releaseGates: Array<() => Promise<void>> = [];
   private readonly responses = new Set<Promise<ConsumedResponse>>();
+  private readonly scheduledEvents = new Set<Promise<unknown>>();
   private readonly gatePids = new Set<number>();
   private readonly requestPids = new Set<number>();
 
@@ -281,6 +282,26 @@ FOR EACH ROW EXECUTE FUNCTION "${this.schema}".record_execution()
     return this.server.getWorker("bellows-cloudflare-processor");
   }
 
+  async runScheduled(
+    outcome: "ok" | "exception" = "ok",
+    scheduledTime = new Date(),
+  ): Promise<void> {
+    const event = this.server
+      .getWorker()
+      .scheduled({ cron: "* * * * *", scheduledTime });
+    this.scheduledEvents.add(event);
+    void event.then(
+      () => this.scheduledEvents.delete(event),
+      () => this.scheduledEvents.delete(event),
+    );
+    const result = await deadline(event, "complete scheduled sweep", 3_000);
+    if (result.outcome !== outcome) {
+      throw new Error(
+        `Scheduled sweep outcome: expected ${outcome}, received ${result.outcome}`,
+      );
+    }
+  }
+
   async consume(
     response: Promise<ResponseLike>,
     description: string,
@@ -302,10 +323,10 @@ FOR EACH ROW EXECUTE FUNCTION "${this.schema}".record_execution()
   async gate(table: "processed_tasks" | "bellows_tasks" = "processed_tasks") {
     const client = this.createClient();
     let releasing: Promise<void> | undefined;
-    const release = () => {
+    const release = (statement: "ROLLBACK" | "COMMIT" = "ROLLBACK") => {
       releasing ??= (async () => {
         try {
-          await client.query("ROLLBACK");
+          await client.query(statement);
         } finally {
           await client.end();
         }
@@ -323,6 +344,8 @@ FOR EACH ROW EXECUTE FUNCTION "${this.schema}".record_execution()
     await client.query(`LOCK TABLE ${relation} IN SHARE MODE`);
     return {
       release,
+      // The lock owner can change eligibility before releasing blocked claims.
+      client,
       blocked: async (count: number) =>
         await poll(
           `${count} processor connection(s) blocked on ${table}`,
@@ -442,6 +465,13 @@ FOR EACH ROW EXECUTE FUNCTION "${this.schema}".record_execution()
         deadline(
           Promise.allSettled([...this.responses]),
           "draining caller responses",
+          3_000,
+        ),
+      );
+      await clean("settle outstanding scheduled events", () =>
+        deadline(
+          Promise.allSettled([...this.scheduledEvents]),
+          "draining scheduled events",
           3_000,
         ),
       );

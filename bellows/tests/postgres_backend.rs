@@ -31,6 +31,7 @@ use bellows::{
     backends::{
         ClaimTaskError, FailTaskError, FinishTaskError, PublishTaskError, RenewTaskError,
         postgres::{PostgresBackend, PostgresBackendOptions, initialize_postgres_schema},
+        postgres_discovery::PostgresDiscoveryBackend,
         postgres_execution::PostgresExecutionBackend,
         postgres_publishing::PostgresPublishingBackend,
     },
@@ -45,6 +46,40 @@ use tokio::sync::{
 };
 
 struct EchoTaskSpec;
+
+#[tokio::test]
+async fn discovery_default_schema_is_read_only_and_never_initialized_on_connect() {
+    let database = TestDatabase::new("discovery_default").await;
+    let backend = PostgresDiscoveryBackend::connect(database.url())
+        .await
+        .unwrap();
+    assert!(backend.begin_sweep().await.is_err());
+    backend.close().await.unwrap();
+    initialize_postgres_schema(database.url(), "public")
+        .await
+        .unwrap();
+    let mut admin = PgConnection::connect(database.url()).await.unwrap();
+    admin
+        .execute(
+            "INSERT INTO bellows_tasks (task_name, payload_json) VALUES (' 未登録 ', 'not json')",
+        )
+        .await
+        .unwrap();
+    let backend = PostgresDiscoveryBackend::connect(&format!(
+        "{}?options=-c%20default_transaction_read_only%3Don",
+        database.url()
+    ))
+    .await
+    .unwrap();
+    let window = backend.begin_sweep().await.unwrap();
+    let page = backend.read_page(&window, None).await.unwrap();
+    assert_eq!(page[0].task_name, " 未登録 ");
+    assert_eq!(page[0].task_id, 1);
+    backend.close().await.unwrap();
+    assert!(backend.begin_sweep().await.is_err());
+    admin.close().await.unwrap();
+    database.cleanup().await;
+}
 
 #[tokio::test]
 async fn failed_claim_follow_up_never_reports_an_existing_due_row_missing() {
@@ -847,6 +882,15 @@ async fn test_postgres_rejects_invalid_schema_before_connecting() {
     for schema in [
         "", "Public", "1schema", "a.b", "a\"b", "a b", "a\n", "a\r", "a\nb", "é", "a-b",
     ] {
+        let error = PostgresDiscoveryBackend::connect_with_options(
+            "not a database URL",
+            PostgresBackendOptions {
+                schema: Some(schema.to_owned()),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, sqlx::Error::Configuration(_)));
         let error = PostgresBackend::connect_with_options(
             "not a database URL",
             PostgresBackendOptions {

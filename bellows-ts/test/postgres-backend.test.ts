@@ -6,6 +6,7 @@ import {
   initializePostgresSchema,
   PostgresBackend,
 } from "../src/backends/postgres.js";
+import { PostgresDiscoveryBackend } from "../src/backends/postgres-discovery.js";
 import { PostgresExecutionBackend } from "../src/backends/postgres-execution.js";
 import {
   PostgresTaskOperations,
@@ -52,6 +53,179 @@ const adminDatabaseUrl =
   "postgres://postgres:postgres@localhost:5432/postgres";
 
 const resources: Array<{ close: () => Promise<void> | void }> = [];
+
+test.each([
+  undefined,
+  "discovery_workload",
+])("discovery is exact, read-only and keyset bounded (schema=%s)", async (schema) => {
+  const database = track(await TestPostgresDatabase.create("discovery"));
+  const admin = new Client({ connectionString: database.url });
+  await admin.connect();
+  const table = `"${schema ?? "public"}"."bellows_tasks"`;
+  let backend: PostgresDiscoveryBackend | undefined;
+  try {
+    if (schema) await admin.query(`CREATE SCHEMA "${schema}"`);
+    await initializePostgresSchema(database.url, schema ?? "public");
+    await admin.query('CREATE SCHEMA "other_workload"');
+    await initializePostgresSchema(database.url, "other_workload");
+    await admin.query(`INSERT INTO other_workload.bellows_tasks (task_name, payload_json)
+                         VALUES ('wrong schema', '!')`);
+    const readOnlyUrl = new URL(database.url);
+    readOnlyUrl.searchParams.set(
+      "options",
+      "-c default_transaction_read_only=on",
+    );
+    backend = await PostgresDiscoveryBackend.connect(
+      readOnlyUrl.toString(),
+      schema ? { schema } : {},
+    );
+    const empty = await backend.beginSweep();
+    expect(empty.upperId).toBeNull();
+    expect(await backend.readPage(empty, null)).toEqual([]);
+    await admin.query(`INSERT INTO ${table} (task_id, task_name, task_unique_key, payload_json)
+        OVERRIDING SYSTEM VALUE VALUES (9223372036854775807, 'singleton', 'unique', '!')`);
+    expect((await backend.beginSweep()).upperId).toBeNull();
+    await admin.query(`INSERT INTO ${table} (task_id, task_name, payload_json)
+        OVERRIDING SYSTEM VALUE
+        SELECT n * 10, CASE WHEN n % 2 = 0 THEN ' 未登録/🔥 ' ELSE 'unregistered' END,
+               'invalid JSON: never decode' FROM generate_series(1, 205) n;
+        INSERT INTO ${table} (task_id, task_name, payload_json) OVERRIDING SYSTEM VALUE VALUES
+        (-9223372036854775808, 'minimum', '!'), (-1, 'negative', '!'), (0, '', '!'),
+        (2100, 'past', '!'), (2110, 'exact', '!'), (2120, 'future', '!'),
+        (2130, 'expired owner', '!'), (2140, 'occupied', '!'),
+        (9007199254740991, 'safe', '!'), (9007199254740992, 'unsafe', '!'),
+        (9007199254740993, 'unsafe exact', '!'), (9223372036854775806, 'upper', '!')`);
+    const window = await backend.beginSweep();
+    expect(window.upperId).toBe("9223372036854775806");
+    expect(await backend.readPage(empty, null)).toEqual([]);
+    const clock = (
+      await admin.query<{ now: string }>(
+        "SELECT FLOOR(EXTRACT(EPOCH FROM statement_timestamp()) * 1000)::bigint::text AS now",
+      )
+    ).rows[0]?.now;
+    if (clock === undefined) throw new Error("Database clock missing");
+    expect(BigInt(window.cutoffUnixMs)).toBeLessThanOrEqual(BigInt(clock));
+    expect(BigInt(clock) - BigInt(window.cutoffUnixMs)).toBeLessThan(5_000n);
+    await admin.query(
+      `UPDATE ${table} SET available_from_unix_ms = CASE task_id
+        WHEN 2100 THEN $1::bigint - 1 WHEN 2110 THEN $1::bigint WHEN 2130 THEN $1::bigint
+        ELSE $1::bigint + 1 END,
+        lease_worker_id = CASE WHEN task_id IN (2130, 2140) THEN 77 END
+        WHERE task_id BETWEEN 2100 AND 2140`,
+      [window.cutoffUnixMs],
+    );
+    await admin.query("SELECT pg_sleep(0.01)");
+    const snapshot = async () =>
+      (
+        await admin.query(
+          `SELECT row_to_json(t)::text FROM ${table} t ORDER BY task_id`,
+        )
+      ).rows;
+    const before = await snapshot();
+    const first = await backend.readPage(window, null);
+    expect(first).toHaveLength(100);
+    expect(first[0]).toEqual({
+      taskId: "-9223372036854775808",
+      taskName: "minimum",
+    });
+    expect(first[2]).toEqual({ taskId: "0", taskName: "" });
+    expect(first[4]?.taskName).toBe(" 未登録/🔥 ");
+    expect(await snapshot()).toEqual(before);
+    // Even a consumer failure must advance by the last returned identity, not an offset.
+    let cursor = first.at(-1)?.taskId;
+    if (cursor === undefined) throw new Error("First page missing");
+    expect(cursor).toBe("970");
+    await admin.query(`DELETE FROM ${table} WHERE task_id = 10;
+        UPDATE ${table} SET available_from_unix_ms = 9223372036854775807 WHERE task_id = 20;
+        DELETE FROM ${table} WHERE task_unique_key IS NOT NULL;
+        INSERT INTO ${table} (task_id, task_name, payload_json) OVERRIDING SYSTEM VALUE
+        VALUES (5, 'late behind cursor', '!'), (9223372036854775807, 'new publication', '!')`);
+    const changed = await snapshot();
+    const remaining: string[] = [];
+    for (;;) {
+      const page = await backend.readPage(window, cursor);
+      expect(page.length).toBeLessThanOrEqual(100);
+      const firstRow = page[0];
+      const lastRow = page.at(-1);
+      if (!firstRow || !lastRow) break;
+      expect(BigInt(firstRow.taskId)).toBeGreaterThan(BigInt(cursor));
+      cursor = lastRow.taskId;
+      remaining.push(...page.map((row) => row.taskId));
+    }
+    expect(remaining).toEqual([
+      ...Array.from({ length: 108 }, (_, n) => String((n + 98) * 10)),
+      "2100",
+      "2110",
+      "2130",
+      "9007199254740991",
+      "9007199254740992",
+      "9007199254740993",
+      "9223372036854775806",
+    ]);
+    expect(await snapshot()).toEqual(changed);
+    const next = await backend.beginSweep();
+    expect(next.upperId).toBe("9223372036854775807");
+    expect(
+      (await backend.readPage(next, null)).map((row) => row.taskId),
+    ).toContain("5");
+    expect(await backend.readPage(next, "9223372036854775806")).toEqual([
+      { taskId: "9223372036854775807", taskName: "new publication" },
+    ]);
+    expect(await backend.readPage(next, "9223372036854775807")).toEqual([]);
+    const nowDue = await backend.readPage(next, "2099");
+    expect(nowDue.map((row) => row.taskId)).toEqual(
+      expect.arrayContaining(["2120", "2140"]),
+    );
+  } finally {
+    await backend?.close();
+    await admin.end();
+  }
+  if (!backend) throw new Error("Backend missing");
+  await expect(backend.beginSweep()).rejects.toThrow();
+});
+
+test("discovery never initializes tables and closes after query failure", async () => {
+  const database = track(
+    await TestPostgresDatabase.create("discovery_missing"),
+  );
+  const backend = await PostgresDiscoveryBackend.connect(database.url);
+  try {
+    await expect(backend.beginSweep()).rejects.toThrow(/does not exist/);
+    await expect(
+      backend.readPage({ cutoffUnixMs: "0", upperId: "1" }, null),
+    ).rejects.toThrow(/does not exist/);
+  } finally {
+    await backend.close();
+  }
+});
+
+test("postgres discovery exposes only discovery and lifecycle methods", () => {
+  expectTypeOf<keyof PostgresDiscoveryBackend>().toEqualTypeOf<
+    "beginSweep" | "readPage" | "close"
+  >();
+});
+
+test("discovery awaits pool shutdown", async () => {
+  const gate = new Gate();
+  const end = vi.spyOn(Pool.prototype, "end").mockImplementation(async () => {
+    await gate.wait();
+  });
+  try {
+    const backend = await PostgresDiscoveryBackend.connect("not used");
+    let settled = false;
+    const close = backend.close().then(() => {
+      settled = true;
+    });
+    await Promise.resolve();
+    expect(end).toHaveBeenCalledOnce();
+    expect(settled).toBe(false);
+    gate.release();
+    await close;
+    expect(settled).toBe(true);
+  } finally {
+    end.mockRestore();
+  }
+});
 
 test("failed claim follow-up never reports an existing due row missing", async () => {
   const database = track(await TestPostgresDatabase.create("claim_follow_up"));
@@ -606,6 +780,9 @@ test("postgres rejects invalid schemas before connecting", async () => {
     ).rejects.toThrow("Database schema names");
     await expect(
       PostgresPublishingBackend.connect("not a database URL", { schema }),
+    ).rejects.toThrow("Database schema names");
+    await expect(
+      PostgresDiscoveryBackend.connect("not a database URL", { schema }),
     ).rejects.toThrow("Database schema names");
     await expect(
       initializePostgresSchema("not a database URL", schema),

@@ -79,6 +79,65 @@ export interface PostgresBackendOptions {
   readonly schema?: string;
 }
 
+/** Fixed database-time/ID bounds, not a repeatable-read snapshot. All BIGINTs stay exact. */
+export interface PostgresSweepWindow {
+  readonly cutoffUnixMs: string;
+  readonly upperId: string | null;
+}
+
+/** Raw stored identity; consumer-specific ID/name validation belongs after discovery. */
+export interface PostgresDiscoveryCandidate {
+  readonly taskId: string;
+  readonly taskName: string;
+}
+
+export class PostgresDiscoveryOperations {
+  private readonly tableName: string;
+
+  constructor(
+    private readonly pool: Pool,
+    options: PostgresBackendOptions = {},
+  ) {
+    this.tableName = qualifiedTasksTable(parseSchemaOption(options));
+  }
+
+  async beginSweep(): Promise<PostgresSweepWindow> {
+    const result = await this.pool.query<{
+      cutoff_unix_ms: string;
+      upper_id: string | null;
+    }>(`
+      SELECT FLOOR(EXTRACT(EPOCH FROM statement_timestamp()) * 1000)::bigint::text AS cutoff_unix_ms,
+             MAX(task_id)::text AS upper_id
+      FROM ${this.tableName} WHERE task_unique_key IS NULL
+    `);
+    const row = result.rows[0];
+    if (!row) throw new Error("PostgreSQL discovery returned no sweep window.");
+    return { cutoffUnixMs: row.cutoff_unix_ms, upperId: row.upper_id };
+  }
+
+  async readPage(
+    window: PostgresSweepWindow,
+    lastSeenId: string | null,
+  ): Promise<PostgresDiscoveryCandidate[]> {
+    const result = await this.pool.query<{
+      task_id: string;
+      task_name: string;
+    }>(
+      `SELECT task_id::text, task_name FROM ${this.tableName}
+       WHERE task_unique_key IS NULL
+         AND (available_from_unix_ms IS NULL OR available_from_unix_ms <= $1::bigint)
+         AND task_id <= $2::bigint
+         AND ($3::bigint IS NULL OR task_id > $3::bigint)
+       ORDER BY ${this.tableName}.task_id LIMIT $4`,
+      [window.cutoffUnixMs, window.upperId, lastSeenId, 100],
+    );
+    return result.rows.map((row) => ({
+      taskId: row.task_id,
+      taskName: row.task_name,
+    }));
+  }
+}
+
 /** Bind order: `$1` task name, `$2` encoded JSON text, `$3` callback ID, `$4` Unix milliseconds. */
 export type PostgresPublishParameters = [
   taskName: string,

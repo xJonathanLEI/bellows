@@ -1,6 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import {
   createPostgresPublisher,
+  createPostgresSweeper,
   PostgresPublisherError,
 } from "../../../../src/cloudflare/postgres.js";
 import { dispatchTask } from "../../../../src/cloudflare.js";
@@ -15,15 +16,19 @@ interface Env {
 const task = definePublishTask<[string, number[]], string[]>(
   "publisher_contract",
 );
-const publisher = createPostgresPublisher((env: Env) => ({
+const config = (env: Env) => ({
   connectionString: env.HYPERDRIVE.connectionString,
   schema: env.BELLOWS_SCHEMA,
-  task,
   dispatcher: env.DISPATCHER,
+});
+const publisher = createPostgresPublisher((env: Env) => ({
+  ...config(env),
+  task,
 }));
 
 // Test-only controls, separate from the application producer and retained dispatcher.
 export default {
+  scheduled: createPostgresSweeper(config).scheduled,
   async fetch(request: Request, env: Env): Promise<Response> {
     const path = new URL(request.url).pathname;
     if (path === "/publisher/publish" || path === "/publisher/publish-future") {
@@ -62,6 +67,7 @@ export default {
 
 export class PublisherReceiver extends DurableObject<Env> {
   private status = 200;
+  private statuses: number[] = [];
   private readonly dispatches: unknown[] = [];
   private drained = 0;
   private readonly releases: Array<() => void> = [];
@@ -74,9 +80,15 @@ export class PublisherReceiver extends DurableObject<Env> {
           dispatches: this.dispatches,
           drained: this.drained,
         });
-      case "/publisher/response":
-        this.status = (await request.json<{ status: number }>()).status;
+      case "/publisher/response": {
+        const { status, statuses } = await request.json<{
+          status: number;
+          statuses?: number[];
+        }>();
+        this.status = status;
+        this.statuses = statuses ?? [];
         return new Response(null);
+      }
       case "/publisher/release":
         this.releases.shift()?.();
         return new Response(null);
@@ -108,7 +120,7 @@ export class PublisherReceiver extends DurableObject<Env> {
               }
             },
           }),
-          { status: this.status },
+          { status: this.statuses.shift() ?? this.status },
         );
       }
       default:

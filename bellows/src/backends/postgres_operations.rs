@@ -19,11 +19,12 @@ use crate::backends::{
 use crate::{PublishActivationStrategy, TaskDefinition};
 
 use super::postgres_common::{
-    NOTIFY_CHANNEL, NOTIFY_SQL, NotificationPayload, PostgresBackendOptions, PreparedPublication,
-    claim_earliest_sql, claim_published_sql, claim_singleton_sql, earliest_availability_sql,
-    fail_sql, finish_published_sql, finish_rescheduled_sql, finish_singleton_sql,
-    instant_to_unix_ms, published_state_sql, published_task, renew_sql, singleton_state_sql,
-    unix_ms_to_instant, unix_timestamp_ms, validate_schema_name,
+    DISCOVERY_PAGE_SIZE, NOTIFY_CHANNEL, NOTIFY_SQL, NotificationPayload, PostgresBackendOptions,
+    PostgresDiscoveryCandidate, PostgresSweepWindow, PreparedPublication, claim_earliest_sql,
+    claim_published_sql, claim_singleton_sql, discovery_page_sql, discovery_window_sql,
+    earliest_availability_sql, fail_sql, finish_published_sql, finish_rescheduled_sql,
+    finish_singleton_sql, instant_to_unix_ms, published_state_sql, published_task, renew_sql,
+    singleton_state_sql, unix_ms_to_instant, unix_timestamp_ms, validate_schema_name,
 };
 use super::postgres_publishing::{PostgresPublishQuery, PostgresPublishingExecutor};
 
@@ -249,6 +250,38 @@ pub(super) struct PostgresTaskOperations {
 }
 
 impl PostgresTaskOperations {
+    pub(super) async fn begin_sweep(&self) -> Result<PostgresSweepWindow, sqlx::Error> {
+        let row = sqlx::query(&discovery_window_sql(&self.table_name))
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(PostgresSweepWindow {
+            cutoff_unix_ms: row.try_get("cutoff_unix_ms")?,
+            upper_id: row.try_get("upper_id")?,
+        })
+    }
+
+    pub(super) async fn read_page(
+        &self,
+        window: &PostgresSweepWindow,
+        last_seen_id: Option<i64>,
+    ) -> Result<Vec<PostgresDiscoveryCandidate>, sqlx::Error> {
+        sqlx::query(&discovery_page_sql(&self.table_name))
+            .bind(window.cutoff_unix_ms)
+            .bind(window.upper_id)
+            .bind(last_seen_id)
+            .bind(DISCOVERY_PAGE_SIZE)
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(|row| {
+                Ok(PostgresDiscoveryCandidate {
+                    task_id: row.try_get("task_id")?,
+                    task_name: row.try_get("task_name")?,
+                })
+            })
+            .collect()
+    }
+
     pub(super) async fn connect(
         database_url: &str,
         options: PostgresBackendOptions,
@@ -270,7 +303,15 @@ impl PostgresTaskOperations {
     }
 
     pub(super) async fn close(&self) -> Result<(), sqlx::Error> {
-        self.pool.close().await;
+        loop {
+            self.pool.close().await;
+            // SQLx 0.8 can finish its final permit wait just as an asynchronously returned
+            // connection becomes idle, without draining that connection. Finish draining it
+            // before reporting shutdown; the pool is closed to new acquisitions throughout.
+            if self.pool.size() == 0 {
+                break;
+            }
+        }
         Ok(())
     }
 

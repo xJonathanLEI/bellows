@@ -10,6 +10,13 @@ export {
   type PostgresPublisherReceipt,
   type PostgresPublisherStage,
 } from "./postgres-publisher.js";
+export {
+  createPostgresSweeper,
+  type PostgresSweeperConfig,
+  PostgresSweeperError,
+  type PostgresSweeperStage,
+  type PostgresSweepReport,
+} from "./postgres-sweeper.js";
 
 const executeTask = Symbol("executeTask");
 

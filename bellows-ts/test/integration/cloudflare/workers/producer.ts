@@ -1,6 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import {
   createPostgresPublisher,
+  createPostgresSweeper,
   PostgresPublisherError,
   type PostgresPublisherReceipt,
 } from "../../../../src/cloudflare/postgres.js";
@@ -39,6 +40,7 @@ function validName(value: unknown): value is string {
 }
 
 export default {
+  scheduled: createPostgresSweeper(publisherConfig).scheduled,
   async fetch(request, env): Promise<Response> {
     const url = new URL(request.url);
     const path = url.pathname;

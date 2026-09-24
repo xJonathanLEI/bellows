@@ -9,7 +9,10 @@ use bellows::{
     backends::postgres_publishing::PostgresBackendOptions,
     cloudflare::{
         RetainedTaskDispatcher,
-        sdk::{Dispatcher, PostgresPublisher, PostgresPublisherConfig},
+        sdk::{
+            Dispatcher, PostgresPublisher, PostgresPublisherConfig, PostgresSweeper,
+            PostgresSweeperConfig,
+        },
     },
 };
 use serde_json::json;
@@ -41,6 +44,33 @@ fn publisher_config(env: &Env) -> Result<PostgresPublisherConfig> {
         },
         env.durable_object("DISPATCHER")?,
     ))
+}
+
+fn sweeper_config(env: &Env) -> Result<PostgresSweeperConfig> {
+    Ok(PostgresSweeperConfig::new(
+        env.hyperdrive("HYPERDRIVE")?.connection_string(),
+        PostgresBackendOptions {
+            schema: Some(env.var("BELLOWS_SCHEMA")?.to_string()),
+        },
+        env.durable_object("DISPATCHER")?,
+    ))
+}
+
+// worker 0.8.5's #[event(scheduled)] discards the handler's Result. Export a real
+// rejecting promise instead, without exposing the typed error's driver/candidate causes.
+#[wasm_bindgen::prelude::wasm_bindgen]
+pub fn scheduled(
+    _event: worker_sys::ScheduledEvent,
+    env: Env,
+    _ctx: worker_sys::ScheduleContext,
+) -> js_sys::Promise {
+    js_sys::futures::future_to_promise(std::panic::AssertUnwindSafe(async move {
+        PostgresSweeper::new(sweeper_config)
+            .sweep(&env)
+            .await
+            .map_err(|error| js_sys::Error::new(&error.to_string()))?;
+        Ok(wasm_bindgen::JsValue::UNDEFINED)
+    }))
 }
 
 #[event(fetch)]

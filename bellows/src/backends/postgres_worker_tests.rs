@@ -18,6 +18,7 @@ use crate::{
     Backend, PublishTrigger, SingletonTrigger, TaskExecutionBackend,
     backends::{
         postgres::{PostgresBackend, initialize_postgres_schema},
+        postgres_discovery::PostgresDiscoveryBackend,
         postgres_execution::PostgresExecutionBackend,
         postgres_publishing::PostgresPublishingBackend,
     },
@@ -25,6 +26,302 @@ use crate::{
 
 const DATABASE_URL: &str = "postgres://postgres:postgres@localhost:5432/postgres";
 const LIMIT: Duration = Duration::from_secs(5);
+
+#[tokio::test]
+async fn discovery_native_and_workers_share_exact_read_only_keyset_semantics() {
+    let f = Fixture::new().await;
+    let other = Fixture::new().await;
+    other.echo("not in this schema").await;
+    let ops = f.connect().await;
+    let native = PostgresDiscoveryBackend::connect_with_options(
+        &f.url(),
+        PostgresBackendOptions {
+            schema: Some(f.schema.clone()),
+        },
+    )
+    .await
+    .unwrap();
+    let empty = ops.begin_sweep().await.unwrap();
+    assert_eq!(empty.upper_id, None);
+    assert_eq!(native.begin_sweep().await.unwrap().upper_id, None);
+    assert!(ops.read_page(&empty, None).await.unwrap().is_empty());
+    assert!(native.read_page(&empty, None).await.unwrap().is_empty());
+    // A singleton larger than every published ID must not extend the window.
+    f.admin
+        .batch_execute(&format!(
+            "INSERT INTO {} (task_id, task_name, task_unique_key, payload_json)
+         OVERRIDING SYSTEM VALUE VALUES (9223372036854775807, 'singleton', 'unique', 'not json')",
+            f.table,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(ops.begin_sweep().await.unwrap().upper_id, None);
+    assert_eq!(native.begin_sweep().await.unwrap().upper_id, None);
+    f.admin
+        .batch_execute(&format!(
+            "INSERT INTO {table} (task_id, task_name, payload_json) OVERRIDING SYSTEM VALUE
+         SELECT n * 10, CASE WHEN n % 2 = 0 THEN ' 未登録/🔥 ' ELSE 'unregistered' END,
+                'invalid JSON: never decode' FROM generate_series(1, 205) n;
+         INSERT INTO {table} (task_id, task_name, payload_json) OVERRIDING SYSTEM VALUE VALUES
+         (-9223372036854775808, 'minimum', '!'), (-1, 'negative', '!'), (0, '', '!'),
+         (2100, 'past', '!'), (2110, 'exact', '!'), (2120, 'future', '!'),
+         (2130, 'expired owner', '!'), (2140, 'occupied', '!'),
+         (9007199254740991, 'safe', '!'), (9007199254740992, 'unsafe', '!'),
+         (9007199254740993, 'unsafe exact', '!'), (9223372036854775806, 'upper', '!')",
+            table = f.table,
+        ))
+        .await
+        .unwrap();
+    let window = ops.begin_sweep().await.unwrap();
+    assert!(ops.read_page(&empty, None).await.unwrap().is_empty());
+    assert!(native.read_page(&empty, None).await.unwrap().is_empty());
+    assert_eq!(window.upper_id, Some(i64::MAX - 1));
+    let native_window = native.begin_sweep().await.unwrap();
+    assert_eq!(native_window.upper_id, window.upper_id);
+    assert!(native_window.cutoff_unix_ms >= window.cutoff_unix_ms);
+    let clock: i64 = f
+        .admin
+        .query_one(
+            "SELECT FLOOR(EXTRACT(EPOCH FROM statement_timestamp()) * 1000)::bigint",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(window.cutoff_unix_ms <= clock);
+    assert!(clock - window.cutoff_unix_ms < 5_000);
+    f.admin
+        .execute(
+            &format!(
+                "UPDATE {} SET available_from_unix_ms = CASE task_id
+                  WHEN 2100 THEN $1::bigint - 1 WHEN 2110 THEN $1::bigint WHEN 2130 THEN $1::bigint
+                  ELSE $1::bigint + 1 END,
+                  lease_worker_id = CASE WHEN task_id IN (2130, 2140) THEN 77 END
+                  WHERE task_id BETWEEN 2100 AND 2140",
+                f.table
+            ),
+            &[&window.cutoff_unix_ms],
+        )
+        .await
+        .unwrap();
+    // Later wall time must not release the cutoff+1 rows in this pass.
+    f.admin.simple_query("SELECT pg_sleep(0.01)").await.unwrap();
+    let snapshot_sql = format!(
+        "SELECT row_to_json(t)::text FROM {} t ORDER BY task_id",
+        f.table,
+    );
+    let before: Vec<String> = f
+        .admin
+        .query(&snapshot_sql, &[])
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    let first = ops.read_page(&window, None).await.unwrap();
+    assert_eq!(first, native.read_page(&window, None).await.unwrap());
+    assert_eq!(first.len(), 100);
+    assert_eq!(first[0].task_id, i64::MIN);
+    assert_eq!(first[2].task_name, "");
+    assert_eq!(first[4].task_name, " 未登録/🔥 ");
+    // Consumer dispatch failure does not affect the cursor: always advance past returned rows.
+    let mut cursor = first.last().unwrap().task_id;
+    assert_eq!(cursor, 970);
+    let after: Vec<String> = f
+        .admin
+        .query(&snapshot_sql, &[])
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(before, after);
+    f.admin
+        .batch_execute(&format!(
+            "DELETE FROM {table} WHERE task_id = 10;
+         UPDATE {table} SET available_from_unix_ms = 9223372036854775807 WHERE task_id = 20;
+         DELETE FROM {table} WHERE task_unique_key IS NOT NULL;
+         INSERT INTO {table} (task_id, task_name, payload_json) OVERRIDING SYSTEM VALUE
+         VALUES (5, 'late behind cursor', '!'), (9223372036854775807, 'new publication', '!')",
+            table = f.table,
+        ))
+        .await
+        .unwrap();
+    let before: Vec<String> = f
+        .admin
+        .query(&snapshot_sql, &[])
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    let mut remaining = Vec::new();
+    loop {
+        let page = ops.read_page(&window, Some(cursor)).await.unwrap();
+        assert_eq!(page, native.read_page(&window, Some(cursor)).await.unwrap());
+        assert!(page.len() <= 100);
+        let Some(last) = page.last() else { break };
+        assert!(page[0].task_id > cursor);
+        cursor = last.task_id;
+        remaining.extend(page);
+    }
+    let expected: Vec<i64> = (98..=205)
+        .map(|n| n * 10)
+        .chain([
+            2100,
+            2110,
+            2130,
+            9007199254740991,
+            9007199254740992,
+            9007199254740993,
+            i64::MAX - 1,
+        ])
+        .collect();
+    assert_eq!(
+        remaining.iter().map(|row| row.task_id).collect::<Vec<_>>(),
+        expected
+    );
+    let after: Vec<String> = f
+        .admin
+        .query(&snapshot_sql, &[])
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(before, after);
+    let next = ops.begin_sweep().await.unwrap();
+    assert_eq!(next.upper_id, Some(i64::MAX));
+    for page in [
+        ops.read_page(&next, None).await.unwrap(),
+        native.read_page(&next, None).await.unwrap(),
+    ] {
+        assert!(page.iter().any(|row| row.task_id == 5));
+    }
+    let last = ops.read_page(&next, Some(i64::MAX - 1)).await.unwrap();
+    assert_eq!(
+        last,
+        native.read_page(&next, Some(i64::MAX - 1)).await.unwrap()
+    );
+    assert_eq!(last[0].task_id, i64::MAX);
+    assert!(
+        ops.read_page(&next, Some(i64::MAX))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        native
+            .read_page(&next, Some(i64::MAX))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    for page in [
+        ops.read_page(&next, Some(2099)).await.unwrap(),
+        native.read_page(&next, Some(2099)).await.unwrap(),
+    ] {
+        assert!(page.iter().any(|row| row.task_id == 2120));
+        assert!(page.iter().any(|row| row.task_id == 2140));
+    }
+    ops.close().await.unwrap();
+    native.close().await.unwrap();
+    assert!(matches!(
+        ops.begin_sweep().await,
+        Err(PostgresWorkerError::Closed)
+    ));
+    assert!(native.begin_sweep().await.is_err());
+    assert!(ops.read_page(&next, None).await.is_err());
+    assert!(native.read_page(&next, None).await.is_err());
+    f.cleanup().await;
+    other.cleanup().await;
+}
+
+#[tokio::test]
+async fn discovery_workers_validates_schema_and_uses_existing_default_search_path() {
+    assert!(matches!(
+        connect(
+            "not a URL",
+            PostgresBackendOptions {
+                schema: Some("bad.schema".into())
+            }
+        )
+        .await,
+        Err(PostgresWorkerError::InvalidSchema(_))
+    ));
+    let f = Fixture::new().await;
+    f.echo("default").await;
+    let (client, driver) = f.caller_connection().await;
+    // Model a database/role default search path; the backend itself never sets it.
+    client
+        .batch_execute(&format!(
+            "SET search_path TO \"{}\"; SET default_transaction_read_only = on",
+            f.schema,
+        ))
+        .await
+        .unwrap();
+    let ops = PostgresTaskOperations::from_connection(
+        client,
+        async move { driver.await.unwrap() },
+        PostgresBackendOptions::default().table_name().unwrap(),
+    );
+    let window = ops.begin_sweep().await.unwrap();
+    assert_eq!(
+        ops.read_page(&window, None).await.unwrap()[0].task_name,
+        Echo::NAME
+    );
+    assert_eq!(
+        ops.client()
+            .await
+            .unwrap()
+            .query_one("SELECT count(*) FROM pg_listening_channels()", &[],)
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        0
+    );
+    ops.close().await.unwrap();
+    let missing = connect(
+        &f.url(),
+        PostgresBackendOptions {
+            schema: Some(format!("{}_missing", f.schema)),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(missing.begin_sweep().await.is_err());
+    assert!(missing.read_page(&window, None).await.is_err());
+    missing.close().await.unwrap();
+    f.cleanup().await;
+}
+
+#[tokio::test]
+async fn discovery_close_waits_for_the_workers_driver() {
+    let f = Fixture::new().await;
+    let (client, connection) = tokio_postgres::connect(&f.url(), NoTls).await.unwrap();
+    let (exited_tx, exited_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let ops = PostgresTaskOperations::from_connection(
+        client,
+        async move {
+            let result = connection.await;
+            exited_tx.send(()).unwrap();
+            release_rx.await.unwrap();
+            result
+        },
+        Arc::from(f.table.as_str()),
+    );
+    ops.begin_sweep().await.unwrap();
+    let mut close = Box::pin(ops.close());
+    tokio::select! {
+        result = close.as_mut() => panic!("close lost the gated driver: {result:?}"),
+        exited = timeout(LIMIT, exited_rx) => exited.unwrap().unwrap(),
+    }
+    pending(close.as_mut()).await;
+    release_tx.send(()).unwrap();
+    timeout(LIMIT, close).await.unwrap().unwrap();
+    f.cleanup().await;
+}
 
 #[tokio::test]
 async fn failed_claim_follow_up_never_reports_an_existing_due_row_missing() {

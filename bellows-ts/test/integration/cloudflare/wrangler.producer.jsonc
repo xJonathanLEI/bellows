@@ -4,6 +4,7 @@
   "main": "workers/producer.ts",
   "compatibility_date": "2026-07-01",
   "compatibility_flags": ["nodejs_compat"],
+  "triggers": { "crons": ["* * * * *"] },
   "vars": {
     "BELLOWS_SCHEMA": "bellows_cloudflare"
   },

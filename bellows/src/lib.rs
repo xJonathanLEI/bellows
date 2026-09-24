@@ -67,7 +67,7 @@
 //! Workers use SDK sockets, execution, and timers; native daemon backends are unavailable.
 //! Use [`time::Instant`] for deadlines. Obtain connection strings from Hyperdrive, keep processors
 //! private, disable query caching, verify origin TLS, and leave schema initialization outside
-//! requests. Both reduced backends require request-scoped connections and awaited `close` on
+//! events. Listener-free backends require event-scoped connections and awaited `close` on
 //! ordinary success and error paths; the delegates own this lifecycle. Dropping clones does not
 //! close a Workers driver. Lower-level Rust receipts remain exact `u64` values.
 //! `publish_future` records availability but dispatches the ID/name immediately; the processor
@@ -85,8 +85,11 @@
 //! A 60-second watchdog supersedes hung or interrupted scheduled attempts without guaranteeing
 //! business cancellation. Stale results are ignored.
 //! PostgreSQL remains authoritative: renewed leases may move a scheduling hint later.
-//! Durability starts with a persisted scheduling hint, not DO acceptance. Earlier loss requires
-//! application recovery; there is no PostgreSQL discovery or Cron.
+//! Dispatcher durability starts with a persisted scheduling hint, not DO acceptance.
+//! Use `cloudflare::sdk::PostgresSweeper` with a scheduled entrypoint and Wrangler `* * * * *`
+//! trigger to recover missed invocations. It redispatches due published tasks without changing rows;
+//! the selected schema must belong entirely to the target processor. Cron supplements dispatch
+//! and alarms without guaranteeing a recovery deadline.
 //! Alarms and attempts are at-least-once, not exactly-once side effects.
 //! Await delegate calls within the request. They do not extend request lifetime or guarantee async
 //! cleanup after future cancellation, abrupt termination, or wasm traps.

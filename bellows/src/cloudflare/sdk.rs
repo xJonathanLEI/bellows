@@ -41,7 +41,9 @@
 //! guaranteeing business cancellation. PostgreSQL controls execution eligibility; another invocation
 //! may observe an extended lease. Alarm and transport redelivery do not imply exactly-once work.
 //! Durability starts when `retryAt` is persisted; earlier uncertainty retries only in memory.
-//! The watchdog applies to scheduled attempts. There is no PostgreSQL discovery or Cron. Publication and dispatch
+//! The watchdog applies to scheduled attempts. [`PostgresSweeper`] adds read-only rediscovery through
+//! the same dispatcher, with no task registry. Its selected schema must belong entirely to that
+//! workload. Applications own scheduled entrypoint wiring and Cron Trigger installation. Publication and dispatch
 //! are not atomic; cancellation, termination, and wasm traps have no
 //! async-finally guarantee. Initialize schemas administratively, not during requests.
 
@@ -55,10 +57,15 @@ use super::{
 
 mod postgres;
 mod postgres_publisher;
+mod postgres_sweeper;
 pub use postgres::{PostgresProcessor, PostgresProcessorConfig, PostgresProcessorTask};
 pub use postgres_publisher::{
     PostgresPublisher, PostgresPublisherConfig, PostgresPublisherError, PostgresPublisherReceipt,
     PostgresPublisherStage,
+};
+pub use postgres_sweeper::{
+    PostgresSweepCandidate, PostgresSweepReport, PostgresSweeper, PostgresSweeperConfig,
+    PostgresSweeperError, PostgresSweeperStage,
 };
 
 /// A Workers service binding adapted to [`ProcessorFetcher`].

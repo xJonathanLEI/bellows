@@ -184,6 +184,23 @@ jobs:
           --health-retries 5
 
     steps:
+      - name: "Configure PostgreSQL connection capacity"
+        env:
+          POSTGRES_CONTAINER: "${{ job.services.postgres.id }}"
+        run: |
+          # Gated sweep tests retain 101 claims plus business and fixture connections.
+          docker exec "$POSTGRES_CONTAINER" psql -U postgres -d postgres -v ON_ERROR_STOP=1 \
+            -c "ALTER SYSTEM SET max_connections = 600"
+          docker restart "$POSTGRES_CONTAINER"
+          for attempt in {1..30}; do
+            if docker exec "$POSTGRES_CONTAINER" pg_isready -U postgres -d postgres; then
+              break
+            fi
+            sleep 1
+          done
+          test "$(docker exec "$POSTGRES_CONTAINER" psql -U postgres -d postgres -At \
+            -c "SHOW max_connections")" = "600"
+
       - name: "Checkout source code"
         uses: "actions/checkout@v6"
 

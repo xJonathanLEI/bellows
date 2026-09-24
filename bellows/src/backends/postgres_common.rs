@@ -49,8 +49,44 @@ pub(super) fn validate_schema_name(schema_name: &str) -> Result<(), io::Error> {
     Ok(())
 }
 
+pub(super) const DISCOVERY_PAGE_SIZE: i64 = 100;
+
+/// Fixed bounds for a finite keyset pass, not a repeatable-read snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PostgresSweepWindow {
+    pub cutoff_unix_ms: i64,
+    /// `None` means there were no published rows when the window was captured.
+    pub upper_id: Option<i64>,
+}
+
+/// Exact stored identity, including IDs/names unsupported by a particular consumer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PostgresDiscoveryCandidate {
+    pub task_id: i64,
+    pub task_name: String,
+}
+
 // Only validated, quoted table identifiers are formatted here. All application values remain
 // query parameters. Both drivers use exactly these predicates and parameter positions.
+pub(super) fn discovery_window_sql(table_name: &str) -> String {
+    format!(
+        "SELECT FLOOR(EXTRACT(EPOCH FROM statement_timestamp()) * 1000)::bigint AS cutoff_unix_ms,
+                MAX(task_id) AS upper_id
+         FROM {table_name} WHERE task_unique_key IS NULL"
+    )
+}
+
+pub(super) fn discovery_page_sql(table_name: &str) -> String {
+    format!(
+        "SELECT task_id, task_name FROM {table_name}
+         WHERE task_unique_key IS NULL
+           AND (available_from_unix_ms IS NULL OR available_from_unix_ms <= $1)
+           AND task_id <= $2
+           AND ($3::bigint IS NULL OR task_id > $3)
+         ORDER BY task_id LIMIT $4"
+    )
+}
+
 pub(super) fn publish_sql(table_name: &str) -> String {
     format!(
         r#"

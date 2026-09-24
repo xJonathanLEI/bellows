@@ -66,6 +66,71 @@ export function publisherContracts(
       }
     }, 10_000);
 
+    test("scheduled sweep fans out across pages and settles every streamed acknowledgement after a partial dispatch failure", async () => {
+      await fixture.admin.query(
+        `INSERT INTO ${fixture.table} (task_name, payload_json)
+         SELECT CASE WHEN n % 2 = 0 THEN ' Unregistered 🦀 ' ELSE '未知' END, 'not JSON'
+         FROM generate_series(1, 101) AS n`,
+      );
+      const before = await fixture.state();
+      // One failure, then successful responses. Every body holds a large secret-bearing
+      // prefix and a gated tail, exercising full drainage without default error logging.
+      await control("/publisher/response", { status: 200, statuses: [503] });
+      let ended = false;
+      const sweep = fixture.runScheduled("exception").finally(() => {
+        ended = true;
+      });
+      // Assertions may fail before the final await; the fixture still owns event drainage.
+      void sweep.catch(() => {});
+      await poll(
+        "all pages dispatch before any acknowledgement body is released",
+        state,
+        ({ dispatches }) => dispatches.length === 101,
+      );
+      const expected = before.tasks.map(({ task_id, task_name }) => ({
+        taskId: task_id,
+        taskName: task_name,
+      }));
+      const dispatched = await state();
+      expect(dispatched.drained).toBe(0);
+      expect(dispatched.dispatches).toHaveLength(expected.length);
+      expect(dispatched.dispatches).toEqual(expect.arrayContaining(expected));
+      // The read-only backend closes while responses are still streaming.
+      await fixture.waitForIdle();
+      expect(await fixture.activeRequestClients()).toEqual([]);
+      expect(ended).toBe(false);
+      await control("/publisher/release");
+      await poll(
+        "the failed response is completely consumed",
+        state,
+        ({ drained }) => drained === 1,
+      );
+      expect(ended).toBe(false);
+      await control("/publisher/drain");
+      await sweep;
+      expect(await state()).toMatchObject({ drained: 101 });
+      expect(await fixture.state()).toEqual(before);
+      expect(await sequence()).toEqual([
+        { last_value: "101", is_called: true },
+      ]);
+      // A later event rediscovers the existing rows, without retrying or republishing
+      // within the failed pass. The receiver now drains immediately.
+      await control("/publisher/response", { status: 200 });
+      await fixture.runScheduled();
+      const recovered = await state();
+      expect(recovered.drained).toBe(202);
+      expect(recovered.dispatches).toHaveLength(202);
+      expect(recovered.dispatches.slice(0, 101)).toEqual(dispatched.dispatches);
+      expect(recovered.dispatches.slice(101)).toEqual(
+        expect.arrayContaining(expected),
+      );
+      expect(await fixture.state()).toEqual(before);
+      expect(await sequence()).toEqual([
+        { last_value: "101", is_called: true },
+      ]);
+      await fixture.waitForIdle();
+    });
+
     for (const future of [false, true]) {
       for (const status of [200, 503]) {
         const title =

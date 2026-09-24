@@ -20,11 +20,12 @@ use crate::{
 };
 
 use super::postgres_common::{
-    NOTIFY_CHANNEL, NOTIFY_SQL, NotificationPayload, PostgresBackendOptions, PreparedPublication,
-    claim_earliest_sql, claim_published_sql, claim_singleton_sql, earliest_availability_sql,
-    fail_sql, finish_published_sql, finish_rescheduled_sql, finish_singleton_sql,
-    instant_to_unix_ms, published_state_sql, published_task, renew_sql, singleton_state_sql,
-    unix_ms_to_instant, unix_timestamp_ms,
+    DISCOVERY_PAGE_SIZE, NOTIFY_CHANNEL, NOTIFY_SQL, NotificationPayload, PostgresBackendOptions,
+    PostgresDiscoveryCandidate, PostgresSweepWindow, PreparedPublication, claim_earliest_sql,
+    claim_published_sql, claim_singleton_sql, discovery_page_sql, discovery_window_sql,
+    earliest_availability_sql, fail_sql, finish_published_sql, finish_rescheduled_sql,
+    finish_singleton_sql, instant_to_unix_ms, published_state_sql, published_task, renew_sql,
+    singleton_state_sql, unix_ms_to_instant, unix_timestamp_ms,
 };
 use super::postgres_publishing::{PostgresPublishQuery, PostgresPublishingExecutor};
 
@@ -241,6 +242,45 @@ impl fmt::Debug for PostgresTaskOperations {
 }
 
 impl PostgresTaskOperations {
+    pub(super) async fn begin_sweep(&self) -> Result<PostgresSweepWindow, PostgresWorkerError> {
+        let row = self
+            .client()
+            .await?
+            .query_typed_one(&discovery_window_sql(&self.table_name), &[])
+            .await?;
+        Ok(PostgresSweepWindow {
+            cutoff_unix_ms: row.try_get("cutoff_unix_ms")?,
+            upper_id: row.try_get("upper_id")?,
+        })
+    }
+
+    pub(super) async fn read_page(
+        &self,
+        window: &PostgresSweepWindow,
+        last_seen_id: Option<i64>,
+    ) -> Result<Vec<PostgresDiscoveryCandidate>, PostgresWorkerError> {
+        self.client()
+            .await?
+            .query_typed(
+                &discovery_page_sql(&self.table_name),
+                &[
+                    (&window.cutoff_unix_ms, Type::INT8),
+                    (&window.upper_id, Type::INT8),
+                    (&last_seen_id, Type::INT8),
+                    (&DISCOVERY_PAGE_SIZE, Type::INT8),
+                ],
+            )
+            .await?
+            .into_iter()
+            .map(|row| {
+                Ok(PostgresDiscoveryCandidate {
+                    task_id: row.try_get("task_id")?,
+                    task_name: row.try_get("task_name")?,
+                })
+            })
+            .collect()
+    }
+
     #[cfg(target_arch = "wasm32")]
     #[worker::send]
     pub(super) async fn connect(

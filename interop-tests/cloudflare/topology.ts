@@ -56,6 +56,315 @@ export function cloudflareTopology(
     expect(done.alarm).toBe(accepted.alarm);
   });
 
+  test("Cron recovers a lost initial dispatch without task persistence or republishing", async () => {
+    const gate = await fixture.gate();
+    const taskId = await seed("cloudflare_greeting", { name: "Cron recovery" });
+    await fixture.admin.query(
+      `UPDATE ${fixture.table}
+       SET available_from_unix_ms = floor(extract(epoch FROM statement_timestamp()) * 1000) - 1
+       WHERE task_id = $1`,
+      [taskId],
+    );
+    const before = await fixture.schedule();
+    expect(before.tasks).toEqual({});
+    expect(before.alarm).toBeNull();
+    // A delayed event must use database wall time, not this nominal timestamp.
+    await fixture.runScheduled("ok", new Date(0));
+    await gate.blocked(1);
+    const accepted = await fixture.schedule();
+    expect(accepted.tasks).toEqual({});
+    expect(accepted.metadata ?? null).toBeNull();
+    expect(accepted.alarm).toBeGreaterThan(accepted.now);
+    await dispatch("cloudflare_greeting", taskId);
+    expect((await fixture.schedule()).alarm).toBe(accepted.alarm);
+    await gate.release();
+    await completed([{ taskId, name: "Cron recovery" }]);
+    expect((await fixture.schedule()).tasks).toEqual({});
+    expect(
+      (
+        await fixture.admin.query(
+          `SELECT last_value FROM "${fixture.schema}".bellows_tasks_task_id_seq`,
+        )
+      ).rows,
+    ).toEqual([{ last_value: taskId }]);
+  });
+
+  for (const occupied of [false, true]) {
+    test(`Cron excludes ${occupied ? "occupied leases" : "future tasks"} until due without pre-scheduling`, async () => {
+      const name = occupied ? "Abandoned lease" : "Lost future dispatch";
+      const taskId = await seed("cloudflare_greeting", { name });
+      const atMs = Date.now() + 1_000;
+      await fixture.admin.query(
+        `UPDATE ${fixture.table} SET available_from_unix_ms = $1, lease_worker_id = $2 WHERE task_id = $3`,
+        [atMs, occupied ? 123 : null, taskId],
+      );
+      const before = await fixture.state();
+      // Neither a future nominal timestamp nor an old lease owner changes eligibility.
+      await fixture.runScheduled("ok", new Date(atMs + 60_000));
+      expect(Date.now()).toBeLessThan(atMs);
+      expect(await fixture.state()).toEqual(before);
+      expect(await fixture.executions(taskId)).toEqual([]);
+      expect((await fixture.schedule()).tasks).toEqual({});
+      expect((await fixture.schedule()).alarm).toBeNull();
+      await fixture.waitForIdle();
+      await databaseTime(atMs);
+      expect((await fixture.state()).tasks[0].lease_worker_id).toBe(
+        occupied ? "123" : null,
+      );
+      await fixture.runScheduled();
+      await completed([{ taskId, name }]);
+      expect(
+        Number((await fixture.executions(taskId))[0].executed_at_ms),
+      ).toBeGreaterThanOrEqual(atMs);
+    });
+  }
+
+  async function databaseTime(atMs: number) {
+    await poll(
+      "database availability deadline",
+      async () =>
+        (
+          await fixture.admin.query<{ due: boolean }>(
+            "SELECT floor(extract(epoch FROM statement_timestamp()) * 1000) >= $1 AS due",
+            [atMs],
+          )
+        ).rows[0].due,
+      (due) => due,
+    );
+  }
+
+  test("Cron discovery does not reserve a task whose lease changes before claim", async () => {
+    const taskId = await seed("cloudflare_greeting", { name: "Claim race" });
+    const claimGate = await fixture.gate("bellows_tasks");
+    const businessGate = await fixture.gate();
+    await fixture.runScheduled();
+    await claimGate.blocked(1);
+    const atMs = Date.now() + 1_000;
+    await claimGate.client.query(
+      `UPDATE ${fixture.table} SET lease_worker_id = 123, available_from_unix_ms = $1 WHERE task_id = $2`,
+      [atMs, taskId],
+    );
+    await claimGate.release("COMMIT");
+    await pending(taskId, atMs);
+    expect((await fixture.state()).tasks[0].lease_worker_id).toBe("123");
+    expect(await fixture.executions(taskId)).toEqual([]);
+    expect(Date.now()).toBeLessThan(atMs);
+    await businessGate.blocked(1);
+    await businessGate.release();
+    await completed([{ taskId, name: "Claim race" }]);
+    expect(
+      Number((await fixture.executions(taskId))[0].executed_at_ms),
+    ).toBeGreaterThanOrEqual(atMs);
+    await forgotten();
+  });
+
+  for (const mode of ["failure", "success"] as const) {
+    test(`Cron recovers a committed ${mode} reschedule with a deliberately unregistered hint`, async () => {
+      const atMs = Date.now() + 1_000;
+      const name = `Lost ${mode} hint`;
+      const taskId = await seed("cloudflare_scheduling", {
+        name,
+        mode,
+        availableFromMs: atMs,
+      });
+      // Bypass the DO: consume the committed response but never register its retryAt.
+      const response = await fixture.consume(
+        fixture.processor.fetch(
+          "/process",
+          json({ taskId, taskName: "cloudflare_scheduling" }),
+        ),
+        "direct attempt with deliberately lost scheduling hint",
+      );
+      const action = JSON.parse(response.body).nextAction;
+      assertAttempt(response, taskId, { type: "retryAt", atMs: action.atMs });
+      expect(action.atMs).toBeGreaterThanOrEqual(atMs);
+      expect(action.atMs).toBeLessThanOrEqual(atMs + 1);
+      await fixture.waitForIdle();
+      expect((await fixture.state()).tasks[0]).toMatchObject({
+        task_id: taskId,
+        lease_worker_id: null,
+        available_from_unix_ms: String(atMs),
+      });
+      await fixture.runScheduled();
+      expect(Date.now()).toBeLessThan(atMs);
+      expect((await fixture.schedule()).tasks).toEqual({});
+      expect((await fixture.schedule()).alarm).toBeNull();
+      expect(await fixture.executions(taskId)).toHaveLength(1);
+      await databaseTime(atMs);
+      // No alarm exists that could be responsible for this recovery.
+      expect((await fixture.schedule()).alarm).toBeNull();
+      await fixture.runScheduled();
+      const done = await poll(
+        "Cron executes the second attempt under the original ID",
+        () => fixture.state(),
+        ({ tasks, processed }) =>
+          tasks.length === 0 && processed[0]?.execution_count === 2,
+      );
+      expect(done.processed).toEqual([
+        { task_id: taskId, name, execution_count: 2 },
+      ]);
+      const executions = await fixture.executions(taskId);
+      expect(Number(executions[0].executed_at_ms)).toBeLessThan(atMs);
+      expect(Number(executions[1].executed_at_ms)).toBeGreaterThanOrEqual(atMs);
+      expect(
+        (
+          await fixture.admin.query(
+            `SELECT last_value FROM "${fixture.schema}".bellows_tasks_task_id_seq`,
+          )
+        ).rows,
+      ).toEqual([{ last_value: taskId }]);
+      await fixture.waitForIdle();
+    });
+  }
+
+  test("overlapping Cron sweeps acknowledge the same due ID without concurrent business ownership", async () => {
+    const taskId = await seed("cloudflare_greeting", { name: "Overlap" });
+    const claims = await fixture.gate("bellows_tasks");
+    const business = await fixture.gate();
+    // Keep the row due while both independent sweeps discover and dispatch it.
+    await Promise.all([fixture.runScheduled(), fixture.runScheduled()]);
+    await claims.blocked(1);
+    expect((await fixture.state()).tasks[0].lease_worker_id).toBeNull();
+    expect((await fixture.schedule()).tasks).toEqual({});
+    await claims.release();
+    await business.blocked(1);
+    await business.release();
+    await completed([{ taskId, name: "Overlap" }]);
+    expect(await fixture.executions(taskId)).toHaveLength(1);
+    expect(
+      (
+        await fixture.admin.query(
+          `SELECT last_value FROM "${fixture.schema}".bellows_tasks_task_id_seq`,
+        )
+      ).rows,
+    ).toEqual([{ last_value: taskId }]);
+  });
+
+  test("Cron reaches a second keyset page while every earlier task is still due and all business work is gated", async () => {
+    const { rows } = await fixture.admin.query<{ task_id: string }>(
+      `INSERT INTO ${fixture.table} (task_id, task_name, payload_json)
+       OVERRIDING SYSTEM VALUE
+       SELECT n * 3, 'cloudflare_greeting', json_build_object('name', 'Paged ' || n)::text
+       FROM generate_series(1, 101) AS n RETURNING task_id`,
+    );
+    const claims = await fixture.gate("bellows_tasks");
+    const business = await fixture.gate();
+    await fixture.runScheduled();
+    // All distinct requests, including page two, launch before any claim can change eligibility.
+    await claims.blocked(rows.length);
+    expect(
+      (await fixture.state()).tasks.every(
+        ({ lease_worker_id }) => lease_worker_id === null,
+      ),
+    ).toBe(true);
+    expect((await fixture.schedule()).tasks).toEqual({});
+    await claims.release();
+    await business.blocked(rows.length);
+    expect((await fixture.state()).processed).toEqual([]);
+    await business.release();
+    await completed(
+      rows.map(({ task_id }, index) => ({
+        taskId: task_id,
+        name: `Paged ${index + 1}`,
+      })),
+    );
+  });
+
+  test("a discovery failure rejects the actual Cron invocation after cleanup and recovers after repair", async () => {
+    const taskId = await seed("cloudflare_greeting", { name: "After repair" });
+    await fixture.admin.query(
+      `ALTER TABLE ${fixture.table} RENAME TO hidden_tasks`,
+    );
+    try {
+      await fixture.runScheduled("exception");
+      await fixture.waitForIdle();
+      expect(await fixture.activeRequestClients()).toEqual([]);
+      expect((await fixture.schedule()).tasks).toEqual({});
+      expect((await fixture.schedule()).alarm).toBeNull();
+    } finally {
+      await fixture.admin.query(
+        `ALTER TABLE "${fixture.schema}".hidden_tasks RENAME TO bellows_tasks`,
+      );
+    }
+    await fixture.runScheduled();
+    await completed([{ taskId, name: "After repair" }]);
+  });
+
+  test("Cron preserves unsupported exact identities, excludes singletons and isolates the configured schema", async () => {
+    const otherSchema = `${fixture.schema}_other`;
+    await fixture.admin.query(`CREATE SCHEMA "${otherSchema}"`);
+    try {
+      await fixture.admin.query(
+        `CREATE TABLE "${otherSchema}".bellows_tasks (LIKE ${fixture.table});
+         INSERT INTO "${otherSchema}".bellows_tasks (task_id, task_name, payload_json)
+         VALUES (17, 'cloudflare_greeting', '{"name":"Wrong schema"}')`,
+      );
+      const identities = [
+        "-1",
+        "0",
+        "9007199254740991",
+        "9007199254740992",
+        "9007199254740993",
+        "9223372036854775807",
+      ];
+      for (const taskId of identities) {
+        await fixture.admin.query(
+          `INSERT INTO ${fixture.table} (task_id, task_name, payload_json)
+           OVERRIDING SYSTEM VALUE VALUES ($1, $2, $3)`,
+          [
+            taskId,
+            "cloudflare_greeting",
+            JSON.stringify({ name: `Exact ${taskId}` }),
+          ],
+        );
+      }
+      await fixture.admin.query(
+        `INSERT INTO ${fixture.table} (task_id, task_name, payload_json, task_unique_key)
+         OVERRIDING SYSTEM VALUE
+         VALUES (1, '', 'not JSON', NULL),
+                (2, 'cloudflare_greeting', 'not JSON', 'singleton')`,
+      );
+      await nextTaskId("3");
+      const taskId = await seed("cloudflare_full_name", {
+        firstName: "Exact",
+        lastName: "Name",
+      });
+      const before = await fixture.state();
+      await fixture.runScheduled("exception");
+      const done = await poll(
+        "valid candidates complete despite unsupported identities",
+        () => fixture.state(),
+        ({ tasks, processed }) =>
+          tasks.length === before.tasks.length - 2 && processed.length === 2,
+      );
+      expect(done.processed).toEqual([
+        { task_id: taskId, name: "Exact Name", execution_count: 1 },
+        {
+          task_id: "9007199254740991",
+          name: "Exact 9007199254740991",
+          execution_count: 1,
+        },
+      ]);
+      expect(done.tasks).toEqual(
+        before.tasks.filter(
+          (task) =>
+            task.task_id !== taskId && task.task_id !== "9007199254740991",
+        ),
+      );
+      expect(
+        (
+          await fixture.admin.query(
+            `SELECT task_id::text FROM "${otherSchema}".bellows_tasks`,
+          )
+        ).rows,
+      ).toEqual([{ task_id: "17" }]);
+      expect((await fixture.schedule()).tasks).toEqual({});
+      await fixture.waitForIdle();
+    } finally {
+      await fixture.admin.query(`DROP SCHEMA "${otherSchema}" CASCADE`);
+    }
+  });
+
   async function pending(taskId: string, atMs?: number) {
     const state = await poll(
       `persisted pending instruction for ${taskId}`,

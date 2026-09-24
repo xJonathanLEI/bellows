@@ -6,21 +6,21 @@ PostgreSQL stores payloads and decides claimability. The SQLite-backed Durable O
 
 ## Files and APIs
 
-| File                                                    | Purpose                                                                                    |
-| ------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
-| `task.ts`                                               | Greeting, full-name, and controlled scheduling definitions.                                |
-| `workers/producer.ts`                                   | Immediate/future typed publication, scheduling fixtures, and the `TaskDispatcher` wrapper. |
-| `workers/processor.ts`                                  | Processor delegate configuration and the `processed_tasks` side effect.                    |
-| `workers/publishing.ts`, `publishing-contracts.ts`      | Test-only direct publishing contracts; no dispatch or processing. Do not deploy.           |
-| `workers/publisher.ts`, `wrangler.publisher.jsonc`      | Test-only publisher adapter and gated dispatch receiver. Do not deploy.                    |
-| `wrangler.*.jsonc`                                      | Hyperdrive, Durable Object, and service bindings.                                          |
-| `cloudflare.integration.test.ts`, `postgres-fixture.ts` | TypeScript-only workerd suite and production schema-initializer adapter.                   |
+| File                                                    | Purpose                                                                              |
+| ------------------------------------------------------- | ------------------------------------------------------------------------------------ |
+| `task.ts`                                               | Greeting, full-name, and controlled scheduling definitions.                          |
+| `workers/producer.ts`                                   | Typed publication, minute-Cron sweeping, fixtures, and the `TaskDispatcher` wrapper. |
+| `workers/processor.ts`                                  | Processor delegate configuration and the `processed_tasks` side effect.              |
+| `workers/publishing.ts`, `publishing-contracts.ts`      | Test-only direct publishing contracts; no dispatch or processing. Do not deploy.     |
+| `workers/publisher.ts`, `wrangler.publisher.jsonc`      | Test-only publisher adapter and gated dispatch receiver. Do not deploy.              |
+| `wrangler.*.jsonc`                                      | Hyperdrive, Durable Object, and service bindings.                                    |
+| `cloudflare.integration.test.ts`, `postgres-fixture.ts` | TypeScript-only workerd suite and production schema-initializer adapter.             |
 
 The examples import repository source. In an application, use:
 
 - `@xjonathanlei/bellows` for task definitions, `WorkerFactory`, and `TaskSuccess`.
 - `@xjonathanlei/bellows/cloudflare` for `dispatchTask` and `RetainedTaskDispatcher`.
-- `@xjonathanlei/bellows/cloudflare/postgres` for `createPostgresPublisher`, `PostgresPublisherError`, `createPostgresProcessor`, and `createPostgresProcessorTask`.
+- `@xjonathanlei/bellows/cloudflare/postgres` for `createPostgresPublisher`, `PostgresPublisherError`, `createPostgresProcessor`, `createPostgresProcessorTask`, and `createPostgresSweeper`.
 - `@xjonathanlei/bellows/backends/postgres` for direct, Node-side schema initialization.
 - `@xjonathanlei/bellows/backends/postgres-publishing` for listener-free typed publication.
 
@@ -34,7 +34,13 @@ String receipts confirm dispatch acceptance, not task completion. `PostgresPubli
 
 A publication error without a receipt does not prove rollback. The producer maps structured errors before any generic conversion: no receipt returns HTTP **503** with `{ error: "task publication failed" }`; a receipt returns **503** with `{ error: "task published, but dispatch acceptance was not confirmed", taskId }`. It does not expose internal stages or causes. Success remains **202** with the plain string ID, `text/plain; charset=utf-8`, and `cache-control: no-store`.
 
-Await the call within the request; the adapter does not extend request lifetime. Ordinary errors await shutdown after acquisition, but abrupt termination cannot guarantee cleanup. It owns Bellows resources, not arbitrary business clients. There is no atomic PostgreSQL-to-DO delivery, automatic republishing, outbox, recovery before DO acceptance, or application-transaction participation.
+Await the call within the request; the adapter does not extend request lifetime. Ordinary errors await shutdown after acquisition, but abrupt termination cannot guarantee cleanup. It owns Bellows resources, not arbitrary business clients. There is no atomic PostgreSQL-to-DO delivery, automatic republishing, outbox, or publisher application-transaction participation. The separate sweeper recovers eligible rows after missed invocation.
+
+## Scheduled sweeper
+
+The producer composes `createPostgresSweeper(publisherConfig).scheduled` with `fetch`; [`wrangler.producer.jsonc`](./wrangler.producer.jsonc) registers `* * * * *`. The [standalone export fixture](./workers/postgres-sweeper.typecheck.ts) checks compatibility with generated Workers types. See [setup examples](../../../README.md#sweeper) and [recovery semantics](../../../../README.md#minute-cron-postgresql-recovery).
+
+Tests inject real workerd scheduled events to verify recovery and observable failures, without waiting for Cron delivery. Coverage is shared across all four language topologies; see the [shared harness](../../../../interop-tests/cloudflare/README.md#shared-support). Hosted Cron delivery is not tested.
 
 ## Processor delegate and cleanup
 
@@ -63,11 +69,12 @@ Use an existing PostgreSQL 17 server or start a disposable local one before runn
 
 ```bash
 docker run --detach --rm --name bellows-cloudflare-postgres \
-  --publish 127.0.0.1:5432:5432 --env POSTGRES_PASSWORD=postgres postgres:17
+  --publish 127.0.0.1:5432:5432 --env POSTGRES_PASSWORD=postgres postgres:17 \
+  -c max_connections=600
 docker exec bellows-cloudflare-postgres pg_isready -U postgres -d postgres
 ```
 
-Wait for `pg_isready` to report acceptance. Remove this container afterward with `docker stop bellows-cloudflare-postgres`.
+Wait for `pg_isready` to report acceptance. The simultaneous 101-task sweep gates require connection headroom; `max_connections=600` is test-server configuration, not production sizing guidance. Remove this container afterward with `docker stop bellows-cloudflare-postgres`.
 
 Run the focused suite:
 
@@ -85,7 +92,7 @@ Direct backend contracts cover immediate/future callback-bearing and void tasks,
 
 These cases also run under `pnpm --dir bellows-ts test`. Neither command prepares Rust or requires a TypeScript `dist` prebuild. Root `pnpm test` runs all three test packages serially, including the Rust and mixed suites, and therefore needs their Rust prerequisites. Each scenario registers once per topology, and direct contracts remain language-owned.
 
-The [neutral fixture and scenarios](../../../../interop-tests/cloudflare/README.md#shared-support) preserve real bindings, SQL gates, and observed lease/payload/side-effect/deletion assertions. Response deadlines include full body consumption within two seconds; polls are bounded to three seconds, startup to eight seconds, and harness shutdown to five seconds. Cleanup clears fixture-owned retained schedules, releases locks, drains responses and request clients, closes workerd, drops only the owned schema, closes administrative connections, and restores `CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE`, including on failure. Unexpected runtime logs and cleanup errors fail tests; unavailable PostgreSQL fails rather than skipping them.
+The [neutral fixture and scenarios](../../../../interop-tests/cloudflare/README.md#shared-support) preserve real bindings, SQL gates, and observed lease/payload/side-effect/deletion assertions. Response deadlines include full body consumption within two seconds; polls are bounded to three seconds, startup to eight seconds, and harness shutdown to five seconds. Cleanup clears fixture-owned retained schedules, releases locks, drains responses, scheduled events, and request clients, closes workerd, drops only the owned schema, closes administrative connections, and restores `CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE`, including on failure. Unexpected runtime logs and cleanup errors fail tests; unavailable PostgreSQL fails rather than skipping them.
 
 **Local Hyperdrive connects directly to PostgreSQL; it does not exercise hosted pooling or caching.**
 
@@ -111,7 +118,7 @@ Worker typechecking generates its runtime declarations and also runs under norma
 - Schema initialization belongs outside Worker requests. Qualify tables and parameterize values. Schema names use lowercase ASCII letters, digits, and underscores, starting with a letter or underscore; choose short names to avoid PostgreSQL truncation.
 - The shared alarm selects the earliest persisted task/watchdog deadline or independent 30-second heartbeat. Every due distinct ID launches without a Bellows concurrency limit; platform limits still apply. Active duplicates preserve the original routing; pending IDs permit explicit corrected redispatch. Only a fully consumed, successful matching-ID `done` removes tracking.
 - External dispatch launches in memory before checking the warming alarm, with no task writes or schedule scans. It sets the alarm only when missing or later than `now + 30 seconds`, preserving earlier and overdue alarms. Any valid `retryAt` starts persistence and resets backoff. Infrastructure uncertainty retries with one-to-thirty-second exponential delays, in memory for unsaved tasks and durably for saved schedules. The 60-second watchdog applies only to scheduled attempts; supersession ignores stale results but does not guarantee business cancellation. PostgreSQL remains authoritative. See [durable scheduling guarantees](../../../../README.md#durable-scheduling-and-limits).
-- There is no PostgreSQL discovery, Cron, outbox, automatic republishing, or atomic publication-to-acceptance transaction. Durability begins with a persisted scheduling hint; earlier loss needs explicit redispatch or application recovery. Callback delivery is not added, and abrupt termination has no async-cleanup guarantee.
+- Prompt publisher dispatch, DO alarms for known schedules, and minute-Cron PostgreSQL rediscovery complement each other. Sweeping adds recovery for earlier loss without strengthening in-memory acceptance into durable tracking, which starts with a persisted `retryAt` hint. There is no outbox, automatic republishing, atomic publication-to-dispatch transaction, or added callback delivery, and abrupt termination has no async-cleanup guarantee.
 - Side effects and completion are separate operations, **not exactly-once**. Use idempotent side effects and protect producer access; this unauthenticated example is not production-complete.
 
 ## Opt-in hosted verification
@@ -121,9 +128,10 @@ Hosted verification is manual, requires Cloudflare permissions, and may incur ch
 1. Initialize an isolated schema through a **direct administrative connection**, using `initializePostgresSchema`. Create `processed_tasks` with `task_id BIGINT PRIMARY KEY`, `name TEXT NOT NULL`, and `execution_count INTEGER NOT NULL CHECK (execution_count > 0)`.
 2. Disable the `bellows_tasks_notify_available` trigger **only in this callback-free, explicit-dispatch schema**. Hyperdrive does not support `LISTEN`/`NOTIFY`; leave triggers intact for listening deployments.
 3. Create a real Hyperdrive configuration with **query caching disabled and verified origin TLS**. Replace the all-zero example IDs in ignored configuration copies; never commit credentials. See [Hyperdrive configuration](https://developers.cloudflare.com/hyperdrive/).
-4. Set `BELLOWS_SCHEMA`, use disposable Worker names, and match the producer's `PROCESSOR` service binding to the processor name. Preserve the Durable Object migration and language-specific compatibility flags. Adjust relative entry-point/build paths if moving configuration files.
+4. Set `BELLOWS_SCHEMA` to a schema dedicated to this processor's workload, use disposable Worker names, and match the producer's `PROCESSOR` service binding to the processor name. Preserve the Durable Object migration, language-specific compatibility flags, and producer's `triggers.crons: ["* * * * *"]`. Adjust relative entry-point/build paths if moving configuration files.
 5. Keep the processor private (`workers_dev: false`, `preview_urls: false`, no public routes). Expose the producer only through an access-controlled route. Deploy the processor, then the producer.
-6. Submit a greeting to `/tasks` and a future full-name payload to `/full-names?availableFromMs=<Unix milliseconds>`. Verify no early execution, then automatic execution without redispatch, `execution_count = 1`, and removal of the Bellows rows and accepted DO records. Acceptance alone is insufficient.
-7. Delete only the disposable deployments, Hyperdrive configuration, and database/schema; remove private configuration and credentials.
+6. Submit a greeting to `/tasks` and a future full-name payload to `/full-names?availableFromMs=<Unix milliseconds>`. Verify no early execution, then automatic execution without redispatch, `execution_count = 1`, and removal of Bellows rows and any persisted DO schedules. Acceptance alone is insufficient.
+7. Publish another task through the listener-free backend without dispatching it. Observe a hosted Cron event and completion under the original ID, without another insert or manual dispatch. Inspect scheduled-event outcomes using sanitized diagnostics; do not impose a strict 60-second deadline.
+8. Delete only the disposable deployments and their Cron Triggers, Hyperdrive configuration, and database/schema; remove private configuration and credentials.
 
-This checks hosted connectivity and automatic scheduling—not pooling performance, cache correctness, induced platform eviction, or exactly-once execution.
+If performed, this checks hosted connectivity, alarm scheduling, and Cron recovery—not pooling performance, cache correctness, induced platform eviction, a recovery-time SLA, or exactly-once execution. Local tests alone do not establish these hosted results.

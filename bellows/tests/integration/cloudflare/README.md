@@ -12,17 +12,17 @@ Pending and in-flight reconstruction replaces the delegate while retaining real 
 
 ## Projects
 
-| Source                                                         | Purpose                                                                                  |
-| -------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
-| `producer/lib.rs`                                              | Immediate/future typed publication, scheduling fixtures, and the Durable Object adapter. |
-| `processor/lib.rs`                                             | Processor delegate configuration, business SQL, and abort-safe application cleanup.      |
-| `task.rs`                                                      | Greeting, full-name, and controlled scheduling definitions.                              |
-| `db.rs`, `http.rs`                                             | Application-side business/cancellation connections and producer request validation.      |
-| `contracts/`, `rust-contracts.ts`                              | Test-only Workers and workerd contracts. Do not deploy.                                  |
-| `contracts/publisher.rs`, `contracts/wrangler.publisher.jsonc` | Publisher adapter and gated dispatch receiver with real Hyperdrive/DO bindings.          |
-| `cloudflare.integration.test.ts`                               | Rust -> Rust scenarios and contract registration.                                        |
-| `build-rust.mjs`, `setup.ts`                                   | Current-source Worker builds and finite suite preparation.                               |
-| `initialize.rs`, `postgres-fixture.ts`                         | Native schema initialization and the Rust fixture adapter.                               |
+| Source                                                         | Purpose                                                                             |
+| -------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
+| `producer/lib.rs`                                              | Typed publication, minute-Cron sweeping, fixtures, and the Durable Object adapter.  |
+| `processor/lib.rs`                                             | Processor delegate configuration, business SQL, and abort-safe application cleanup. |
+| `task.rs`                                                      | Greeting, full-name, and controlled scheduling definitions.                         |
+| `db.rs`, `http.rs`                                             | Application-side business/cancellation connections and producer request validation. |
+| `contracts/`, `rust-contracts.ts`                              | Test-only Workers and workerd contracts. Do not deploy.                             |
+| `contracts/publisher.rs`, `contracts/wrangler.publisher.jsonc` | Publisher adapter and gated dispatch receiver with real Hyperdrive/DO bindings.     |
+| `cloudflare.integration.test.ts`                               | Rust -> Rust scenarios and contract registration.                                   |
+| `build-rust.mjs`, `setup.ts`                                   | Current-source Worker builds and finite suite preparation.                          |
+| `initialize.rs`, `postgres-fixture.ts`                         | Native schema initialization and the Rust fixture adapter.                          |
 
 ## API and connection lifecycle
 
@@ -49,7 +49,46 @@ Map the structured error before converting it into a generic Worker error. The p
 
 For a close/dispatch error, acceptance is unconfirmed, not necessarily rejected: receipts remain ID-only, so call `dispatch_task(namespace, Task::NAME, &receipt.task_id)` with the original published definition through a trusted path rather than inserting again. A `task-id` receipt is exact but unsupported by this processor and needs another recovery action. A publication error without a receipt does not establish rollback. Never automatically republish.
 
-Await the operation within the request. Ordinary errors await shutdown after acquisition, but dropping/cancelling a future, abrupt termination, or a wasm trap cannot guarantee async cleanup. The adapter does not extend request lifetime, atomically bridge PostgreSQL and a Durable Object, participate in application transactions, deliver callbacks, or provide an outbox or recovery before DO acceptance.
+Await the operation within the request. Ordinary errors await shutdown after acquisition, but dropping/cancelling a future, abrupt termination, or a wasm trap cannot guarantee async cleanup. The publisher does not extend request lifetime, atomically bridge PostgreSQL and a Durable Object, participate in application transactions, deliver callbacks, or provide an outbox. The separate sweeper recovers eligible rows after missed invocation.
+
+### Scheduled sweeper
+
+Configure `PostgresSweeper` with Hyperdrive, the existing schema, and dispatcher:
+
+```rust
+fn sweeper_config(env: &Env) -> Result<PostgresSweeperConfig> {
+    Ok(PostgresSweeperConfig::new(
+        env.hyperdrive("HYPERDRIVE")?.connection_string(),
+        PostgresBackendOptions {
+            schema: Some(env.var("BELLOWS_SCHEMA")?.to_string()),
+        },
+        env.durable_object("DISPATCHER")?,
+    ))
+}
+```
+
+**worker 0.8.5's `#[event(scheduled)]` discards returned errors.** Export a rejecting JavaScript promise instead, as in [`producer/lib.rs`](./producer/lib.rs) (using its `worker::*` and sweeper imports):
+
+```rust
+#[wasm_bindgen::prelude::wasm_bindgen]
+pub fn scheduled(
+    _event: worker_sys::ScheduledEvent,
+    env: Env,
+    _ctx: worker_sys::ScheduleContext,
+) -> js_sys::Promise {
+    js_sys::futures::future_to_promise(std::panic::AssertUnwindSafe(async move {
+        PostgresSweeper::new(sweeper_config)
+            .sweep(&env)
+            .await
+            .map_err(|error| js_sys::Error::new(&error.to_string()))?;
+        Ok(wasm_bindgen::JsValue::UNDEFINED)
+    }))
+}
+```
+
+Register `"triggers": { "crons": ["* * * * *"] }` in Wrangler, as in [`producer/wrangler.jsonc`](./producer/wrangler.jsonc). The wrapper awaits the sweep and maps errors to sanitized messages; do not expose underlying causes through `Debug` or the error chain. See [recovery semantics and configuration constraints](../../../../README.md#minute-cron-postgresql-recovery).
+
+The [shared harness](../../../../interop-tests/cloudflare/README.md#shared-support) verifies recovery and failed scheduled invocations through injected workerd events, not hosted Cron delivery.
 
 ### Processor cleanup
 
@@ -67,7 +106,7 @@ Direct `PostgresPublishingBackend` plus `dispatch_task` also remains available f
 
 The dispatcher launches external requests in memory before checking the warming alarm, with no task writes or schedule scans. It sets the alarm only when missing or later than `now + 30 seconds`, leaving earlier and overdue alarms alone. Scheduling persistence starts on a valid `retryAt`, including past deadlines; unsaved completion performs no writes. The alarm selects the earliest task deadline (a 60-second watchdog for running scheduled attempts) or independent 30-second warming heartbeat, launching every due distinct ID without a Bellows concurrency limit, subject to platform limits. Only a fully consumed, successful matching-ID `done` removes tracking. Uncertain responses retry with one-to-thirty-second exponential backoff, in memory for unsaved tasks and durably for saved schedules. Watchdog supersession ignores stale results but does not prove business cancellation. PostgreSQL remains the execution/lease authority.
 
-Durability starts with a persisted scheduling hint, not DO acceptance. Earlier loss requires explicit redispatch or application recovery; there is no PostgreSQL discovery, Cron, automatic republishing, or atomic publication-to-acceptance transaction. Alarms and attempts are at-least-once, not exactly-once side effects; use idempotent operations. See the [complete scheduling guarantees](../../../../README.md#durable-scheduling-and-limits).
+Dispatcher durability starts with a persisted `retryAt` hint, not DO acceptance. Prompt publisher dispatch, known-schedule DO alarms, and minute-Cron rediscovery complement one another; sweeping adds recovery for earlier loss without persisting acceptance. There is no automatic republishing, outbox, added callback delivery, or atomic publication-to-dispatch transaction. Alarms and attempts are at-least-once, not exactly-once side effects; use idempotent operations. See the [complete scheduling guarantees](../../../../README.md#durable-scheduling-and-limits).
 
 ## Build and test
 
@@ -85,11 +124,12 @@ Use an existing PostgreSQL 17 server or start a disposable local one with Docker
 
 ```bash
 docker run --detach --rm --name bellows-cloudflare-postgres \
-  --publish 127.0.0.1:5432:5432 --env POSTGRES_PASSWORD=postgres postgres:17
+  --publish 127.0.0.1:5432:5432 --env POSTGRES_PASSWORD=postgres postgres:17 \
+  -c max_connections=600
 docker exec bellows-cloudflare-postgres pg_isready -U postgres -d postgres
 ```
 
-Wait for `pg_isready` to report acceptance before testing. Remove this container afterward with `docker stop bellows-cloudflare-postgres`.
+Wait for `pg_isready` to report acceptance before testing. The simultaneous 101-task sweep fixtures need connection headroom for gated claims/business work; use `max_connections=600` for this test server, not as production sizing guidance. Remove this container afterward with `docker stop bellows-cloudflare-postgres`.
 
 Build current sources and validate both application bundles without deploying:
 
@@ -119,7 +159,7 @@ Each fixture creates an isolated schema and initializes it with Rust's public `b
 
 The Rust and mixed suites build current Rust Workers automatically; no manual prebuild is required. The helper pins `worker-build` 0.8.5, reuses source/tool/environment-hashed bundles, and copies SDK output unmodified into `build/harness`. Cold preparation has a separate 240-second budget before short fixture hooks. Response deadlines remain two seconds including body consumption, polls three seconds, startup eight seconds, and harness shutdown five seconds. Tests use SQL gates and observed database state, not processing sleeps.
 
-Cleanup clears fixture-owned retained schedules, releases locks, drains responses and request clients, closes workerd, drops only the fixture-owned schema, closes administrative connections, and restores `CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE`, including on failure. Unexpected runtime logs or cleanup errors fail tests. Generated `build/` and `.wrangler/` output is ignored. All-zero Hyperdrive IDs are local placeholders, not deployable resources.
+Cleanup clears fixture-owned retained schedules, releases locks, drains responses, scheduled events, and request clients, closes workerd, drops only the fixture-owned schema, closes administrative connections, and restores `CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE`, including on failure. Unexpected runtime logs or cleanup errors fail tests. Generated `build/` and `.wrangler/` output is ignored. All-zero Hyperdrive IDs are local placeholders, not deployable resources.
 
 See the [shared protocol and opt-in hosted verification instructions](../../../../bellows-ts/test/integration/cloudflare/README.md#opt-in-hosted-verification) before using the application projects outside workerd. For Rust, use `initialize_postgres_schema` through a direct administrative connection. Preserve the private processor, disabled Hyperdrive query caching, verified origin TLS, disposable resources, and language-specific compatibility flags. The contract Workers are test-only and must not be deployed.
 

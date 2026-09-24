@@ -2,6 +2,7 @@
   "name": "bellows-cloudflare-producer",
   "main": "build/worker/shim.mjs",
   "compatibility_date": "2026-07-01",
+  "triggers": { "crons": ["* * * * *"] },
   "build": {
     "command": "pnpm --workspace-root exec node bellows/tests/integration/cloudflare/build-rust.mjs producer"
   },

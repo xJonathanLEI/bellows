@@ -2,6 +2,7 @@
 
 use std::{
     cell::{Cell, RefCell},
+    collections::VecDeque,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -14,7 +15,7 @@ use bellows::{
     backends::postgres_publishing::PostgresBackendOptions,
     cloudflare::{
         dispatch_task,
-        sdk::{PostgresPublisher, PostgresPublisherConfig},
+        sdk::{PostgresPublisher, PostgresPublisherConfig, PostgresSweeper, PostgresSweeperConfig},
     },
     time::Instant,
 };
@@ -28,6 +29,30 @@ impl TaskDefinition for PublisherTask {
     const NAME: &str = "publisher_contract";
     type Callback = Vec<String>;
     type Trigger = PublishTrigger<(String, Vec<u32>)>;
+}
+
+// Like the producer, reject the actual event rather than losing Result in worker 0.8.5's macro.
+#[wasm_bindgen::prelude::wasm_bindgen]
+pub fn scheduled(
+    _event: worker_sys::ScheduledEvent,
+    env: Env,
+    _ctx: worker_sys::ScheduleContext,
+) -> js_sys::Promise {
+    js_sys::futures::future_to_promise(std::panic::AssertUnwindSafe(async move {
+        PostgresSweeper::new(|env: &Env| {
+            Ok(PostgresSweeperConfig::new(
+                env.hyperdrive("HYPERDRIVE")?.connection_string(),
+                PostgresBackendOptions {
+                    schema: Some(env.var("BELLOWS_SCHEMA")?.to_string()),
+                },
+                env.durable_object("DISPATCHER")?,
+            ))
+        })
+        .sweep(&env)
+        .await
+        .map_err(|error| js_sys::Error::new(&error.to_string()))?;
+        Ok(wasm_bindgen::JsValue::UNDEFINED)
+    }))
 }
 
 pub async fn fetch(mut request: Request, env: &Env) -> Result<Response> {
@@ -98,6 +123,7 @@ pub async fn fetch(mut request: Request, env: &Env) -> Result<Response> {
 #[durable_object]
 pub struct PublisherReceiver {
     status: Cell<u16>,
+    statuses: RefCell<VecDeque<u16>>,
     dispatches: RefCell<Vec<Value>>,
     drained: Arc<AtomicUsize>,
     release: Arc<Semaphore>,
@@ -107,6 +133,7 @@ impl DurableObject for PublisherReceiver {
     fn new(_: State, _: Env) -> Self {
         Self {
             status: Cell::new(200),
+            statuses: RefCell::new(VecDeque::new()),
             dispatches: RefCell::new(Vec::new()),
             drained: Arc::new(AtomicUsize::new(0)),
             release: Arc::new(Semaphore::new(0)),
@@ -122,6 +149,12 @@ impl DurableObject for PublisherReceiver {
             "/publisher/response" => {
                 let body: Value = request.json().await?;
                 self.status.set(body["status"].as_u64().unwrap() as u16);
+                *self.statuses.borrow_mut() = body["statuses"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|status| status.as_u64().unwrap() as u16)
+                    .collect();
                 Response::empty()
             }
             "/publisher/release" => {
@@ -129,7 +162,7 @@ impl DurableObject for PublisherReceiver {
                 Response::empty()
             }
             "/publisher/drain" => {
-                self.release.add_permits(100);
+                self.release.close();
                 Response::empty()
             }
             "/dispatch" => {
@@ -144,7 +177,9 @@ impl DurableObject for PublisherReceiver {
                             // Send more than the diagnostic excerpt before withholding the tail.
                             0 => format!("fixture-secret:{}", "a".repeat(10_000)).into_bytes(),
                             1 => {
-                                release.acquire().await.unwrap().forget();
+                                if let Ok(permit) = release.acquire().await {
+                                    permit.forget();
+                                }
                                 "🦀:complete".as_bytes().to_vec()
                             }
                             _ => {
@@ -155,7 +190,12 @@ impl DurableObject for PublisherReceiver {
                         Some((Ok::<_, Error>(bytes), (part + 1, release, drained)))
                     },
                 );
-                Ok(Response::from_stream(stream)?.with_status(self.status.get()))
+                let status = self
+                    .statuses
+                    .borrow_mut()
+                    .pop_front()
+                    .unwrap_or(self.status.get());
+                Ok(Response::from_stream(stream)?.with_status(status))
             }
             _ => Response::error("not-found", 404),
         }

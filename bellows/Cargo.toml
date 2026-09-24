@@ -22,6 +22,7 @@ sqlite = ["dep:rand", "sqlx", "serde_json"]
 postgres = ["dep:rand", "sqlx", "serde_json"]
 
 [dependencies]
+futures-util = { workspace = true, optional = true }
 http = { workspace = true, optional = true }
 serde.workspace = true
 serde_json = { workspace = true, optional = true }
@@ -34,7 +35,6 @@ sqlx = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["rt", "time"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-futures-util = { workspace = true, optional = true }
 tokio-postgres = { workspace = true, features = ["js"], optional = true }
 web-time.workspace = true
 worker = { workspace = true, optional = true }
