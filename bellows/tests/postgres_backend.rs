@@ -61,7 +61,9 @@ async fn discovery_default_schema_is_read_only_and_never_initialized_on_connect(
     let mut admin = PgConnection::connect(database.url()).await.unwrap();
     admin
         .execute(
-            "INSERT INTO bellows_tasks (task_name, payload_json) VALUES (' 未登録 ', 'not json')",
+            "INSERT INTO bellows_tasks (task_name, payload_json) VALUES (' 未登録 ', 'not json');
+             INSERT INTO bellows_tasks (task_name, task_unique_key, payload_json)
+             VALUES ('singleton', 'singleton', 'not json')",
         )
         .await
         .unwrap();
@@ -75,6 +77,10 @@ async fn discovery_default_schema_is_read_only_and_never_initialized_on_connect(
     let page = backend.read_page(&window, None).await.unwrap();
     assert_eq!(page[0].task_name, " 未登録 ");
     assert_eq!(page[0].task_id, 1);
+    assert!(!page[0].is_singleton);
+    assert_eq!(page[1].task_name, "singleton");
+    assert!(page[1].is_singleton);
+    assert_eq!(window.upper_id, Some(page[1].task_id));
     backend.close().await.unwrap();
     assert!(backend.begin_sweep().await.is_err());
     admin.close().await.unwrap();

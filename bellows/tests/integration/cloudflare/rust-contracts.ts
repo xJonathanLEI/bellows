@@ -205,13 +205,18 @@ export function rustContracts(configPath: URL): void {
     const dispatch = async (taskId: string) => {
       const response = await consume(
         "/dispatch",
-        json({ taskId, taskName: "body_contract" }),
+        json({
+          tasks: [
+            {
+              task: { kind: "published", taskId, taskName: "body_contract" },
+              intent: "run",
+            },
+          ],
+        }),
       );
       expect(response.status, response.body).toBe(200);
       return JSON.parse(response.body) as {
         ok: boolean;
-        taskId: string;
-        duplicate?: boolean;
       };
     };
 
@@ -311,17 +316,13 @@ export function rustContracts(configPath: URL): void {
       }, 10_000);
 
       test(`retains service fetch through body drainage and permits redispatch: ${taskId}`, async () => {
-        expect(await dispatch(taskId)).toEqual({ ok: true, taskId });
+        expect(await dispatch(taskId)).toEqual({ ok: true });
         await poll(
           "service response started but body withheld",
           state,
           (s) => s.fetched === 1,
         );
-        expect(await dispatch(taskId)).toEqual({
-          ok: true,
-          taskId,
-          duplicate: true,
-        });
+        expect(await dispatch(taskId)).toEqual({ ok: true });
         expect(await state()).toEqual({ fetched: 1, drained: 0 });
         await consume("/source/release");
         await poll(
@@ -332,7 +333,7 @@ export function rustContracts(configPath: URL): void {
         if (taskId === "error") {
           expectedLogs.push({
             level: "error",
-            message: `task processor failed error task processor returned HTTP 503: ${"a".repeat(466)}`,
+            message: `task processor failed published task processor returned HTTP 503: ${"a".repeat(466)}`,
           });
           await poll(
             "observed processor HTTP error",
@@ -342,8 +343,11 @@ export function rustContracts(configPath: URL): void {
         }
         await poll(
           "previous attempt permits explicit redispatch",
-          () => dispatch(taskId),
-          (s) => s.duplicate !== true,
+          async () => {
+            await dispatch(taskId);
+            return state();
+          },
+          (s) => s.fetched === 2,
         );
         await poll(
           "new service attempt launched",
@@ -371,6 +375,132 @@ export function rustContracts(configPath: URL): void {
       expect(await state()).toEqual({ fetched: 0, drained: 0 });
     }, 10_000);
 
+    test("persists kind-prefixed singleton schedules and resets only bootstrap suppression on reconstruction", async () => {
+      const singleton = { kind: "singleton", taskName: "7 雪🦀" };
+      const published = {
+        kind: "published",
+        taskId: "7 雪🦀",
+        taskName: "body_contract",
+      };
+      const ensure = { task: singleton, intent: "ensure" };
+      const run = { task: singleton, intent: "run" };
+      const schedule = async () =>
+        JSON.parse((await consume("/dispatcher/state")).body) as {
+          tasks: Record<
+            string,
+            { task: unknown; state: { type: string }; nextAttemptAtMs: number }
+          >;
+        };
+      const batch = async (tasks: unknown[]) => {
+        const response = await consume("/dispatch", json({ tasks }));
+        expect(response.status, response.body).toBe(200);
+        expect(JSON.parse(response.body)).toEqual({ ok: true });
+      };
+      const atMs = Date.now() + 60_000;
+      await consume("/source/action", json({ type: "retryAt", atMs }));
+      await batch([ensure, { task: published, intent: "run" }, ensure]);
+      await poll(
+        "both kinds launched before body release",
+        state,
+        (s) => s.fetched === 2,
+      );
+      expect((await schedule()).tasks).toEqual({});
+      await consume("/source/release");
+      await consume("/source/release");
+      const saved = await poll(
+        "both kind-prefixed records persisted",
+        schedule,
+        (s) => Object.keys(s.tasks).length === 2,
+      );
+      expect(saved.tasks["task:singleton:7 雪🦀"]).toEqual({
+        task: singleton,
+        state: { type: "pending" },
+        infrastructureFailures: 0,
+        nextAttemptAtMs: atMs,
+      });
+      expect(saved.tasks["task:published:7 雪🦀"].task).toEqual(published);
+      await batch([ensure, ensure]);
+      expect((await state()).fetched).toBe(2);
+      await batch([ensure, run]);
+      await poll(
+        "run bypasses the bootstrap set",
+        state,
+        (s) => s.fetched === 3,
+      );
+      await consume("/source/release");
+      await poll("run body consumed", state, (s) => s.drained === 3);
+      await consume("/dispatcher/reconstruct");
+      await batch([ensure]);
+      await poll(
+        "new delegate can bootstrap an existing schedule",
+        state,
+        (s) => s.fetched === 4,
+      );
+      await consume("/source/release");
+      await poll(
+        "reconstructed bootstrap consumed",
+        state,
+        (s) => s.drained === 4,
+      );
+      expect((await schedule()).tasks).toEqual(saved.tasks);
+      await consume("/source/action", json({ type: "done" }));
+      await batch([run]);
+      await poll(
+        "definitive completion launched",
+        state,
+        (s) => s.fetched === 5,
+      );
+      await consume("/source/release");
+      await poll(
+        "only the singleton record removed",
+        schedule,
+        (s) => Object.keys(s.tasks).length === 1,
+      );
+      await poll(
+        "done allows another ensure",
+        async () => {
+          await batch([ensure]);
+          return state();
+        },
+        (s) => s.fetched === 6,
+      );
+      await consume("/source/release");
+      await poll("last singleton body consumed", state, (s) => s.drained === 6);
+    }, 10_000);
+
+    test("rejects an old dispatch envelope and an invalid final batch entry before launching", async () => {
+      for (const body of [
+        { taskId: "ok", taskName: "body_contract" },
+        {
+          tasks: [
+            {
+              task: {
+                kind: "published",
+                taskId: "ok",
+                taskName: "body_contract",
+              },
+              intent: "run",
+            },
+            {
+              task: {
+                kind: "singleton",
+                taskId: "fabricated",
+                taskName: "singleton",
+              },
+              intent: "ensure",
+            },
+          ],
+        },
+      ]) {
+        const response = await consume("/dispatch", json(body));
+        expect(response.status).toBe(400);
+      }
+      expect(await state()).toEqual({ fetched: 0, drained: 0 });
+      expect(
+        JSON.parse((await consume("/dispatcher/state")).body).alarm,
+      ).toBeNull();
+    }, 10_000);
+
     test("adapts heartbeat alarms as absolute times and schedules while idle", async () => {
       const alarmState = async () =>
         JSON.parse((await consume("/dispatcher/state")).body) as {
@@ -383,7 +513,7 @@ export function rustContracts(configPath: URL): void {
       const after = await alarmState();
       expect(after.alarm).toBeGreaterThanOrEqual(before.now + 30_000);
       expect(after.alarm).toBeLessThanOrEqual(after.now + 30_000);
-      expect(await dispatch("ok")).toEqual({ ok: true, taskId: "ok" });
+      expect(await dispatch("ok")).toEqual({ ok: true });
       expect((await alarmState()).alarm).toBe(after.alarm);
       await consume("/source/release");
       await poll(

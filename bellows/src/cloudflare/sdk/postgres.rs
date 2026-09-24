@@ -4,7 +4,8 @@ use worker::{Env, Request, Response};
 
 use super::{incoming_request, outgoing_response, sdk_error};
 use crate::{
-    PublishActivationStrategy, PublishDispatchToken, TaskDefinition, Worker, WorkerFactory,
+    PublishActivationStrategy, PublishDispatchToken, SingletonTrigger, TaskDefinition, Worker,
+    WorkerFactory,
     backends::postgres_execution::{PostgresBackendOptions, PostgresExecutionBackend},
     cloudflare::{
         BoxDispatchError,
@@ -12,7 +13,7 @@ use crate::{
     },
 };
 
-/// A typed published factory registered under its definition's exact name.
+/// A typed factory registered under its definition's exact name and kind.
 pub struct PostgresProcessorTask(ProcessorTask<PostgresExecutionBackend>);
 
 impl PostgresProcessorTask {
@@ -24,6 +25,14 @@ impl PostgresProcessorTask {
         >,
     {
         Self(ProcessorTask::new(factory))
+    }
+
+    pub fn singleton<F>(factory: F) -> Self
+    where
+        F: WorkerFactory + 'static,
+        <F::Worker as Worker>::Task: TaskDefinition<Trigger = SingletonTrigger>,
+    {
+        Self(ProcessorTask::singleton(factory))
     }
 }
 
@@ -64,14 +73,16 @@ impl PostgresProcessorConfig {
     }
 }
 
-/// A request-scoped PostgreSQL processor routing exact names to typed published factories.
+/// A request-scoped PostgreSQL processor routing exact names and kinds to typed factories.
 ///
-/// Unknown names return 404 without acquisition; claims still check the persisted definition name.
+/// Unknown names or mismatched kinds return 404 without acquisition. Claims precede construction;
+/// singleton workers receive unit payloads and the actual backend-managed row ID.
 /// The synchronous callback reads bindings only after validation. Construction performs no I/O.
 /// If configuration fails before returning, it owns its partially created resources.
 /// Connections are never retained between requests. HTTP 200 reports `nextAction`: `done` or
 /// `retryAt` with absolute Unix `atMs`, not business success. Uncertain runtime outcomes return
 /// a sanitized HTTP 500. This does not extend request lifetime, retry tasks, or recover from wasm traps.
+/// Responses echo the full identity. Singleton success without a deadline retries immediately.
 pub struct PostgresProcessor<C> {
     configure: C,
 }
@@ -84,7 +95,7 @@ where
         Self { configure }
     }
 
-    /// Delegates POST `/process` with `{ taskId, taskName }`.
+    /// Delegates POST `/process` with `{ task: TaskIdentity }`.
     /// Awaits the runtime, registered cleanup, and backend shutdown.
     pub async fn fetch_worker(&self, request: Request, env: &Env) -> worker::Result<Response> {
         let processor = RequestProcessor {

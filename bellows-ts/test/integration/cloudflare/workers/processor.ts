@@ -8,16 +8,24 @@ import {
   TaskSuccess,
   type WorkerFactory,
 } from "../../../../src/index.js";
-import { fullNameTask, greetingTask, schedulingTask } from "../task.js";
+import {
+  fullNameTask,
+  greetingTask,
+  schedulingTask,
+  singletonTask,
+  unconfiguredSingletonTask,
+} from "../task.js";
 
 interface ProcessorEnv {
   HYPERDRIVE: Hyperdrive;
   BELLOWS_SCHEMA: string;
+  BELLOWS_SINGLETON_MODE?: string;
 }
 
 const processor = createPostgresProcessor((env: ProcessorEnv) => {
   const connectionString = env.HYPERDRIVE.connectionString;
   const schema = env.BELLOWS_SCHEMA;
+  const singletonMode = env.BELLOWS_SINGLETON_MODE ?? "park";
   let operation: Promise<number> | undefined;
   function record(taskId: number, name: string): Promise<number> {
     operation = (async () => {
@@ -93,6 +101,32 @@ RETURNING execution_count
       createPostgresProcessorTask(greetingFactory),
       createPostgresProcessorTask(fullNameFactory),
       createPostgresProcessorTask(schedulingFactory),
+      ...[singletonTask, unconfiguredSingletonTask].map((task) =>
+        createPostgresProcessorTask({
+          task,
+          build() {
+            return {
+              async process(taskId, payload) {
+                if (payload !== undefined)
+                  throw new Error("singleton payload must be undefined");
+                const count = await record(taskId, task.name);
+                const atMs =
+                  Date.now() +
+                  (count === 1 && singletonMode !== "park" ? 1_000 : 60_000);
+                if (count === 1) {
+                  if (singletonMode === "failure")
+                    return TaskFailure.retryAt(atMs);
+                  if (singletonMode === "immediate")
+                    return TaskFailure.retryImmediately();
+                  if (singletonMode === "done")
+                    return TaskSuccess.done(undefined);
+                }
+                return TaskSuccess.scheduleNextRun(undefined, atMs);
+              },
+            };
+          },
+        }),
+      ),
     ],
     async cleanup() {
       // The runtime handles worker failures; drain work and its finally after lease loss.
@@ -104,21 +138,44 @@ RETURNING execution_count
 // Fixture-only response loss, after all real finalization and owned cleanup.
 // The producer never forwards these control routes.
 const lostResponses = new Set<string>();
+const singletonAttempts = new Map<string, number>();
 export default {
   async fetch(request: Request, env: ProcessorEnv): Promise<Response> {
+    if (new URL(request.url).pathname === "/__test/attempts") {
+      return Response.json(Object.fromEntries(singletonAttempts));
+    }
     if (new URL(request.url).pathname === "/__test/lose-response") {
-      const { taskId } = await request.json<{ taskId: string }>();
-      lostResponses.add(taskId);
+      const { taskId, taskName } = await request.json<{
+        taskId?: string;
+        taskName?: string;
+      }>();
+      const key = taskName ?? taskId;
+      if (key === undefined)
+        return new Response("missing identity", { status: 400 });
+      lostResponses.add(key);
       return new Response(null);
     }
     const response = await processor.fetch(request, env);
-    if (response.status !== 200 || lostResponses.size === 0) return response;
+    if (response.status !== 200) return response;
     const body = await response.json<{
-      taskId: string;
+      task:
+        | { kind: "published"; taskId: string; taskName: string }
+        | { kind: "singleton"; taskName: string };
       nextAction: { type: string };
     }>();
-    if (body.nextAction.type === "done" && lostResponses.delete(body.taskId)) {
-      // The committed done instruction is lost, not changed into a business retry.
+    if (body.task.kind === "singleton") {
+      singletonAttempts.set(
+        body.task.taskName,
+        (singletonAttempts.get(body.task.taskName) ?? 0) + 1,
+      );
+    }
+    if (
+      (body.task.kind === "singleton" || body.nextAction.type === "done") &&
+      lostResponses.delete(
+        body.task.kind === "singleton" ? body.task.taskName : body.task.taskId,
+      )
+    ) {
+      // Lose the committed instruction without changing PostgreSQL's outcome.
       return new Response("fixture response lost", { status: 503 });
     }
     return Response.json(body);

@@ -11,13 +11,14 @@ use bellows::{
         RetainedTaskDispatcher,
         sdk::{
             Dispatcher, PostgresPublisher, PostgresPublisherConfig, PostgresSweeper,
-            PostgresSweeperConfig,
+            PostgresSweeperConfig, PostgresSweeperSingleton,
         },
     },
 };
 use serde_json::json;
 use task::{
-    FullNamePayload, FullNameTask, GreetingPayload, GreetingTask, SchedulingPayload, SchedulingTask,
+    FullNamePayload, FullNameTask, GreetingPayload, GreetingTask, SchedulingPayload,
+    SchedulingTask, SingletonTask,
 };
 use worker::*;
 
@@ -47,13 +48,23 @@ fn publisher_config(env: &Env) -> Result<PostgresPublisherConfig> {
 }
 
 fn sweeper_config(env: &Env) -> Result<PostgresSweeperConfig> {
+    // Keep published-only scenarios free of perpetual singleton chains.
+    let singletons = if env
+        .var("BELLOWS_SINGLETON_BOOTSTRAP")
+        .is_ok_and(|value| value.to_string() == "true")
+    {
+        vec![PostgresSweeperSingleton::new::<SingletonTask>()]
+    } else {
+        vec![]
+    };
     Ok(PostgresSweeperConfig::new(
         env.hyperdrive("HYPERDRIVE")?.connection_string(),
         PostgresBackendOptions {
             schema: Some(env.var("BELLOWS_SCHEMA")?.to_string()),
         },
         env.durable_object("DISPATCHER")?,
-    ))
+    )
+    .with_singletons(singletons))
 }
 
 // worker 0.8.5's #[event(scheduled)] discards the handler's Result. Export a real

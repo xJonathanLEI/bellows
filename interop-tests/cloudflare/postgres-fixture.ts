@@ -52,6 +52,10 @@ interface WorkerProject {
 export interface CloudflareProjects {
   producer: WorkerProject;
   processor?: WorkerProject;
+  singleton?: {
+    bootstrap: boolean;
+    mode?: "park" | "success" | "failure" | "immediate" | "done";
+  };
 }
 
 export interface CloudflarePostgresFixtureOptions {
@@ -130,18 +134,25 @@ export class CloudflarePostgresFixture {
     // Wrangler reads this while loading the real on-disk Hyperdrive bindings.
     // Do not replace HYPERDRIVE with a vars override or a fabricated binding.
     process.env[HYPERDRIVE_LOCAL_URL] = this.options.databaseUrl;
+    const vars = {
+      BELLOWS_SCHEMA: this.schema,
+      BELLOWS_SINGLETON_BOOTSTRAP: project.singleton?.bootstrap
+        ? "true"
+        : "false",
+      BELLOWS_SINGLETON_MODE: project.singleton?.mode ?? "park",
+    };
     try {
       this.server = createTestHarness({
         workers: [
           {
             ...project.producer,
-            vars: { BELLOWS_SCHEMA: this.schema },
+            vars,
           },
           ...(project.processor
             ? [
                 {
                   ...project.processor,
-                  vars: { BELLOWS_SCHEMA: this.schema },
+                  vars,
                 },
               ]
             : []),
@@ -253,8 +264,9 @@ FOR EACH ROW EXECUTE FUNCTION "${this.schema}".record_execution()
       tasks: Record<
         string,
         {
-          taskId: string;
-          taskName: string;
+          task:
+            | { kind: "published"; taskId: string; taskName: string }
+            | { kind: "singleton"; taskName: string };
           state: { type: "pending" | "running"; attemptId?: number };
           nextAttemptAtMs: number;
           infrastructureFailures: number;

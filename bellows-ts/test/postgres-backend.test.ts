@@ -9,6 +9,7 @@ import {
 import { PostgresDiscoveryBackend } from "../src/backends/postgres-discovery.js";
 import { PostgresExecutionBackend } from "../src/backends/postgres-execution.js";
 import {
+  PostgresSingletonTaskIdError,
   PostgresTaskOperations,
   validatePostgresSchemaName,
 } from "../src/backends/postgres-operations.js";
@@ -55,6 +56,57 @@ const adminDatabaseUrl =
 const resources: Array<{ close: () => Promise<void> | void }> = [];
 
 test.each([
+  "9007199254740991",
+  "9007199254740992",
+  "9007199254740993",
+  "9223372036854775807",
+])("singleton claims preserve exact PostgreSQL row ID %s", async (taskId) => {
+  const database = track(await TestPostgresDatabase.create("singleton_id"));
+  await initializePostgresSchema(database.url, "public");
+  const admin = new Client({ connectionString: database.url });
+  await admin.connect();
+  const backend = await PostgresExecutionBackend.connect(database.url);
+  try {
+    await admin.query(
+      `INSERT INTO bellows_tasks (task_id, task_name, task_unique_key, payload_json)
+         OVERRIDING SYSTEM VALUE VALUES ($1, $2, $2, 'null')`,
+      [taskId, singletonTask.name],
+    );
+    const expiration = Date.now() + 60_000;
+    if (taskId === "9007199254740991") {
+      expect(
+        await backend.claimSingleton(singletonTask, 17, expiration),
+      ).toEqual({
+        taskId: Number(taskId),
+        taskPayload: undefined,
+        leaseExpirationMs: expiration,
+      });
+    } else {
+      const claim = backend.claimSingleton(singletonTask, 17, expiration);
+      await expect(claim).rejects.toBeInstanceOf(PostgresSingletonTaskIdError);
+      await expect(claim).rejects.toMatchObject({ taskId });
+    }
+    // Even a rejected conversion may follow a committed claim. No rounded ID is released.
+    expect(
+      (
+        await admin.query(
+          "SELECT task_id::text, task_unique_key, lease_worker_id::text FROM bellows_tasks",
+        )
+      ).rows,
+    ).toEqual([
+      {
+        task_id: taskId,
+        task_unique_key: singletonTask.name,
+        lease_worker_id: "17",
+      },
+    ]);
+  } finally {
+    await backend.close();
+    await admin.end();
+  }
+});
+
+test.each([
   undefined,
   "discovery_workload",
 ])("discovery is exact, read-only and keyset bounded (schema=%s)", async (schema) => {
@@ -84,7 +136,16 @@ test.each([
     expect(await backend.readPage(empty, null)).toEqual([]);
     await admin.query(`INSERT INTO ${table} (task_id, task_name, task_unique_key, payload_json)
         OVERRIDING SYSTEM VALUE VALUES (9223372036854775807, 'singleton', 'unique', '!')`);
-    expect((await backend.beginSweep()).upperId).toBeNull();
+    const singletonOnly = await backend.beginSweep();
+    expect(singletonOnly.upperId).toBe("9223372036854775807");
+    expect(await backend.readPage(singletonOnly, null)).toEqual([
+      {
+        taskId: "9223372036854775807",
+        taskName: "singleton",
+        isSingleton: true,
+      },
+    ]);
+    await admin.query(`DELETE FROM ${table}`);
     await admin.query(`INSERT INTO ${table} (task_id, task_name, payload_json)
         OVERRIDING SYSTEM VALUE
         SELECT n * 10, CASE WHEN n % 2 = 0 THEN ' 未登録/🔥 ' ELSE 'unregistered' END,
@@ -94,7 +155,9 @@ test.each([
         (2100, 'past', '!'), (2110, 'exact', '!'), (2120, 'future', '!'),
         (2130, 'expired owner', '!'), (2140, 'occupied', '!'),
         (9007199254740991, 'safe', '!'), (9007199254740992, 'unsafe', '!'),
-        (9007199254740993, 'unsafe exact', '!'), (9223372036854775806, 'upper', '!')`);
+        (9007199254740993, 'unsafe exact', '!'), (9223372036854775806, 'upper', '!');
+        UPDATE ${table} SET task_unique_key = task_id::text
+        WHERE task_id IN (2110, 2120, 2130, 2140, 9007199254740993, 9223372036854775806)`);
     const window = await backend.beginSweep();
     expect(window.upperId).toBe("9223372036854775806");
     expect(await backend.readPage(empty, null)).toEqual([]);
@@ -127,8 +190,9 @@ test.each([
     expect(first[0]).toEqual({
       taskId: "-9223372036854775808",
       taskName: "minimum",
+      isSingleton: false,
     });
-    expect(first[2]).toEqual({ taskId: "0", taskName: "" });
+    expect(first[2]).toEqual({ taskId: "0", taskName: "", isSingleton: false });
     expect(first[4]?.taskName).toBe(" 未登録/🔥 ");
     expect(await snapshot()).toEqual(before);
     // Even a consumer failure must advance by the last returned identity, not an offset.
@@ -137,7 +201,6 @@ test.each([
     expect(cursor).toBe("970");
     await admin.query(`DELETE FROM ${table} WHERE task_id = 10;
         UPDATE ${table} SET available_from_unix_ms = 9223372036854775807 WHERE task_id = 20;
-        DELETE FROM ${table} WHERE task_unique_key IS NOT NULL;
         INSERT INTO ${table} (task_id, task_name, payload_json) OVERRIDING SYSTEM VALUE
         VALUES (5, 'late behind cursor', '!'), (9223372036854775807, 'new publication', '!')`);
     const changed = await snapshot();
@@ -151,6 +214,12 @@ test.each([
       expect(BigInt(firstRow.taskId)).toBeGreaterThan(BigInt(cursor));
       cursor = lastRow.taskId;
       remaining.push(...page.map((row) => row.taskId));
+      for (const row of page)
+        expect(row.isSingleton).toBe(
+          ["2110", "2130", "9007199254740993", "9223372036854775806"].includes(
+            row.taskId,
+          ),
+        );
     }
     expect(remaining).toEqual([
       ...Array.from({ length: 108 }, (_, n) => String((n + 98) * 10)),
@@ -169,7 +238,11 @@ test.each([
       (await backend.readPage(next, null)).map((row) => row.taskId),
     ).toContain("5");
     expect(await backend.readPage(next, "9223372036854775806")).toEqual([
-      { taskId: "9223372036854775807", taskName: "new publication" },
+      {
+        taskId: "9223372036854775807",
+        taskName: "new publication",
+        isSingleton: false,
+      },
     ]);
     expect(await backend.readPage(next, "9223372036854775807")).toEqual([]);
     const nowDue = await backend.readPage(next, "2099");

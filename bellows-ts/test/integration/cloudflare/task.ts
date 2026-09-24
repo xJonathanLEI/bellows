@@ -1,4 +1,8 @@
-import { definePublishTask } from "../../../src/index.js";
+import { definePublishTask, defineSingletonTask } from "../../../src/index.js";
+
+export const singletonTask = defineSingletonTask("cloudflare_singleton");
+export const unconfiguredSingletonTask =
+  defineSingletonTask(" singleton:7 🦀 ");
 
 export const greetingTask = definePublishTask<{ name: string }>(
   "cloudflare_greeting",

@@ -55,9 +55,9 @@
 //!
 //! Delegate processor requests to `cloudflare::sdk::PostgresProcessor` with a synchronous
 //! environment-to-config callback and typed `PostgresProcessorTask` registrations with unique names.
-//! It validates `{ taskId, taskName }` before configuration, rejects unknown names without acquiring
+//! It validates `{ task: TaskIdentity }` before configuration, rejects unknown names or kinds without acquiring
 //! a backend, and awaits [`run_task_once`], registered application cleanup, and backend shutdown.
-//! One request attempts one ID; claims check the persisted name before decoding its typed payload.
+//! One request attempts one published ID or singleton name; claims precede worker construction.
 //! HTTP 200 reports `nextAction`: `done` or `retryAt` with absolute Unix `atMs`, not task success.
 //! Uncertain runtime outcomes and cleanup failures return sanitized HTTP 500 responses.
 //! Applications still own side-effect resources; retain cleanup ownership outside aborted workers.

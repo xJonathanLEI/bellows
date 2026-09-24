@@ -142,7 +142,7 @@ export async function queueGreeting(
 
 The annotated synchronous callback infers environment and payload types and runs once per publication, not at construction. The delegate can be reused; connections, receipts, and failures are local to each call. Both `publish` and `publishFuture` work detached from the returned object. Callback-bearing definitions publish without callback registration or an awaitable result, and singleton definitions are rejected.
 
-For future work, await `publisher.publishFuture(env, { name }, Date.now() + 60_000)`. The third argument is absolute Unix milliseconds. Availability reaches PostgreSQL, but dispatch happens immediately: the initial processor attempt asks PostgreSQL when the task can run, and the Durable Object retains that hint for a later automatic alarm. Both dispatch hops still carry only `{ taskId, taskName }`, never payloads or scheduling metadata.
+For future work, await `publisher.publishFuture(env, { name }, Date.now() + 60_000)`. The third argument is absolute Unix milliseconds. Availability reaches PostgreSQL, but dispatch happens immediately: the initial processor attempt asks PostgreSQL when the task can run, and the Durable Object retains that hint for a later automatic alarm. Dispatch carries logical identities, never payloads or scheduling metadata.
 
 Bellows acquires a fresh listener-free `PostgresPublishingBackend`, publishes exactly once, retains the string ID, validates it, awaits `close()`, then calls `dispatchTask` for object `global` with the published definition's exact name. Success waits for complete response-body consumption and returns readonly `PostgresPublisherReceipt.taskId: string`. It confirms **in-memory dispatch acceptance, not durable tracking, processing, or business success**; receipts remain ID-only for future publication too.
 
@@ -160,10 +160,13 @@ Publication and dispatch are not atomic: durable dispatcher tracking starts when
 
 #### Sweeper
 
-Default-export a sweeper configured with Hyperdrive, an existing schema, and the dispatcher. No task registrations are needed; use your generated Workers types:
+Default-export a sweeper configured with Hyperdrive, an existing schema, and the dispatcher. Optional `singletons` bootstrap work without filtering discovery; register their factories with the processor too. Use your generated Workers types:
 
 ```ts
+import { defineSingletonTask } from "@xjonathanlei/bellows";
 import { createPostgresSweeper } from "@xjonathanlei/bellows/cloudflare/postgres";
+
+const periodicTask = defineSingletonTask("periodic");
 
 interface TaskSweeperEnv {
   HYPERDRIVE: Hyperdrive;
@@ -175,6 +178,7 @@ const sweepConfigFor = (env: TaskSweeperEnv) => ({
   connectionString: env.HYPERDRIVE.connectionString,
   schema: env.BELLOWS_SCHEMA,
   dispatcher: env.DISPATCHER,
+  singletons: [periodicTask],
 });
 
 export default createPostgresSweeper(
@@ -195,16 +199,20 @@ export default {
 
 Add `"triggers": { "crons": ["* * * * *"] }` to Wrangler; exporting `scheduled` alone does not register the trigger. **The selected schema must belong entirely to the target processor's workload.** Initialize it separately, disable Hyperdrive query caching, and retain `nodejs_compat`.
 
-For manual invocation, `await sweep(env)` returns `discovered`, `accepted`, and `failed` counts. `PostgresSweeperError` retains the first stage/cause, partial report, optional candidate, and any later close error. All launched dispatches and backend shutdown are awaited before returning; `scheduled` rejects with sanitized diagnostics. Do not automatically log imperative error causes.
+For manual invocation, `await sweep(env)` returns `discovered`, `bootstrapCandidates`, `accepted`, and `failed` counts. `PostgresSweeperError` retains the first stage/cause, partial report, bounded candidate context, and any later close error. All launched dispatches and backend shutdown are awaited before returning; `scheduled` rejects with sanitized diagnostics. Do not automatically log imperative error details.
 
 See [recovery semantics and limits](../README.md#minute-cron-postgresql-recovery) for eligibility, pagination, and at-least-once behavior, and the [compiled producer](./test/integration/cloudflare/workers/producer.ts) for integration.
 
 #### Processor
 
-Default-export `createPostgresProcessor` with typed task registrations to route multiple published definitions through one Worker. The annotated configuration callback infers the environment.
+Default-export `createPostgresProcessor` with typed factories to route published and singleton definitions through one Worker. The annotated configuration callback infers the environment.
 
 ```ts
-import { definePublishTask, TaskSuccess } from "@xjonathanlei/bellows";
+import {
+  definePublishTask,
+  defineSingletonTask,
+  TaskSuccess,
+} from "@xjonathanlei/bellows";
 import {
   createPostgresProcessor,
   createPostgresProcessorTask,
@@ -216,9 +224,7 @@ interface Env {
 }
 
 const greetingTask = definePublishTask<{ name: string }>("cloudflare_greeting");
-const fullNameTask = definePublishTask<{ firstName: string; lastName: string }>(
-  "cloudflare_full_name",
-);
+const periodicTask = defineSingletonTask("periodic");
 
 export default createPostgresProcessor((env: Env) => ({
   connectionString: env.HYPERDRIVE.connectionString,
@@ -234,11 +240,12 @@ export default createPostgresProcessor((env: Env) => ({
       }),
     }),
     createPostgresProcessorTask({
-      task: fullNameTask,
+      task: periodicTask,
       build: () => ({
         async process(taskId, payload) {
-          console.log(taskId, `${payload.firstName} ${payload.lastName}`);
-          return TaskSuccess.done(undefined);
+          // The actual claimed row ID and undefined payload.
+          console.log(taskId, payload);
+          return TaskSuccess.scheduleNextRun(undefined, Date.now() + 60_000);
         },
       }),
     }),
@@ -246,27 +253,21 @@ export default createPostgresProcessor((env: Env) => ({
 }));
 ```
 
-Both dispatch hops require `{ taskId, taskName }`, not a payload. Registrations must be non-empty with unique, non-empty definition names, matched exactly. See the [shared protocol](./test/integration/cloudflare/README.md#protocol-and-limits) for validation and HTTP responses.
+Registrations must be non-empty with unique, non-empty definition names, matched by name and kind. See the [shared protocol](../README.md#logical-identity-and-bulk-protocol).
 
-Configuration is synchronous and runs once per validated request, not at construction. Bellows generates the worker ID, acquires a fresh listener-free backend, and claims by **ID and persisted definition name** before building your worker. Only the database's claimed payload reaches `process`. An existing router can instead retain the delegate and return `processor.fetch(request, env)`; `fetch` does not depend on `this`.
+Configuration is synchronous and runs once per validated request, not at construction. Bellows generates the worker ID, acquires a fresh listener-free backend, and claims before building your worker: by ID and persisted name for published tasks, or exact definition name for singletons. Only the claimed payload (undefined for singletons) and actual row ID reach `process`. An existing router can instead retain the delegate and return `processor.fetch(request, env)`; `fetch` does not depend on `this`.
 
 The response waits for the runtime, optional `cleanup: () => Promise<void>`, and backend shutdown, even if application cleanup fails. Cleanup runs once whenever configuration returned, including invalid registries, unknown names, acquisition failure, and no claim. Applications still own arbitrary side-effect resources. Keep business connections separate and drain any tracked business promise in cleanup: lease loss does **not** cancel a pending TypeScript promise. The [SQL processor](./test/integration/cloudflare/workers/processor.ts) demonstrates this with a request-scoped operation and an awaited `pg.Client` shutdown.
 
-HTTP **200** reports `{ taskId, nextAction: { type: "done" } }` for an absent matching task or committed completion, or `{ taskId, nextAction: { type: "retryAt", atMs } }` for observed availability/leases and committed retries or self-rescheduling. `atMs` is a finite, non-negative integer Unix millisecond timestamp within JavaScript's safe-integer and Date ranges; valid past deadlines request a prompt asynchronous recheck. This describes a known next action, not business success. Runtime uncertainty and acquisition, cleanup, or backend-close failures return sanitized **500** responses; diagnostics contain only the validated ID and lifecycle stage. Each processor request attempts once; the dispatcher schedules later requests.
+See the [processor contract](../README.md#processor-and-deployment) for responses and errors. **Singleton success without a deadline immediately repeats**; the example explicitly schedules a later run.
 
 Keep the processor private, initialize schemas separately through an administrative connection, and use the Hyperdrive connection string with query caching disabled and verified origin TLS. TypeScript requires `nodejs_compat` for `pg`; Rust must omit it. Do not construct the listening `PostgresBackend` in a Worker. Direct `PostgresExecutionBackend` from `@xjonathanlei/bellows/backends/postgres-execution` with `runTaskOnce()` remains the lower-level option for custom integrations, which must await their own backend shutdown. Generic root/`cloudflare` imports do not load PostgreSQL or Node modules; the PostgreSQL subpath retains its `pg` compatibility requirements without loading the full listening backend or Bellows's Node randomness module.
 
 #### Durable dispatcher
 
-Keep one `RetainedTaskDispatcher` per SQLite-backed Durable Object and use the named object `global`. External dispatch launches with in-memory tracking before checking the warming alarm, without task writes, schedule scans, or durable attempt allocation. It sets the alarm only when absent or later than `now + 30 seconds`, preserving earlier and overdue alarms. Conditional alarm writes and unrelated writes on this object retain Cloudflare's normal output gating. Active same-ID requests are deduplicated across names until the full response and result handling finish; active duplicates cannot change routing. Explicit redispatch of a pending ID can recheck immediately with a corrected name without acceptance-time task writes.
+Keep one `RetainedTaskDispatcher` per SQLite-backed Durable Object and use the named object `global`. `dispatchTasks` accepts batches; `dispatchTask` wraps one published `run` entry. See the [scheduling guarantees](../README.md#durable-scheduling-and-limits).
 
-The single alarm selects the earliest task deadline or independent 30-second heartbeat; a running scheduled task contributes its 60-second watchdog. The heartbeat keeps the DO warm even while idle. Alarms inspect persisted state and launch all due distinct IDs without a Bellows concurrency cap, batching delay, or serial processor queue, subject to platform limits. Saved schedules survive delegate reconstruction. Watchdog supersession retries interrupted/hung scheduled attempts and ignores stale responses; best-effort transport cancellation does not cancel arbitrary business promises.
-
-Only a fully consumed, successful, matching-ID `done` response removes tracking; unsaved completion performs no writes. Any valid `retryAt`, including a past deadline, starts durable tracking and resets infrastructure backoff. Uncertain responses, transport/body failures, and non-success statuses retry with exponential backoff from one to thirty seconds: in memory for unsaved tasks, durably for saved schedules. Scheduled tasks remain persisted while running. Committed business retries bypass that backoff, including immediate failure. PostgreSQL decides claimability; an extended lease can produce a later hint instead of building a worker.
-
-Alarms and attempts are at-least-once, not exactly-once side effects. Use idempotent business operations. Before a scheduling hint is persisted, loss of an invocation or its response needs minute-Cron rediscovery or explicit redispatch. Sweeping adds no outbox, automatic republishing, callback delivery, or atomic publication-to-dispatch guarantee, and abrupt termination cannot guarantee async cleanup. See the [shared scheduling guarantees](../README.md#durable-scheduling-and-limits).
-
-The [TypeScript Cloudflare–Postgres guide](./test/integration/cloudflare/README.md) exercises future publication, lease hints, business retries, successful self-rescheduling, response loss, and automatic alarms through real workerd/Hyperdrive/PostgreSQL. `pnpm --dir bellows-ts test:cloudflare` runs its topology and direct contracts without Rust tools; they also run in normal package tests. The independent [Rust harness](../bellows/tests/integration/cloudflare/README.md) owns Rust topology/SDK contracts, while the [interop suite](../interop-tests/cloudflare/README.md) runs both mixed directions. Root `pnpm test` runs all three packages serially, registering each scenario once per topology.
+The [TypeScript Cloudflare–Postgres guide](./test/integration/cloudflare/README.md) exercises published and singleton work through real local workerd/Hyperdrive/PostgreSQL. `pnpm --dir bellows-ts test:cloudflare` runs its topology and direct contracts without Rust tools; they also run in normal package tests. The independent [Rust harness](../bellows/tests/integration/cloudflare/README.md) owns Rust topology/SDK contracts, while the [interop suite](../interop-tests/cloudflare/README.md) runs both mixed directions. Root `pnpm test` runs all three packages serially, registering each scenario once per topology.
 
 ## Tasks
 

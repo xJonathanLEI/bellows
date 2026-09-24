@@ -1,7 +1,18 @@
+import {
+  type DispatchTask,
+  dispatchEntry,
+  dispatchIdentity,
+  sameTask,
+  type TaskIdentity,
+  taskIdentity,
+  trackingKey,
+} from "./cloudflare/protocol.js";
+
+export type { DispatchTask, TaskIdentity } from "./cloudflare/protocol.js";
+
 const DISPATCHER_NAME = "global";
 const DISPATCH_PATH = "https://dispatcher/dispatch";
 const PROCESSOR_PATH = "https://processor/process";
-const MAX_TASK_ID_LENGTH = 200;
 const HEARTBEAT_INTERVAL_MS = 30_000;
 const ATTEMPT_WATCHDOG_MS = 60_000;
 const MAX_DATE_MS = 8_640_000_000_000_000;
@@ -48,8 +59,7 @@ interface SchedulerMetadata {
 }
 
 interface TaskRecord {
-  taskId: string;
-  taskName: string;
+  task: TaskIdentity;
   nextAttemptAtMs: number;
   infrastructureFailures: number;
   state: { type: "pending" } | { type: "running"; attemptId: number };
@@ -77,11 +87,14 @@ function object(value: unknown): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
-function nextAction(text: string, taskId: string): NextAction {
+function nextAction(text: string, task: TaskIdentity): NextAction {
   try {
     const body = object(JSON.parse(text));
     const action = object(body.nextAction);
-    if (body.taskId === taskId && Object.keys(body).length === 2) {
+    if (
+      sameTask(taskIdentity(body.task), task) &&
+      Object.keys(body).length === 2
+    ) {
       if (action.type === "done" && Object.keys(action).length === 1) {
         return { type: "done" };
       }
@@ -109,11 +122,6 @@ function retry(record: TaskRecord, now: number): void {
     now + Math.min(1_000 * 2 ** (record.infrastructureFailures - 1), 30_000);
 }
 
-interface DispatchRequest {
-  readonly taskId?: unknown;
-  readonly taskName?: unknown;
-}
-
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
     status,
@@ -137,44 +145,16 @@ function truncateText(text: string): string {
   return text.slice(0, end);
 }
 
-function parseTaskId(value: unknown): string {
-  if (
-    typeof value !== "string" ||
-    value.length < 1 ||
-    value.length > MAX_TASK_ID_LENGTH
-  ) {
-    throw new Error(
-      `taskId must be a non-empty string no longer than ${MAX_TASK_ID_LENGTH} characters`,
-    );
-  }
-
-  return value;
-}
-
-function parseTaskName(value: unknown): string {
-  if (typeof value !== "string" || value.length === 0) {
-    throw new Error("taskName must be a non-empty string");
-  }
-  return value;
-}
-
-async function parseDispatchRequest(
-  request: Request,
-): Promise<{ taskId: string; taskName: string }> {
+async function parseDispatchRequest(request: Request): Promise<DispatchTask[]> {
   const contentType = request.headers.get("content-type") ?? "";
   if (!contentType.toLowerCase().includes("application/json")) {
     throw new Error("request content-type must be application/json");
   }
 
-  const body = (await request.json()) as DispatchRequest;
-  if (body === null || typeof body !== "object" || Array.isArray(body)) {
-    throw new Error("request body must be a JSON object");
-  }
-
-  return {
-    taskId: parseTaskId(body.taskId),
-    taskName: parseTaskName(body.taskName),
-  };
+  const body = object(await request.json());
+  if (Object.keys(body).length !== 1 || !Array.isArray(body.tasks))
+    throw new Error("request must contain a tasks array");
+  return body.tasks.map(dispatchEntry);
 }
 
 async function consumeResponse(response: Response): Promise<string> {
@@ -187,15 +167,25 @@ export async function dispatchTask(
   taskName: string,
   taskId: string,
 ): Promise<void> {
-  const validTaskId = parseTaskId(taskId);
-  const validTaskName = parseTaskName(taskName);
+  return dispatchTasks(namespace, [
+    { task: { kind: "published", taskId, taskName }, intent: "run" },
+  ]);
+}
+
+/** Validates the whole batch before contacting `global`; empty batches do no I/O. */
+export async function dispatchTasks(
+  namespace: DurableObjectNamespaceLike,
+  tasks: readonly DispatchTask[],
+): Promise<void> {
+  const entries = tasks.map(dispatchEntry);
+  if (entries.length === 0) return;
   const dispatcher = namespace.getByName(DISPATCHER_NAME);
   const response = await dispatcher.fetch(DISPATCH_PATH, {
     method: "POST",
     headers: {
       "content-type": "application/json",
     },
-    body: JSON.stringify({ taskId: validTaskId, taskName: validTaskName }),
+    body: JSON.stringify({ tasks: entries }),
   });
   const responseBody = await consumeResponse(response);
 
@@ -208,16 +198,18 @@ export async function dispatchTask(
 
 /**
  * One delegate per SQLite-backed Durable Object, using the named object `global`.
- * Dispatch launches in memory before checking/repairing the warming alarm, without task writes.
- * The alarm is set only when absent or later than now plus thirty seconds. Active same-ID duplicates cannot
- * change routing and stay deduplicated through full body consumption and result persistence.
- * Pending IDs can be explicitly redispatched immediately with a corrected name.
+ * Dispatch validates the entire batch, launches in memory, then checks the warming alarm once,
+ * without task writes. The alarm is set only when absent or later than now plus thirty seconds.
+ * Active attempts deduplicate by published ID or singleton name through full response consumption
+ * and result persistence. Pending published IDs can be redispatched with a corrected name.
+ * Singleton `ensure` entries are suppressed only after this delegate establishes an invocation
+ * chain. The in-memory optimization never suppresses `run` entries or alarms and is cleared on done.
  *
- * Only a successful, fully consumed, matching-ID `done` removes tracking. `retryAt` persists the
+ * Only a successful, fully consumed, matching-identity `done` removes tracking. `retryAt` persists the
  * hint and resets infrastructure backoff; uncertain responses back off from one to thirty seconds.
  * Tasks with persisted hints survive reconstruction; unsaved uncertainty retries only in memory.
  * One alarm selects the earliest pending/60-second scheduled-attempt watchdog
- * deadline or independent 30-second heartbeat, launching all due IDs without a Bellows concurrency
+ * deadline or independent 30-second heartbeat, launching all due identities without a Bellows concurrency
  * cap, subject to platform limits. Stale responses cannot overwrite newer attempts.
  *
  * PostgreSQL claims remain authoritative; renewed leases can move hints later. Watchdog supersession
@@ -231,6 +223,8 @@ export class RetainedTaskDispatcher {
     { record: TaskRecord; controller: AbortController; promise: Promise<void> }
   >();
   private readonly memoryRetries = new Map<string, TaskRecord>();
+  // Bootstrap optimization only. Discovery and alarms never consult this set.
+  private readonly singletons = new Set<string>();
   private bookkeeping: Promise<unknown> = Promise.resolve();
 
   constructor(
@@ -304,9 +298,8 @@ export class RetainedTaskDispatcher {
         const record = object(value) as unknown as TaskRecord;
         const state = object(record.state);
         if (
-          key !== TASK_PREFIX + parseTaskId(record.taskId) ||
-          Object.keys(record).length !== 5 ||
-          !parseTaskName(record.taskName) ||
+          key !== TASK_PREFIX + trackingKey(dispatchIdentity(record.task)) ||
+          Object.keys(record).length !== 4 ||
           !timestamp(record.nextAttemptAtMs) ||
           !counter(record.infrastructureFailures) ||
           record.infrastructureFailures > 6 ||
@@ -320,7 +313,7 @@ export class RetainedTaskDispatcher {
         ) {
           throw new Error("invalid dispatcher task record");
         }
-        records.set(record.taskId, structuredClone(record));
+        records.set(trackingKey(record.task), structuredClone(record));
       }
       const result = change(metadata, records, now);
       let alarm = metadata.nextHeartbeatAtMs;
@@ -361,13 +354,13 @@ export class RetainedTaskDispatcher {
     record: TaskRecord,
     signal: AbortSignal,
   ): Promise<NextAction> {
-    const { taskName, taskId } = record;
+    const { task } = record;
     const response = await this.processor.fetch(PROCESSOR_PATH, {
       method: "POST",
       headers: {
         "content-type": "application/json",
       },
-      body: JSON.stringify({ taskId, taskName }),
+      body: JSON.stringify({ task }),
       signal,
     });
     const responseBody = await consumeResponse(response);
@@ -377,80 +370,100 @@ export class RetainedTaskDispatcher {
         `task processor returned HTTP ${response.status}: ${truncateText(responseBody)}`,
       );
     }
-    return nextAction(responseBody, taskId);
+    return nextAction(responseBody, task);
   }
 
   private launchProcessor(record: TaskRecord): void {
-    const { taskId } = record;
-    if (this.inFlight.has(taskId)) return;
-    this.memoryRetries.delete(taskId);
+    const key = trackingKey(record.task);
+    if (this.inFlight.has(key)) return;
+    this.memoryRetries.delete(key);
     const controller = new AbortController();
     const promise = this.runProcessor(record, controller.signal)
       .then(
         (action) => action,
         (error: unknown) => {
-          if (this.inFlight.get(taskId)?.record === record) {
-            console.error("task processor failed", taskId, errorMessage(error));
+          if (this.inFlight.get(key)?.record === record) {
+            console.error(
+              "task processor failed",
+              record.task.kind,
+              errorMessage(error),
+            );
           }
           return undefined;
         },
       )
       .then((action) =>
         this.serialize(async () => {
-          if (this.inFlight.get(taskId)?.record !== record) return;
+          if (this.inFlight.get(key)?.record !== record) return;
           // A targeted read, only after the response, distinguishes an unsaved task from
           // an explicit redispatch of a schedule retained by an earlier delegate.
           if (
             action?.type !== "retryAt" &&
-            (await this.storage.get(TASK_PREFIX + taskId)) === undefined
+            (await this.storage.get(TASK_PREFIX + key)) === undefined
           ) {
             if (action === undefined && record.state.type === "pending")
               this.retryInMemory(record);
+            if (action?.type === "done") this.forgetSingleton(record);
             return;
           }
-          await this.updateStorage((_metadata, records, now) => {
-            const current = records.get(taskId);
-            if (
-              record.state.type === "running" &&
-              (current?.state.type !== "running" ||
-                current.state.attemptId !== record.state.attemptId)
-            )
-              return;
-            if (action?.type === "done") {
-              records.delete(taskId);
-            } else if (action?.type === "retryAt") {
-              records.set(taskId, {
-                taskId,
-                taskName: record.taskName,
-                state: { type: "pending" },
-                nextAttemptAtMs: action.atMs,
-                infrastructureFailures: 0,
-              });
-            } else if (current) {
-              retry(current, now);
-            }
-          });
+          const applied = await this.updateStorage(
+            (_metadata, records, now) => {
+              const current = records.get(key);
+              if (
+                record.state.type === "running" &&
+                (current?.state.type !== "running" ||
+                  current.state.attemptId !== record.state.attemptId)
+              )
+                return false;
+              if (action?.type === "done") {
+                records.delete(key);
+              } else if (action?.type === "retryAt") {
+                records.set(key, {
+                  task: record.task,
+                  state: { type: "pending" },
+                  nextAttemptAtMs: action.atMs,
+                  infrastructureFailures: 0,
+                });
+              } else if (current) {
+                retry(current, now);
+              }
+              return true;
+            },
+          );
+          if (applied && action?.type === "done") this.forgetSingleton(record);
         }),
       )
       .catch((error: unknown) => {
-        console.error("task processor failed", taskId, errorMessage(error));
-        if (this.inFlight.get(taskId)?.record === record)
+        console.error(
+          "task processor failed",
+          record.task.kind,
+          errorMessage(error),
+        );
+        if (this.inFlight.get(key)?.record === record)
           this.retryInMemory(record);
       })
       .finally(() => {
-        if (this.inFlight.get(taskId)?.record === record)
-          this.inFlight.delete(taskId);
+        if (this.inFlight.get(key)?.record === record)
+          this.inFlight.delete(key);
       });
-    this.inFlight.set(taskId, { record, controller, promise });
+    this.inFlight.set(key, { record, controller, promise });
+    if (record.task.kind === "singleton")
+      this.singletons.add(record.task.taskName);
+  }
+
+  private forgetSingleton(record: TaskRecord): void {
+    if (record.task.kind === "singleton")
+      this.singletons.delete(record.task.taskName);
   }
 
   private retryInMemory(record: TaskRecord): void {
     const pending = structuredClone(record);
     retry(pending, Date.now());
-    this.memoryRetries.set(record.taskId, pending);
+    const key = trackingKey(record.task);
+    this.memoryRetries.set(key, pending);
     setTimeout(
       () => {
-        if (this.memoryRetries.get(record.taskId) === pending)
+        if (this.memoryRetries.get(key) === pending)
           this.launchProcessor(pending);
       },
       Math.max(0, pending.nextAttemptAtMs - Date.now()),
@@ -458,24 +471,23 @@ export class RetainedTaskDispatcher {
   }
 
   private async dispatch(request: Request): Promise<Response> {
-    const { taskId, taskName } = await parseDispatchRequest(request);
-
-    const duplicate = this.inFlight.has(taskId);
-    if (!duplicate) {
+    const tasks = await parseDispatchRequest(request);
+    const launched = new Set<string>();
+    for (const { task, intent } of tasks) {
+      if (intent === "ensure" && this.singletons.has(task.taskName)) continue;
+      const key = trackingKey(task);
+      if (launched.has(key)) continue;
       this.launchProcessor({
-        taskId,
-        taskName,
+        task,
         nextAttemptAtMs: Date.now(),
         infrastructureFailures:
-          this.memoryRetries.get(taskId)?.infrastructureFailures ?? 0,
+          this.memoryRetries.get(key)?.infrastructureFailures ?? 0,
         state: { type: "pending" },
       });
+      launched.add(key);
     }
-    await this.ensureHeartbeat();
-    if (duplicate) {
-      return jsonResponse({ duplicate: true, ok: true, taskId });
-    }
-    return jsonResponse({ ok: true, taskId });
+    if (tasks.length !== 0) await this.ensureHeartbeat();
+    return jsonResponse({ ok: true });
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -498,10 +510,10 @@ export class RetainedTaskDispatcher {
           if (metadata.nextHeartbeatAtMs <= now)
             metadata.nextHeartbeatAtMs = now + HEARTBEAT_INTERVAL_MS;
           const launches: TaskRecord[] = [];
-          const expired: { taskId: string; attemptId: number }[] = [];
+          const expired: { key: string; attemptId: number }[] = [];
           for (const record of records.values()) {
             if (record.nextAttemptAtMs > now) continue;
-            const active = this.inFlight.get(record.taskId)?.record;
+            const active = this.inFlight.get(trackingKey(record.task))?.record;
             if (active?.state.type === "pending") {
               // External dispatch has no durable attempt allocation. Keep its existing
               // schedule recoverable without racing its live invocation.
@@ -510,7 +522,7 @@ export class RetainedTaskDispatcher {
             }
             if (record.state.type === "running") {
               expired.push({
-                taskId: record.taskId,
+                key: trackingKey(record.task),
                 attemptId: record.state.attemptId,
               });
               retry(record, now);
@@ -521,13 +533,13 @@ export class RetainedTaskDispatcher {
           return { launches, expired };
         },
       );
-      for (const { taskId, attemptId } of expired) {
-        const active = this.inFlight.get(taskId);
+      for (const { key, attemptId } of expired) {
+        const active = this.inFlight.get(key);
         if (
           active?.record.state.type === "running" &&
           active.record.state.attemptId === attemptId
         ) {
-          this.inFlight.delete(taskId);
+          this.inFlight.delete(key);
           active.controller.abort();
         }
       }

@@ -1,4 +1,4 @@
-import { expect, test, vi } from "vitest";
+import { expect, expectTypeOf, test, vi } from "vitest";
 import { InMemoryBackend } from "../src/backends/in-memory.js";
 import {
   definePublishTask,
@@ -16,7 +16,7 @@ import {
   TaskUnavailableError,
   type WorkerFactory,
 } from "../src/index.js";
-import { WorkerRuntime } from "../src/runtime.js";
+import { type PublishDispatchToken, WorkerRuntime } from "../src/runtime.js";
 import { Gate } from "./helpers.js";
 
 const blockingTask = definePublishTask<void>("runtime_once_blocking");
@@ -197,11 +197,14 @@ test("singleton dispatch executes one backend-managed task", async () => {
   const task = defineSingletonTask("runtime_once_singleton");
   const process = vi.fn(async () => TaskSuccess.done(undefined));
   const factory = { task, build: vi.fn(() => ({ process })) };
-  // TypeScript accepts a published token but ignores it for singleton activation.
+  expectTypeOf<
+    Parameters<typeof runTaskOnce<typeof task>>[3]
+  >().toEqualTypeOf<undefined>();
+  expectTypeOf<
+    Parameters<typeof runTaskOnce<typeof blockingTask>>[3]
+  >().toEqualTypeOf<PublishDispatchToken>();
   assertImmediate(
-    await runTaskOnce(executionOnly(backend), factory, 17, {
-      type: "earliest-available",
-    }),
+    await runTaskOnce(executionOnly(backend), factory, 17, undefined),
   );
   expect(factory.build).toHaveBeenCalledExactlyOnceWith(17);
   const claimed = await backend.claimSingleton(task, 18, Date.now() + 60_000);

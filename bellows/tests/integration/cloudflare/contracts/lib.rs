@@ -10,6 +10,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
+use std::{cell::RefCell, rc::Rc};
 
 use bellows::cloudflare::{RetainedTaskDispatcher, dispatch_task, sdk::Dispatcher};
 use futures_util::stream;
@@ -66,48 +67,78 @@ pub async fn fetch(request: Request, env: Env, _ctx: Context) -> Result<Response
 
 #[durable_object]
 pub struct ContractDispatcher {
-    dispatcher: Dispatcher,
-    storage: Storage,
+    dispatcher: RefCell<Rc<Dispatcher>>,
+    state: State,
+    env: Env,
 }
 
 impl DurableObject for ContractDispatcher {
     fn new(state: State, env: Env) -> Self {
         Self {
-            dispatcher: RetainedTaskDispatcher::from_bindings(
+            dispatcher: RefCell::new(Rc::new(RetainedTaskDispatcher::from_bindings(
                 state.storage(),
                 env.service("PROCESSOR").unwrap(),
-            ),
-            storage: state.storage(),
+            ))),
+            state,
+            env,
         }
     }
 
     async fn fetch(&self, request: Request) -> Result<Response> {
+        let dispatcher = self.dispatcher.borrow().clone();
         match request.path().as_str() {
-            "/dispatcher/state" => Response::from_json(&json!({
-                "alarm": self.storage.get_alarm().await?,
-                "now": js_sys::Date::now()
-            })),
-            "/dispatcher/alarm" => match self.dispatcher.alarm_worker().await {
+            "/dispatcher/state" => {
+                let records = self
+                    .state
+                    .storage()
+                    .list_with_options(ListOptions::new().prefix("task:"))
+                    .await?;
+                let mut tasks = serde_json::Map::new();
+                for entry in records.entries() {
+                    let entry = js_sys::Array::from(&entry?);
+                    tasks.insert(
+                        entry.get(0).as_string().unwrap(),
+                        serde_json::from_str::<serde_json::Value>(
+                            &js_sys::JSON::stringify(&entry.get(1))?.as_string().unwrap(),
+                        )?,
+                    );
+                }
+                Response::from_json(&json!({
+                    "tasks": tasks,
+                    "alarm": self.state.storage().get_alarm().await?,
+                    "now": js_sys::Date::now()
+                }))
+            }
+            "/dispatcher/reconstruct" => {
+                *self.dispatcher.borrow_mut() = Rc::new(RetainedTaskDispatcher::from_bindings(
+                    self.state.storage(),
+                    self.env.service("PROCESSOR")?,
+                ));
+                Response::empty()
+            }
+            "/dispatcher/alarm" => match dispatcher.alarm_worker().await {
                 Ok(response) => Ok(response),
                 Err(error) => Response::error(error.to_string(), 400),
             },
             "/dispatcher/corrupt" => {
-                self.storage
+                self.state
+                    .storage()
                     .put_raw("scheduler", wasm_bindgen::JsValue::NULL)
                     .await?;
                 Response::empty()
             }
             "/dispatcher/clear" => {
-                self.storage.delete_all().await?;
-                self.storage.delete_alarm().await?;
+                self.state.storage().delete_all().await?;
+                self.state.storage().delete_alarm().await?;
                 Response::empty()
             }
-            _ => self.dispatcher.fetch_worker(request).await,
+            _ => dispatcher.fetch_worker(request).await,
         }
     }
 
     async fn alarm(&self) -> Result<Response> {
-        self.dispatcher.alarm_worker().await
+        let dispatcher = self.dispatcher.borrow().clone();
+        dispatcher.alarm_worker().await
     }
 }
 
@@ -116,6 +147,7 @@ pub struct BodySource {
     release: Arc<Semaphore>,
     fetched: AtomicUsize,
     drained: Arc<AtomicUsize>,
+    next_action: RefCell<serde_json::Value>,
 }
 
 impl DurableObject for BodySource {
@@ -124,11 +156,16 @@ impl DurableObject for BodySource {
             release: Arc::new(Semaphore::new(0)),
             fetched: AtomicUsize::new(0),
             drained: Arc::new(AtomicUsize::new(0)),
+            next_action: RefCell::new(json!({"type": "done"})),
         }
     }
 
     async fn fetch(&self, mut request: Request) -> Result<Response> {
         match request.path().as_str() {
+            "/source/action" => {
+                *self.next_action.borrow_mut() = request.json().await?;
+                Response::empty()
+            }
             "/source/state" => Response::from_json(&json!({
                 "fetched": self.fetched.load(Ordering::SeqCst),
                 "drained": self.drained.load(Ordering::SeqCst),
@@ -143,11 +180,30 @@ impl DurableObject for BodySource {
             }
             "/process" | "/dispatch" => {
                 let body: serde_json::Value = request.json().await?;
-                let error = body["taskId"] == "error";
+                let is_processor = request.path() == "/process";
+                if is_processor
+                    && serde_json::from_value::<bellows::cloudflare::TaskIdentity>(
+                        body["task"].clone(),
+                    )
+                    .is_err()
+                {
+                    return Response::error("invalid task identity", 400);
+                }
+                let error = if is_processor {
+                    &body["task"]["taskId"]
+                } else {
+                    let entries = dispatch_entries(&body)?;
+                    if entries.is_empty() {
+                        return Response::from_json(&json!({"ok": true}));
+                    }
+                    &body["tasks"][0]["task"]["taskId"]
+                } == "error";
                 let bytes = if request.path() == "/process" && !error {
-                    json!({ "taskId": body["taskId"], "nextAction": { "type": "done" } })
+                    json!({ "task": body["task"], "nextAction": *self.next_action.borrow() })
                         .to_string()
                         .into_bytes()
+                } else if !error {
+                    format!("{{\"ok\":true}}{}", " ".repeat(10_000)).into_bytes()
                 } else {
                     // Larger than the diagnostic excerpt, spanning its UTF-16 boundary.
                     format!("{}🦀{}", "a".repeat(499), "z".repeat(10_000)).into_bytes()
@@ -175,4 +231,14 @@ impl DurableObject for BodySource {
             _ => Response::error("not-found", 404),
         }
     }
+}
+
+fn dispatch_entries(body: &serde_json::Value) -> Result<Vec<bellows::cloudflare::DispatchTask>> {
+    if body
+        .as_object()
+        .is_none_or(|object| object.len() != 1 || !object.contains_key("tasks"))
+    {
+        return Err(Error::RustError("invalid dispatch batch".into()));
+    }
+    Ok(serde_json::from_value(body["tasks"].clone())?)
 }

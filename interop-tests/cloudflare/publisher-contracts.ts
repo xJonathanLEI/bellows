@@ -25,8 +25,14 @@ export function publisherContracts(
       const response = await consume("/publisher/state");
       expect(response.status, response.body).toBe(200);
       return JSON.parse(response.body) as {
-        dispatches: Array<{ taskId: string; taskName: string }>;
+        dispatches: Array<{
+          task:
+            | { kind: "published"; taskId: string; taskName: string }
+            | { kind: "singleton"; taskName: string };
+          intent: "run";
+        }>;
         drained: number;
+        requests: number;
       };
     };
     const control = async (path: string, body?: unknown) => {
@@ -68,8 +74,9 @@ export function publisherContracts(
 
     test("scheduled sweep fans out across pages and settles every streamed acknowledgement after a partial dispatch failure", async () => {
       await fixture.admin.query(
-        `INSERT INTO ${fixture.table} (task_name, payload_json)
-         SELECT CASE WHEN n % 2 = 0 THEN ' Unregistered 🦀 ' ELSE '未知' END, 'not JSON'
+        `INSERT INTO ${fixture.table} (task_name, payload_json, task_unique_key)
+         SELECT CASE WHEN n % 2 = 0 THEN ' Unregistered 🦀 ' || n::text ELSE '未知' END, 'not JSON',
+                CASE WHEN n % 2 = 0 THEN ' Unregistered 🦀 ' || n::text END
          FROM generate_series(1, 101) AS n`,
       );
       const before = await fixture.state();
@@ -87,12 +94,18 @@ export function publisherContracts(
         state,
         ({ dispatches }) => dispatches.length === 101,
       );
-      const expected = before.tasks.map(({ task_id, task_name }) => ({
-        taskId: task_id,
-        taskName: task_name,
-      }));
+      const expected = before.tasks.map(
+        ({ task_id, task_name, task_unique_key }) => ({
+          task:
+            task_unique_key === null
+              ? { kind: "published", taskId: task_id, taskName: task_name }
+              : { kind: "singleton", taskName: task_name },
+          intent: "run",
+        }),
+      );
       const dispatched = await state();
       expect(dispatched.drained).toBe(0);
+      expect(dispatched.requests).toBe(2);
       expect(dispatched.dispatches).toHaveLength(expected.length);
       expect(dispatched.dispatches).toEqual(expect.arrayContaining(expected));
       // The read-only backend closes while responses are still streaming.
@@ -108,7 +121,7 @@ export function publisherContracts(
       expect(ended).toBe(false);
       await control("/publisher/drain");
       await sweep;
-      expect(await state()).toMatchObject({ drained: 101 });
+      expect(await state()).toMatchObject({ drained: 2 });
       expect(await fixture.state()).toEqual(before);
       expect(await sequence()).toEqual([
         { last_value: "101", is_called: true },
@@ -118,7 +131,8 @@ export function publisherContracts(
       await control("/publisher/response", { status: 200 });
       await fixture.runScheduled();
       const recovered = await state();
-      expect(recovered.drained).toBe(202);
+      expect(recovered.drained).toBe(4);
+      expect(recovered.requests).toBe(4);
       expect(recovered.dispatches).toHaveLength(202);
       expect(recovered.dispatches.slice(0, 101)).toEqual(dispatched.dispatches);
       expect(recovered.dispatches.slice(101)).toEqual(
@@ -153,7 +167,11 @@ export function publisherContracts(
             (await fixture.activeRequestClients()).map(({ pid }) => pid),
           ).toEqual(pids);
           expect(await fixture.state()).toEqual({ tasks: [], processed: [] });
-          expect(await state()).toEqual({ dispatches: [], drained: 0 });
+          expect(await state()).toEqual({
+            dispatches: [],
+            drained: 0,
+            requests: 0,
+          });
           expect(ended).toBe(false);
 
           await gate.release();
@@ -163,10 +181,18 @@ export function publisherContracts(
             (value) => value.dispatches.length === 1,
           );
           const receipt = { taskId: "1" };
-          const dispatch = { ...receipt, taskName: "publisher_contract" };
+          const dispatch = {
+            task: {
+              kind: "published",
+              ...receipt,
+              taskName: "publisher_contract",
+            },
+            intent: "run",
+          };
           expect(await state()).toEqual({
             dispatches: [dispatch],
             drained: 0,
+            requests: 1,
           });
           if (future)
             expect(Date.now()).toBeLessThan(availableFromMs as number);
@@ -205,7 +231,11 @@ export function publisherContracts(
                 },
           );
           expect(result.body).not.toContain("fixture-secret");
-          expect(await state()).toEqual({ dispatches: [dispatch], drained: 1 });
+          expect(await state()).toEqual({
+            dispatches: [dispatch],
+            drained: 1,
+            requests: 1,
+          });
           expect(await fixture.state()).toEqual(committed);
 
           if (status === 503) {
@@ -227,6 +257,7 @@ export function publisherContracts(
             expect(await state()).toEqual({
               dispatches: [dispatch, dispatch],
               drained: 1,
+              requests: 2,
             });
             expect(await fixture.activeRequestClients()).toHaveLength(0);
             expect(ended).toBe(false);
@@ -237,6 +268,7 @@ export function publisherContracts(
             expect(await state()).toEqual({
               dispatches: [dispatch, dispatch],
               drained: 2,
+              requests: 2,
             });
           }
           expect(await fixture.state()).toEqual(committed);

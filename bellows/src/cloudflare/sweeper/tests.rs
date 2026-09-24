@@ -39,7 +39,8 @@ impl fmt::Display for Cause {
 impl Error for Cause {}
 
 struct Backend {
-    pages: Mutex<VecDeque<Vec<(i64, String)>>>,
+    pages: Mutex<VecDeque<Vec<(i64, String, bool)>>>,
+    singletons: Vec<String>,
     cursors: Mutex<Vec<Option<i64>>>,
     events: Mutex<Vec<&'static str>>,
     requests: Mutex<Vec<Value>>,
@@ -54,6 +55,7 @@ impl Default for Backend {
     fn default() -> Self {
         Self {
             pages: Mutex::new(VecDeque::from([vec![row(1)], vec![]])),
+            singletons: vec![],
             cursors: Mutex::default(),
             events: Mutex::default(),
             requests: Mutex::default(),
@@ -66,8 +68,16 @@ impl Default for Backend {
     }
 }
 
-fn row(id: i64) -> (i64, String) {
-    (id, NAME.into())
+fn row(id: i64) -> (i64, String, bool) {
+    (id, NAME.into(), false)
+}
+
+fn context(id: i64, name: &str, is_singleton: bool) -> PostgresSweepCandidate {
+    PostgresSweepCandidate::Discovered {
+        task_id: id.to_string(),
+        task_name: name.into(),
+        is_singleton,
+    }
 }
 
 impl Backend {
@@ -114,7 +124,7 @@ impl ProcessorFetcher for Stub {
         assert_eq!(request.method(), "POST");
         assert_eq!(request.headers()["content-type"], "application/json");
         let body = serde_json::from_str::<Value>(request.body())?;
-        let first = body["taskId"] == "1";
+        let first = body["tasks"][0]["task"]["taskId"] == "1";
         self.0.requests.lock().unwrap().push(body);
         if first {
             self.0.fail(Fault::Transport)?;
@@ -127,7 +137,11 @@ impl ProcessorFetcher for Stub {
                 state.fail(Fault::Body)?;
             }
             state.event("body-end");
-            Ok(format!("{SECRET}{}tail", "x".repeat(5000)))
+            Ok(if first && state.fault == Some(Fault::Status) {
+                format!("{SECRET}{}tail", "x".repeat(5000))
+            } else {
+                format!("{{\"ok\":true}}{}\n", " ".repeat(5000))
+            })
         });
         Ok(Response::builder()
             .status(if first && self.0.fault == Some(Fault::Status) {
@@ -160,6 +174,7 @@ impl Sweeper for Harness {
                 "sweep_schema".into(),
                 backend.clone(),
             ),
+            singletons: backend.singletons.clone(),
             dispatcher: Namespace(backend),
         })
     }
@@ -183,7 +198,7 @@ impl Sweeper for Harness {
         backend: &Arc<Backend>,
         window: &Self::Window,
         cursor: Option<i64>,
-    ) -> Result<Vec<(i64, String)>, BoxDispatchError> {
+    ) -> Result<Vec<(i64, String, bool)>, BoxDispatchError> {
         assert_eq!(*window, (1234, i64::MAX));
         backend.cursors.lock().unwrap().push(cursor);
         if cursor.is_some() {
@@ -223,6 +238,7 @@ async fn assert_pending<F: Future>(mut future: Pin<&mut F>) {
 fn report(discovered: u64, accepted: u64, failed: u64) -> PostgresSweepReport {
     PostgresSweepReport {
         discovered,
+        bootstrap_candidates: 0,
         accepted,
         failed,
     }
@@ -234,7 +250,10 @@ fn check_error(
 ) {
     assert_eq!(error.stage, stage);
     assert_eq!(error.report, report);
-    assert_eq!(report.discovered, report.accepted + report.failed);
+    assert_eq!(
+        report.discovered + report.bootstrap_candidates,
+        report.accepted + report.failed
+    );
     assert_eq!(
         error.to_string(),
         format!("PostgreSQL sweeper failed at {stage}")
@@ -258,7 +277,9 @@ async fn inert_construction_exact_dispatch_and_empty_sweeps() {
     assert_eq!(sweep(&sweeper).await.unwrap(), report(1, 1, 0));
     assert_eq!(
         *state.requests.lock().unwrap(),
-        [json!({"taskId": "1", "taskName": NAME})]
+        [
+            json!({"tasks": [{"task": {"kind": "published", "taskId": "1", "taskName": NAME}, "intent": "run"}]})
+        ]
     );
     assert_eq!(*state.cursors.lock().unwrap(), [None, Some(1)]);
     for event in [
@@ -277,8 +298,9 @@ async fn inert_construction_exact_dispatch_and_empty_sweeps() {
 }
 
 #[tokio::test]
-async fn three_hundred_dispatches_launch_during_queries_and_settle_during_close() {
+async fn three_page_batches_launch_during_queries_and_settle_during_close() {
     let state = Arc::new(Backend {
+        singletons: vec![format!("{NAME}2"), "bootstrap".into()],
         pages: Mutex::new(
             (0..3)
                 .map(|page| {
@@ -287,10 +309,11 @@ async fn three_hundred_dispatches_launch_during_queries_and_settle_during_close(
                             (
                                 page * 100 + id,
                                 if id % 2 == 0 {
-                                    NAME.into()
+                                    format!("{NAME}{}", page * 100 + id)
                                 } else {
                                     "other unregistered".into()
                                 },
+                                id % 2 == 0,
                             )
                         })
                         .collect()
@@ -308,14 +331,14 @@ async fn three_hundred_dispatches_launch_during_queries_and_settle_during_close(
     for _ in 0..20 {
         assert_pending(call.as_mut()).await;
     }
-    assert_eq!(state.count("body-start"), 100);
+    assert_eq!(state.count("body-start"), 1);
     assert_eq!(*state.cursors.lock().unwrap(), [None, Some(100)]);
     assert_eq!(state.count("body-end"), 0);
     state.page_gate.as_ref().unwrap().add_permits(3);
     for _ in 0..40 {
         assert_pending(call.as_mut()).await;
     }
-    assert_eq!(state.count("body-start"), 300);
+    assert_eq!(state.count("body-start"), 4);
     assert_eq!(state.count("close"), 1);
     assert_eq!(
         *state.cursors.lock().unwrap(),
@@ -326,17 +349,30 @@ async fn three_hundred_dispatches_launch_during_queries_and_settle_during_close(
         .lock()
         .unwrap()
         .iter()
-        .map(|value| value["taskId"].as_str().unwrap().to_owned())
+        .flat_map(|value| value["tasks"].as_array().unwrap())
+        .map(|value| value["task"].to_string())
         .collect();
-    assert_eq!(ids.len(), 300);
-    state.body_gate.as_ref().unwrap().add_permits(300);
+    assert_eq!(ids.len(), 301);
+    assert_eq!(
+        state.requests.lock().unwrap()[3],
+        json!({
+            "tasks": [{"task": {"kind": "singleton", "taskName": "bootstrap"}, "intent": "ensure"}]
+        })
+    );
+    state.body_gate.as_ref().unwrap().add_permits(4);
     for _ in 0..40 {
         assert_pending(call.as_mut()).await;
     }
-    assert_eq!(state.count("body-end"), 300);
+    assert_eq!(state.count("body-end"), 4);
     assert_eq!(state.count("closed"), 0);
     state.close_gate.as_ref().unwrap().add_permits(1);
-    assert_eq!(call.await.unwrap(), report(300, 300, 0));
+    assert_eq!(
+        call.await.unwrap(),
+        PostgresSweepReport {
+            bootstrap_candidates: 1,
+            ..report(300, 301, 0)
+        }
+    );
 }
 
 #[tokio::test]
@@ -359,20 +395,16 @@ async fn unsupported_ids_preserve_identity_and_cursor_and_do_not_starve_later_pa
         });
         let error = sweep(&harness(vec![state.clone()])).await.unwrap_err();
         check_error(&error, PostgresSweeperStage::Candidate, report(2, 1, 1));
-        assert_eq!(
-            error.candidate,
-            Some(PostgresSweepCandidate {
-                task_id: id.to_string(),
-                task_name: NAME.into()
-            })
-        );
+        assert_eq!(error.candidates, vec![context(id, NAME, false)]);
         assert_eq!(
             *state.cursors.lock().unwrap(),
             [None, Some(id), Some(9_007_199_254_740_991)]
         );
         assert_eq!(
             *state.requests.lock().unwrap(),
-            [json!({"taskId": "9007199254740991", "taskName": NAME})]
+            [
+                json!({"tasks": [{"task": {"kind": "published", "taskId": "9007199254740991", "taskName": NAME}, "intent": "run"}]})
+            ]
         );
     }
 }
@@ -381,20 +413,20 @@ async fn unsupported_ids_preserve_identity_and_cursor_and_do_not_starve_later_pa
 async fn empty_names_fail_but_other_names_are_exact() {
     let state = Arc::new(Backend {
         pages: Mutex::new(VecDeque::from([
-            vec![(1, "".into()), (2, " ".into()), row(3)],
+            vec![(1, "".into(), false), (2, " ".into(), false), row(3)],
             vec![],
         ])),
         ..Backend::default()
     });
     let error = sweep(&harness(vec![state.clone()])).await.unwrap_err();
     check_error(&error, PostgresSweeperStage::Candidate, report(3, 2, 1));
-    assert_eq!(error.candidate.unwrap().task_name, "");
+    assert_eq!(error.candidates, vec![context(1, "", false)]);
     assert_eq!(
         *state.requests.lock().unwrap(),
-        [
-            json!({"taskId": "2", "taskName": " "}),
-            json!({"taskId": "3", "taskName": NAME})
-        ]
+        [json!({"tasks": [
+            {"task": {"kind": "published", "taskId": "2", "taskName": " "}, "intent": "run"},
+            {"task": {"kind": "published", "taskId": "3", "taskName": NAME}, "intent": "run"}
+        ]})]
     );
 }
 
@@ -409,8 +441,11 @@ async fn dispatch_failures_continue_and_consume_bodies_without_retrying() {
             ..Backend::default()
         });
         let error = sweep(&harness(vec![state.clone()])).await.unwrap_err();
-        check_error(&error, PostgresSweeperStage::Dispatch, report(3, 2, 1));
-        assert_eq!(error.candidate.unwrap().task_id, "1");
+        check_error(&error, PostgresSweeperStage::Dispatch, report(3, 1, 2));
+        assert_eq!(
+            error.candidates,
+            vec![context(1, NAME, false), context(2, NAME, false)]
+        );
         if fault != Fault::Status {
             assert_eq!(error.cause.downcast_ref::<Cause>().unwrap().0, fault);
         }
@@ -423,10 +458,10 @@ async fn dispatch_failures_continue_and_consume_bodies_without_retrying() {
                 .0,
             Fault::Close
         );
-        assert_eq!(state.count("lookup"), 3);
+        assert_eq!(state.count("lookup"), 2);
         assert_eq!(
             state.count("body-end"),
-            if fault == Fault::Status { 3 } else { 2 }
+            if fault == Fault::Status { 2 } else { 1 }
         );
         assert_eq!(state.count("close"), 1);
         assert_eq!(state.cursors.lock().unwrap().len(), 3);
@@ -468,16 +503,14 @@ async fn discovery_failure_closes_before_slow_dispatch_and_waits_for_every_body(
     let mut call = pin!(sweep(&sweeper));
     assert_pending(call.as_mut()).await;
     assert_eq!(state.count("close"), 1);
-    assert_eq!(state.count("body-start"), 2);
-    state.body_gate.as_ref().unwrap().add_permits(1);
-    assert_pending(call.as_mut()).await;
+    assert_eq!(state.count("body-start"), 1);
     state.body_gate.as_ref().unwrap().add_permits(1);
     let error = call.await.unwrap_err();
     check_error(&error, PostgresSweeperStage::Discovery, report(2, 2, 0));
     assert_eq!(error.cause.downcast_ref::<Cause>().unwrap().0, Fault::Page);
-    assert!(error.candidate.is_none());
+    assert!(error.candidates.is_empty());
     assert!(error.backend_close_error.is_some());
-    assert_eq!(state.count("lookup"), 2);
+    assert_eq!(state.count("lookup"), 1);
 }
 
 #[tokio::test]
@@ -518,34 +551,257 @@ async fn close_failure_observed_before_dispatch_failure_stays_primary() {
     let error = call.await.unwrap_err();
     check_error(&error, PostgresSweeperStage::BackendClose, report(1, 0, 1));
     assert!(error.backend_close_error.is_none());
-    assert!(error.candidate.is_none());
+    assert!(error.candidates.is_empty());
 }
 
 #[tokio::test]
 async fn independent_overlapping_scopes() {
     let first = Arc::new(Backend {
         pages: Mutex::new(VecDeque::from([vec![row(0)]])),
+        singletons: vec!["first".into()],
         close_gate: Some(Arc::new(Semaphore::new(0))),
         ..Backend::default()
     });
     let second = Arc::new(Backend {
         pages: Mutex::new(VecDeque::from([vec![row(3)]])),
+        singletons: vec!["second".into()],
         ..Backend::default()
     });
     let sweeper = harness(vec![first.clone(), second.clone()]);
     let mut call = pin!(sweep(&sweeper));
     assert_pending(call.as_mut()).await;
-    assert_eq!(sweep(&sweeper).await.unwrap(), report(1, 1, 0));
+    assert_eq!(
+        sweep(&sweeper).await.unwrap(),
+        PostgresSweepReport {
+            bootstrap_candidates: 1,
+            ..report(1, 2, 0)
+        }
+    );
     assert_pending(call.as_mut()).await;
     first.close_gate.as_ref().unwrap().add_permits(1);
     check_error(
         &call.await.unwrap_err(),
         PostgresSweeperStage::Candidate,
-        report(1, 0, 1),
+        PostgresSweepReport {
+            bootstrap_candidates: 1,
+            ..report(1, 1, 1)
+        },
     );
     assert_eq!(*second.cursors.lock().unwrap(), [None, Some(3)]);
     assert_eq!(first.count("configure"), 1);
     assert_eq!(second.count("configure"), 1);
+    assert_eq!(
+        first.requests.lock().unwrap()[0]["tasks"][0]["task"]["taskName"],
+        "first"
+    );
+    assert_eq!(
+        second.requests.lock().unwrap()[1]["tasks"][0]["task"]["taskName"],
+        "second"
+    );
+}
+
+struct Singleton;
+impl TaskDefinition for Singleton {
+    const NAME: &str = NAME;
+    type Trigger = SingletonTrigger;
+    type Callback = ();
+}
+struct OtherSingleton;
+impl TaskDefinition for OtherSingleton {
+    const NAME: &str = " count ";
+    type Trigger = SingletonTrigger;
+    type Callback = Vec<u32>;
+}
+
+#[tokio::test]
+async fn empty_discovery_bootstraps_typed_heterogeneous_definitions() {
+    let definitions = [
+        PostgresSweeperSingleton::new::<Singleton>(),
+        PostgresSweeperSingleton::new::<OtherSingleton>(),
+    ];
+    let state = Arc::new(Backend {
+        pages: Mutex::default(),
+        singletons: definitions
+            .iter()
+            .map(|task| task.name().to_owned())
+            .collect(),
+        ..Backend::default()
+    });
+    assert_eq!(
+        sweep(&harness(vec![state.clone()])).await.unwrap(),
+        PostgresSweepReport {
+            bootstrap_candidates: 2,
+            ..report(0, 2, 0)
+        }
+    );
+    assert_eq!(
+        *state.requests.lock().unwrap(),
+        [json!({"tasks": [
+            {"task": {"kind": "singleton", "taskName": NAME}, "intent": "ensure"},
+            {"task": {"kind": "singleton", "taskName": " count "}, "intent": "ensure"}
+        ]})]
+    );
+    assert_eq!(state.count("closed"), 1);
+}
+
+#[tokio::test]
+async fn invalid_bootstrap_configuration_rejects_before_acquisition() {
+    for singletons in [
+        vec!["".into()],
+        vec!["雪".repeat(679)],
+        vec![NAME.into(), NAME.into()],
+    ] {
+        let state = Arc::new(Backend {
+            singletons,
+            ..Backend::default()
+        });
+        let error = sweep(&harness(vec![state.clone()])).await.unwrap_err();
+        check_error(&error, PostgresSweeperStage::Configuration, report(0, 0, 0));
+        assert_eq!(state.count("acquire"), 0);
+        assert_eq!(state.count("lookup"), 0);
+    }
+    let state = Arc::new(Backend {
+        singletons: vec![format!("{}ab", "雪".repeat(677))],
+        pages: Mutex::default(),
+        ..Backend::default()
+    });
+    assert_eq!(
+        sweep(&harness(vec![state])).await.unwrap(),
+        PostgresSweepReport {
+            bootstrap_candidates: 1,
+            ..report(0, 1, 0)
+        }
+    );
+}
+
+#[tokio::test]
+async fn discovery_failures_skip_bootstrap() {
+    for fault in [Fault::Window, Fault::Page] {
+        let state = Arc::new(Backend {
+            singletons: vec!["bootstrap".into()],
+            fault: Some(fault),
+            ..Backend::default()
+        });
+        let error = sweep(&harness(vec![state.clone()])).await.unwrap_err();
+        let count = u64::from(fault == Fault::Page);
+        check_error(
+            &error,
+            PostgresSweeperStage::Discovery,
+            report(count, count, 0),
+        );
+        assert_eq!(state.count("closed"), 1);
+        assert_eq!(state.count("lookup"), count as usize);
+    }
+}
+
+#[tokio::test]
+async fn failed_recovery_does_not_bootstrap_submitted_singletons_again() {
+    let state = Arc::new(Backend {
+        pages: Mutex::new(VecDeque::from([
+            vec![row(1), (i64::MAX, NAME.into(), true)],
+            vec![(9_007_199_254_740_993, "unconfigured".into(), true)],
+            vec![],
+        ])),
+        singletons: vec![NAME.into(), "bootstrap".into()],
+        fault: Some(Fault::Body),
+        body_gate: Some(Arc::new(Semaphore::new(0))),
+        ..Backend::default()
+    });
+    let sweeper = harness(vec![state.clone()]);
+    let mut call = pin!(sweep(&sweeper));
+    assert_pending(call.as_mut()).await;
+    assert_eq!(state.count("close"), 1);
+    assert_eq!(state.requests.lock().unwrap().len(), 3);
+    state.body_gate.as_ref().unwrap().add_permits(3);
+    let error = call.await.unwrap_err();
+    check_error(
+        &error,
+        PostgresSweeperStage::Dispatch,
+        PostgresSweepReport {
+            bootstrap_candidates: 1,
+            ..report(3, 2, 2)
+        },
+    );
+    assert_eq!(
+        error.candidates,
+        [context(1, NAME, false), context(i64::MAX, NAME, true)]
+    );
+    assert_eq!(
+        *state.requests.lock().unwrap(),
+        [
+            json!({"tasks": [
+                {"task": {"kind": "published", "taskId": "1", "taskName": NAME}, "intent": "run"},
+                {"task": {"kind": "singleton", "taskName": NAME}, "intent": "run"}
+            ]}),
+            json!({"tasks": [{"task": {"kind": "singleton", "taskName": "unconfigured"}, "intent": "run"}]}),
+            json!({"tasks": [{"task": {"kind": "singleton", "taskName": "bootstrap"}, "intent": "ensure"}]})
+        ]
+    );
+    assert_eq!(
+        *state.cursors.lock().unwrap(),
+        [None, Some(i64::MAX), Some(9_007_199_254_740_993)]
+    );
+}
+
+#[tokio::test]
+async fn invalid_singleton_candidates_do_not_poison_page_or_bootstrap() {
+    let state = Arc::new(Backend {
+        pages: Mutex::new(VecDeque::from([vec![
+            (i64::MAX, "雪".repeat(679), true),
+            (i64::MIN, NAME.into(), true),
+            row(9_007_199_254_740_992),
+        ]])),
+        singletons: vec!["bootstrap".into()],
+        ..Backend::default()
+    });
+    let error = sweep(&harness(vec![state.clone()])).await.unwrap_err();
+    check_error(
+        &error,
+        PostgresSweeperStage::Candidate,
+        PostgresSweepReport {
+            bootstrap_candidates: 1,
+            ..report(3, 2, 2)
+        },
+    );
+    assert_eq!(
+        error.candidates,
+        [context(i64::MAX, &"雪".repeat(679), true)]
+    );
+    assert_eq!(
+        state.requests.lock().unwrap()[0],
+        json!({
+            "tasks": [{"task": {"kind": "singleton", "taskName": NAME}, "intent": "run"}]
+        })
+    );
+}
+
+#[tokio::test]
+async fn bootstrap_failure_context_is_bounded_name_only_and_counts_every_entry() {
+    let state = Arc::new(Backend {
+        pages: Mutex::default(),
+        singletons: (0..150).map(|i| format!("task{i}")).collect(),
+        fault: Some(Fault::Lookup),
+        ..Backend::default()
+    });
+    let error = sweep(&harness(vec![state.clone()])).await.unwrap_err();
+    check_error(
+        &error,
+        PostgresSweeperStage::Dispatch,
+        PostgresSweepReport {
+            bootstrap_candidates: 150,
+            ..report(0, 0, 150)
+        },
+    );
+    assert_eq!(
+        error.candidates,
+        (0..100)
+            .map(|i| PostgresSweepCandidate::Bootstrap {
+                task_name: format!("task{i}")
+            })
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(state.count("lookup"), 1);
+    assert_eq!(state.count("closed"), 1);
 }
 
 struct NoLogs;

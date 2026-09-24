@@ -79,6 +79,16 @@ export interface PostgresBackendOptions {
   readonly schema?: string;
 }
 
+/** The claim may have committed; retain the exact ID without renewing or finalizing a rounded ID. */
+export class PostgresSingletonTaskIdError extends Error {
+  constructor(readonly taskId: string) {
+    super(
+      "PostgreSQL singleton claim returned an ID not representable as a safe integer.",
+    );
+    this.name = "PostgresSingletonTaskIdError";
+  }
+}
+
 /** Fixed database-time/ID bounds, not a repeatable-read snapshot. All BIGINTs stay exact. */
 export interface PostgresSweepWindow {
   readonly cutoffUnixMs: string;
@@ -89,6 +99,7 @@ export interface PostgresSweepWindow {
 export interface PostgresDiscoveryCandidate {
   readonly taskId: string;
   readonly taskName: string;
+  readonly isSingleton: boolean;
 }
 
 export class PostgresDiscoveryOperations {
@@ -108,7 +119,7 @@ export class PostgresDiscoveryOperations {
     }>(`
       SELECT FLOOR(EXTRACT(EPOCH FROM statement_timestamp()) * 1000)::bigint::text AS cutoff_unix_ms,
              MAX(task_id)::text AS upper_id
-      FROM ${this.tableName} WHERE task_unique_key IS NULL
+      FROM ${this.tableName}
     `);
     const row = result.rows[0];
     if (!row) throw new Error("PostgreSQL discovery returned no sweep window.");
@@ -122,10 +133,10 @@ export class PostgresDiscoveryOperations {
     const result = await this.pool.query<{
       task_id: string;
       task_name: string;
+      is_singleton: boolean;
     }>(
-      `SELECT task_id::text, task_name FROM ${this.tableName}
-       WHERE task_unique_key IS NULL
-         AND (available_from_unix_ms IS NULL OR available_from_unix_ms <= $1::bigint)
+      `SELECT task_id::text, task_name, task_unique_key IS NOT NULL AS is_singleton FROM ${this.tableName}
+       WHERE (available_from_unix_ms IS NULL OR available_from_unix_ms <= $1::bigint)
          AND task_id <= $2::bigint
          AND ($3::bigint IS NULL OR task_id > $3::bigint)
        ORDER BY ${this.tableName}.task_id LIMIT $4`,
@@ -134,6 +145,7 @@ export class PostgresDiscoveryOperations {
     return result.rows.map((row) => ({
       taskId: row.task_id,
       taskName: row.task_name,
+      isSingleton: row.is_singleton,
     }));
   }
 }
@@ -455,8 +467,17 @@ WHERE task_name = $1
       );
     }
 
+    const rawTaskId = claimedResult.rows[0].task_id;
+    const taskId = Number(rawTaskId);
+    if (
+      !Number.isSafeInteger(taskId) ||
+      taskId <= 0 ||
+      String(taskId) !== rawTaskId
+    ) {
+      throw new PostgresSingletonTaskIdError(rawTaskId);
+    }
     return {
-      taskId: Number(claimedResult.rows[0].task_id),
+      taskId,
       taskPayload: undefined,
       leaseExpirationMs,
     };

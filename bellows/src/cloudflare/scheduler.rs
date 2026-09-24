@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use super::{BoxDispatchError, validate_task_id, validate_task_name};
+use super::{BoxDispatchError, TaskIdentity};
 
 pub(super) const HEARTBEAT_INTERVAL_MS: i64 = 30_000;
 pub(super) const ATTEMPT_WATCHDOG_MS: i64 = 60_000;
@@ -32,8 +32,7 @@ pub enum TaskSchedule {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DispatcherTask {
-    pub task_id: String,
-    pub task_name: String,
+    pub task: TaskIdentity,
     pub next_attempt_at_ms: i64,
     pub infrastructure_failures: u32,
     pub state: TaskSchedule,
@@ -44,6 +43,7 @@ pub struct DispatcherTask {
 #[derive(Clone, Debug, Default)]
 pub struct DispatcherState {
     pub metadata: Option<SchedulerMetadata>,
+    /// Keyed by `TaskIdentity::tracking_key()`, excluding the storage prefix.
     pub tasks: BTreeMap<String, DispatcherTask>,
     /// Current platform alarm, used only when initializing scheduler metadata.
     pub alarm: Option<i64>,
@@ -70,9 +70,8 @@ impl DispatcherState {
             return Err("invalid dispatcher metadata".into());
         }
         for (id, task) in &self.tasks {
-            validate_task_id(id)?;
-            validate_task_name(&task.task_name)?;
-            if id != &task.task_id
+            task.task.validate_dispatch()?;
+            if id != &task.task.tracking_key()
                 || !timestamp(task.next_attempt_at_ms)
                 || task.infrastructure_failures > 6
                 || matches!(task.state, TaskSchedule::Running { attempt_id } if attempt_id >= metadata.next_attempt_id)
@@ -140,7 +139,7 @@ pub trait DispatcherStorage: Send + Sync + 'static {
     fn set_alarm(&self, at_ms: i64) -> impl Future<Output = Result<(), BoxDispatchError>> + Send;
     fn contains_task(
         &self,
-        id: &str,
+        key: &str,
     ) -> impl Future<Output = Result<bool, BoxDispatchError>> + Send;
 
     fn transaction<T>(

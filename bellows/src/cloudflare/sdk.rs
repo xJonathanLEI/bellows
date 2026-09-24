@@ -16,7 +16,8 @@
 //! configuration callback maps request bindings to [`PostgresProcessorConfig`] with typed
 //! [`PostgresProcessorTask`] registrations, after validation. Construction performs no I/O; the delegate
 //! owns a fresh listener-free execution backend for each selected attempt. Names come from each
-//! definition and must be unique; claims check both the dispatched ID and persisted definition name.
+//! definition and must be globally unique. Published claims check ID and persisted name; singleton
+//! claims create or reuse a backend-managed row by exact name, without a dispatched row ID.
 //!
 //! Register owned application cleanup with [`PostgresProcessorConfig::with_cleanup`], retaining
 //! business-connection ownership outside the spawned worker to survive lease-loss aborts. Cleanup
@@ -31,21 +32,13 @@
 //! [`super::dispatch_task`] supports caller-managed publication. The publisher's `publish_future`
 //! records availability and immediately dispatches the ID/name for processor-driven scheduling.
 //! It adds no awaitable publication, callback delivery, or application cleanup hooks.
-//! The named object `global` launches external dispatches in memory, then checks the warming alarm.
-//! It sets the alarm only when missing or later than now plus thirty seconds, without task writes.
-//! Active same-ID requests stay deduplicated through full body consumption and result persistence.
-//! Only a matching `done` removes tracking; `retryAt` persists an absolute hint. Uncertain responses
-//! back off from one to thirty seconds. One alarm selects the earliest pending/watchdog deadline or
-//! independent 30-second heartbeat, launching every due ID without a Bellows concurrency limit.
-//! The 60-second watchdog supersedes interrupted/hung transport and ignores stale results, without
-//! guaranteeing business cancellation. PostgreSQL controls execution eligibility; another invocation
-//! may observe an extended lease. Alarm and transport redelivery do not imply exactly-once work.
-//! Durability starts when `retryAt` is persisted; earlier uncertainty retries only in memory.
-//! The watchdog applies to scheduled attempts. [`PostgresSweeper`] adds read-only rediscovery through
-//! the same dispatcher, with no task registry. Its selected schema must belong entirely to that
-//! workload. Applications own scheduled entrypoint wiring and Cron Trigger installation. Publication and dispatch
-//! are not atomic; cancellation, termination, and wasm traps have no
-//! async-finally guarantee. Initialize schemas administratively, not during requests.
+//! [`super::dispatch_tasks`] submits identity/intent batches to the named object `global`.
+//! See [`super::RetainedTaskDispatcher`] for acceptance, scheduling, and bootstrap suppression.
+//! [`PostgresSweeper`] recovers both task kinds and optionally bootstraps configured singleton
+//! definitions; its selected schema must belong entirely to the target workload. Applications own
+//! scheduled entrypoint wiring and Cron Trigger installation. Publication and dispatch are not atomic;
+//! cancellation, termination, and wasm traps have no async-finally guarantee.
+//! Initialize schemas administratively, not during requests.
 
 use http::{Request, Response};
 use worker::send::{SendFuture, SendWrapper};
@@ -65,7 +58,7 @@ pub use postgres_publisher::{
 };
 pub use postgres_sweeper::{
     PostgresSweepCandidate, PostgresSweepReport, PostgresSweeper, PostgresSweeperConfig,
-    PostgresSweeperError, PostgresSweeperStage,
+    PostgresSweeperError, PostgresSweeperSingleton, PostgresSweeperStage,
 };
 
 /// A Workers service binding adapted to [`ProcessorFetcher`].
@@ -220,12 +213,12 @@ impl DispatcherStorage for Storage {
                             worker::Error::RustError("invalid dispatcher storage key".into())
                         })?;
                         let task: DispatcherTask = stored_value(&entry.get(1))?;
-                        if key != format!("task:{}", task.task_id) {
+                        if key != format!("task:{}", task.task.tracking_key()) {
                             return Err(worker::Error::RustError(
                                 "invalid dispatcher storage key".into(),
                             ));
                         }
-                        state.tasks.insert(task.task_id.clone(), task);
+                        state.tasks.insert(task.task.tracking_key(), task);
                     }
                     let previous = state.tasks.clone();
                     let value = update(&mut state)

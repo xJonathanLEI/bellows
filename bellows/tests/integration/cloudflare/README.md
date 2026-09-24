@@ -4,7 +4,7 @@ These Rust/Wasm projects implement **producer Worker -> `global` Durable Object 
 
 This directory owns a private Node/Vitest/Wrangler harness for Rust -> Rust topology scenarios and Rust workerd contracts. It runs actual Rust/Wasm Workers without importing or building the TypeScript library. The [TypeScript suite](../../../../bellows-ts/test/integration/cloudflare/README.md) owns its topology and direct contracts; the [mixed suite](../../../../interop-tests/cloudflare/README.md) runs both mixed directions. Direct contracts register only in their language-owned suites.
 
-The topology scenarios cover high-level future publication, renewed lease hints, scheduled/immediate failure, successful self-rescheduling, transient failure repair, lost completion responses, and simultaneous alarm-driven execution across definitions. They retain early acceptance, ownership/redelivery, validation/cleanup, insert failure without republishing, and exact-ID boundaries (`9007199254740991`, `9007199254740992`, `9007199254740993`, `9223372036854775807`). SQL timestamps prove no early execution; gates prove that every simultaneous task starts before any finishes.
+Shared scenarios cover published and singleton tasks through real scheduled events and alarms. Singleton bootstrap is fixture-opt-in; see [shared coverage](../../../../interop-tests/cloudflare/README.md#shared-support).
 
 Contracts cover runtime ownership, namespace and retained service-response streaming, real storage/absolute alarms, and PostgreSQL cancellation/shutdown. Direct publishing contracts cover immediate/future callback-bearing and unit tasks, SQL errors, gated inserts, and cancelled publication/close drainage without dispatch or processing bindings. Separate publisher-adapter contracts exercise both publication methods with gated success/non-2xx bodies, shutdown-before-completion, full body consumption, exact partial-success receipts, and explicit redispatch without another insert. Their [shared helper](../../../../interop-tests/cloudflare/publisher-contracts.ts) registers once per language, not in mixed suites. Local Hyperdrive connects directly to PostgreSQL; these tests do not exercise hosted pooling or caching.
 
@@ -16,7 +16,7 @@ Pending and in-flight reconstruction replaces the delegate while retaining real 
 | -------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
 | `producer/lib.rs`                                              | Typed publication, minute-Cron sweeping, fixtures, and the Durable Object adapter.  |
 | `processor/lib.rs`                                             | Processor delegate configuration, business SQL, and abort-safe application cleanup. |
-| `task.rs`                                                      | Greeting, full-name, and controlled scheduling definitions.                         |
+| `task.rs`                                                      | Published and singleton definitions with controlled scheduling.                     |
 | `db.rs`, `http.rs`                                             | Application-side business/cancellation connections and producer request validation. |
 | `contracts/`, `rust-contracts.ts`                              | Test-only Workers and workerd contracts. Do not deploy.                             |
 | `contracts/publisher.rs`, `contracts/wrangler.publisher.jsonc` | Publisher adapter and gated dispatch receiver with real Hyperdrive/DO bindings.     |
@@ -29,13 +29,13 @@ Pending and in-flight reconstruction replaces the delegate while retaining real 
 Target `wasm32-unknown-unknown` with Bellows default features disabled and `features = ["cloudflare"]`. Match `worker` and `worker-build` **0.8.5**. Native workspace builds do not compile the examples' Wasm-only bodies.
 
 - Use `bellows::cloudflare::sdk::{PostgresPublisher, PostgresPublisherConfig}` for typed immediate/future publication bound to a task and dispatcher. The synchronous callback runs once per publication, never at construction. Each call owns a fresh listener-free publishing backend, publishes once, retains and validates the ID, awaits shutdown, then consumes the complete `dispatch_task` response. See the [small task-bound example](../../../../README.md#producer) and [compiled handler](./producer/lib.rs).
-- Use `bellows::cloudflare::sdk::{PostgresProcessor, PostgresProcessorConfig, PostgresProcessorTask}` for typed registrations routed by definition name, one task ID per request. Its synchronous configuration callback runs once per validated request, not at construction. Supply the real Hyperdrive binding's connection string, `PostgresBackendOptions`, and a `Vec<PostgresProcessorTask>`; the execution backend validates the schema, and initialization stays outside Workers.
+- Use `bellows::cloudflare::sdk::{PostgresProcessor, PostgresProcessorConfig, PostgresProcessorTask}` for typed registrations routed by exact name and kind, one logical identity per request. Use `PostgresProcessorTask::new` for published factories and `PostgresProcessorTask::singleton` for singleton factories. Its synchronous configuration callback runs once per validated request, not at construction. Supply the real Hyperdrive binding's connection string, `PostgresBackendOptions`, and a `Vec<PostgresProcessorTask>`; the execution backend validates the schema, and initialization stays outside Workers.
 - Await `PostgresProcessor::fetch_worker` in the event handler or delegate from an existing router. Bellows owns the `/process` protocol, random worker IDs, and a fresh listener-free execution backend. It uses `run_task_once` to claim before building the worker, pass the claimed payload, renew ownership, and await finalization.
-- HTTP **200** reports `{ taskId, nextAction: { type: "done" } }` for an absent matching task or committed completion, or `{ taskId, nextAction: { type: "retryAt", atMs } }` for observed availability/leases and committed retries or self-rescheduling. `atMs` is an absolute Unix millisecond timestamp. This describes a known next action, not business success. Runtime uncertainty and acquisition, cleanup, or backend-close failures return sanitized **500** responses; diagnostics contain only the validated ID and lifecycle stage.
+- See the [processor contract](../../../../README.md#processor-and-deployment) for responses and errors.
 - Use `bellows::time::Instant` for portable deadlines. It is `std::time::Instant` on native targets and `web_time::Instant` on Wasm. Workers use SDK execution and timers, not a Tokio runtime; public `Send`/`Sync` bounds remain unchanged.
-- Keep one `bellows::cloudflare::sdk::Dispatcher` per Durable Object, constructed with `RetainedTaskDispatcher::from_bindings`. Forward handlers to `fetch_worker` and `alarm_worker`; `dispatch_task` accepts `worker::ObjectNamespace` directly.
+- Keep one `bellows::cloudflare::sdk::Dispatcher` per Durable Object, constructed with `RetainedTaskDispatcher::from_bindings`. Forward handlers to `fetch_worker` and `alarm_worker`; `dispatch_tasks` and its published one-item wrapper `dispatch_task` accept `worker::ObjectNamespace` directly.
 
-All definitions share one `DISPATCHER` and one `PROCESSOR` binding. Both dispatch hops require only `{ taskId, taskName }`, not payloads or scheduling metadata; deduplication remains ID-keyed across names. See the [shared protocol](../../../../bellows-ts/test/integration/cloudflare/README.md#protocol-and-limits) for immediate/future producer routes, scheduling fixtures, name validation, and claim behavior.
+All definitions share one `DISPATCHER` and one `PROCESSOR` binding. See the [shared bulk protocol](../../../../README.md#logical-identity-and-bulk-protocol) for name-only singleton identities and the [fixture routes](../../../../bellows-ts/test/integration/cloudflare/README.md#protocol-and-limits).
 
 ### Publisher receipts and errors
 
@@ -53,7 +53,7 @@ Await the operation within the request. Ordinary errors await shutdown after acq
 
 ### Scheduled sweeper
 
-Configure `PostgresSweeper` with Hyperdrive, the existing schema, and dispatcher:
+Configure `PostgresSweeper` with Hyperdrive, the existing schema, and dispatcher. For optional singleton bootstrap, see the [public example](../../../../README.md#minute-cron-postgresql-recovery):
 
 ```rust
 fn sweeper_config(env: &Env) -> Result<PostgresSweeperConfig> {
@@ -104,9 +104,7 @@ Direct `PostgresPublishingBackend` plus `dispatch_task` also remains available f
 
 **Do not add `nodejs_compat` to Rust configurations.** With the configured compatibility date, Node-style timer handles are incompatible with the SDK's numeric handles. TypeScript needs this flag for `pg`; Rust sockets do not.
 
-The dispatcher launches external requests in memory before checking the warming alarm, with no task writes or schedule scans. It sets the alarm only when missing or later than `now + 30 seconds`, leaving earlier and overdue alarms alone. Scheduling persistence starts on a valid `retryAt`, including past deadlines; unsaved completion performs no writes. The alarm selects the earliest task deadline (a 60-second watchdog for running scheduled attempts) or independent 30-second warming heartbeat, launching every due distinct ID without a Bellows concurrency limit, subject to platform limits. Only a fully consumed, successful matching-ID `done` removes tracking. Uncertain responses retry with one-to-thirty-second exponential backoff, in memory for unsaved tasks and durably for saved schedules. Watchdog supersession ignores stale results but does not prove business cancellation. PostgreSQL remains the execution/lease authority.
-
-Dispatcher durability starts with a persisted `retryAt` hint, not DO acceptance. Prompt publisher dispatch, known-schedule DO alarms, and minute-Cron rediscovery complement one another; sweeping adds recovery for earlier loss without persisting acceptance. There is no automatic republishing, outbox, added callback delivery, or atomic publication-to-dispatch transaction. Alarms and attempts are at-least-once, not exactly-once side effects; use idempotent operations. See the [complete scheduling guarantees](../../../../README.md#durable-scheduling-and-limits).
+See the shared [scheduling guarantees](../../../../README.md#durable-scheduling-and-limits).
 
 ## Build and test
 

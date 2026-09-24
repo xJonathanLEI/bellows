@@ -41,7 +41,7 @@ export class PostgresDiscoveryBackend {
     }
   }
 
-  /** Captures database statement time and maximum published ID together, without a transaction. */
+  /** Captures database statement time and maximum task ID together, without a transaction. */
   async beginSweep(): Promise<PostgresSweepWindow> {
     return await this.operations.beginSweep();
   }
@@ -50,9 +50,9 @@ export class PostgresDiscoveryBackend {
    * Reads at most 100 eligible identities in numeric ID order. Start with null, then use the
    * last returned ID even if consuming it failed; an empty page ends the pass. Page size bounds
    * query results, not consumer concurrency. Concurrent changes behind the cursor await another
-   * pass; discovery does not reserve execution. Published rows with null availability or an
+   * pass; discovery does not reserve execution. Rows with null availability or an
    * availability at/before the cutoff are eligible, including expired leases with populated
-   * owners. Singleton rows are excluded. IDs retain the full signed-BIGINT range as text; never
+   * owners. IDs retain the full signed-BIGINT range as text; never
    * round them through Number. Consumer-specific ID validation belongs after discovery.
    */
   async readPage(

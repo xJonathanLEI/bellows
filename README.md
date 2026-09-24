@@ -288,7 +288,7 @@ This lower-level publishing backend provides no automatic retry, savepoint, tran
 
 ## Cloudflare Workers (Rust and TypeScript)
 
-Both languages implement the **producer Worker -> one `global` Durable Object dispatcher -> service-bound processor Worker** topology. PostgreSQL stores payloads and controls execution eligibility; the SQLite-backed Durable Object accepts external dispatches in memory and persists processor scheduling hints. One processor routes multiple published definitions by name, claims before building a worker, renews ownership during processing, and awaits failure/completion recording.
+Both languages implement the **producer Worker -> one `global` Durable Object dispatcher -> service-bound processor Worker** topology. PostgreSQL stores payloads and controls execution eligibility; the SQLite-backed Durable Object accepts external dispatches in memory and persists processor scheduling hints. One processor routes published and singleton definitions by exact name and kind, claims before building a worker, renews ownership during processing, and awaits failure/completion recording.
 
 Three complementary paths arrange invocation: prompt publisher dispatch, DO alarms for known schedules, and once-per-minute generic PostgreSQL rediscovery for missed invocations. Sweeping runs in a scheduled Worker, not inside the DO, and uses the same `global` dispatcher and processor.
 
@@ -367,43 +367,81 @@ let config = PostgresProcessorConfig::new(
     vec![
         PostgresProcessorTask::new(greeting_factory),
         PostgresProcessorTask::new(full_name_factory),
+        PostgresProcessorTask::singleton(singleton_factory),
     ],
 ).with_cleanup(cleanup);
 ```
 
 See the [TypeScript registration example](./bellows-ts/README.md#processor).
 
-Both dispatch hops require `{ taskId, taskName }`, not a payload. Registrations must be non-empty with unique, non-empty definition names, matched exactly. Claims check both ID and persisted name, preventing decoding with the wrong definition. See the [shared protocol](./bellows-ts/test/integration/cloudflare/README.md#protocol-and-limits) for validation and HTTP responses.
+Registrations must be non-empty with unique, non-empty definition names, matched by name and kind. Published claims check ID and persisted name; singleton claims create or reuse a row by name. Singleton workers receive `()` / `undefined` payloads and the claimed row ID.
 
 The delegate owns worker IDs and a fresh listener-free execution backend for each selected attempt. It awaits the runtime, registered application cleanup, and Bellows backend shutdown before responding. Cleanup runs once whenever configuration returned, including invalid registries and unknown names; acquired backends always close afterwards, even if cleanup fails. Applications still own their side-effect resources; use separate business connections and register cleanup for work that can outlive the runtime. TypeScript cleanup must drain outstanding business promises after lease loss; Rust cleanup must retain resource ownership outside the aborted worker.
 
-HTTP **200** reports `{ taskId, nextAction: { type: "done" } }` for an absent matching task or committed completion, or `{ taskId, nextAction: { type: "retryAt", atMs } }` for observed availability/leases and committed retries or self-rescheduling. `atMs` is an absolute Unix millisecond timestamp: a finite, non-negative integer within JavaScript's safe-integer and Date ranges. Past timestamps request a prompt asynchronous recheck. Rust conservatively rounds hints upward to millisecond precision without adding query or cleanup latency. HTTP 200 describes a known next action, not business success. Runtime uncertainty and acquisition, cleanup, or backend-close failures return sanitized **500** responses; diagnostics contain only the validated ID and lifecycle stage. The processor runs once per request; the Durable Object schedules subsequent requests.
+HTTP **200** reports `{ task, nextAction: { type: "done" } }` for an absent matching published task or committed terminal completion, or `{ task, nextAction: { type: "retryAt", atMs } }` for observed availability/leases and committed retries or self-rescheduling. `task` is the complete logical identity below. `atMs` is an absolute Unix millisecond timestamp: a finite, non-negative integer within JavaScript's safe-integer and Date ranges. Past timestamps request a prompt asynchronous recheck. Rust conservatively rounds hints upward to millisecond precision without adding query or cleanup latency. HTTP 200 describes a known next action, not business success. Runtime uncertainty and acquisition, cleanup, or backend-close failures return sanitized **500** responses; automatic diagnostics identify kind and lifecycle stage, not task names or driver errors. The processor runs once per request; the Durable Object schedules subsequent requests.
 
 Keep the processor private, initialize schemas separately through an administrative connection, and use Hyperdrive with query caching disabled and verified origin TLS. TypeScript requires `nodejs_compat` for `pg`; Rust must omit it. Generic TypeScript root/Cloudflare imports do not load PostgreSQL or Node modules; the PostgreSQL subpath still requires `pg` compatibility.
 
 For caller-managed integrations, direct `PostgresPublishingBackend` plus `dispatchTask` / `dispatch_task`, or `PostgresExecutionBackend` plus `runTaskOnce` / `run_task_once`, remain available. Await your own backend shutdown; do not construct the listening `PostgresBackend` in a Worker.
 
+### Logical identity and bulk protocol
+
+| Boundary                  | Envelope                                                              |
+| ------------------------- | --------------------------------------------------------------------- |
+| DO `POST /dispatch`       | `{ tasks: [{ task: TaskIdentity, intent: "run" \| "ensure" }, ...] }` |
+| Processor `POST /process` | `{ task: TaskIdentity }`                                              |
+| Bulk acceptance           | `{ ok: true }`                                                        |
+
+A published identity is `{ kind: "published", taskId: "123", taskName: "name" }`; a singleton identity is `{ kind: "singleton", taskName: "name" }`. `run` requests an attempt; `ensure` is only for singleton bootstrap. Processor responses echo the full identity.
+
+Use `dispatchTasks` / `dispatch_tasks` for batches; `dispatchTask` / `dispatch_task` wraps one published `run` entry. The entire batch is validated before launch; empty batches do nothing.
+
+Names are exact, without trimming or normalization. Published dispatch IDs allow 1–200 UTF-16 code units; PostgreSQL processors require canonical positive decimal IDs up to `9007199254740991`. Singleton names must fit the 2,048-byte UTF-8 storage-key limit including `task:singleton:`. TypeScript rejects unsafe claimed singleton row IDs rather than rounding them.
+
 ### Minute-Cron PostgreSQL recovery
 
-Use `createPostgresSweeper(configure)` in TypeScript or `bellows::cloudflare::sdk::PostgresSweeper::new(configure)` in Rust to recover missed dispatches and lost scheduling hints. Supply Hyperdrive, existing schema options, and the dispatcher namespace; no task registry is needed. **The entire selected schema must belong to that processor's workload.** Initialize it separately and disable Hyperdrive query caching.
+Use `createPostgresSweeper(configure)` in TypeScript or `bellows::cloudflare::sdk::PostgresSweeper::new(configure)` in Rust to recover missed dispatches and lost scheduling hints. Supply Hyperdrive, existing schema options, and the dispatcher namespace. Generic discovery needs no registry; optional singleton definitions configure bootstrap, not a discovery filter. **The entire selected schema must belong to that processor's workload.** Initialize it separately and disable Hyperdrive query caching.
+
+Share the singleton definition with its processor factory:
+
+```rust
+use bellows::{SingletonTrigger, TaskDefinition};
+use bellows::cloudflare::sdk::{PostgresSweeperConfig, PostgresSweeperSingleton};
+
+pub struct SingletonTask;
+impl TaskDefinition for SingletonTask {
+    const NAME: &str = "cloudflare_singleton";
+    type Callback = ();
+    type Trigger = SingletonTrigger;
+}
+
+let config = PostgresSweeperConfig::new(connection_string, options, dispatcher)
+    .with_singletons([PostgresSweeperSingleton::new::<SingletonTask>()]);
+```
 
 Host the scheduled handler in your producer or a dedicated Worker, and register `triggers.crons: ["* * * * *"]` in Wrangler. Exporting a handler alone does not register the trigger. See the [TypeScript setup](./bellows-ts/README.md#sweeper) and [Rust scheduled wrapper](./bellows/tests/integration/cloudflare/README.md#scheduled-sweeper).
 
-Each read-only sweep redispatches due published tasks by existing ID and name, including expired leases but excluding singletons. PostgreSQL still decides whether they can execute. A fixed database-time cutoff and maximum ID bound the pass; pages advance past the last seen ID rather than using offsets. Concurrent changes behind the cursor wait for the next sweep. Pagination does not limit dispatch concurrency.
+Each read-only sweep redispatches due published and singleton tasks, including expired leases. PostgreSQL still decides whether they can execute. A fixed database-time cutoff and maximum ID bound the pass; pages advance past the last seen ID rather than using offsets. Concurrent changes behind the cursor wait for the next sweep.
 
-The helper awaits launched dispatches and backend shutdown, including on errors. `sweep` returns `discovered`, `accepted`, and `failed` counts; errors retain partial counts and the first cause. Candidate failures do not stop later dispatches. **Accepted is not completed or durably tracked.** Scheduled failures expose sanitized diagnostics; imperative error causes may contain sensitive information.
+Each page sends a bulk `run` request. After discovery succeeds, a bulk `ensure` request bootstraps configured singletons not submitted during discovery. Batches do not wait for earlier acknowledgements or limit processor concurrency.
+
+The helper awaits launched dispatches and backend shutdown, including on errors. Reports count tasks: `discovered + bootstrapCandidates = accepted + failed` (`bootstrap_candidates` in Rust). **Accepted includes no-ops, not completion or durable tracking.** An uncertain batch counts all its entries as failed; candidate and batch failures do not stop later dispatches.
+
+Errors retain partial counts, the first cause, bounded candidate context, and any later close error. Scheduled failures expose sanitized diagnostics; imperative error details may contain sensitive information.
 
 Cron supplements immediate dispatch and DO alarms; it does not replace them. Overlapping sweeps are safe, but attempts remain at-least-once: use idempotent side effects. Recovery depends on successful sweeps and platform limits, not a strict 60-second guarantee.
 
 ### Durable scheduling and limits
 
-External dispatch launches the processor with in-memory tracking before checking the warming alarm. It performs no task writes, schedule scans, or durable attempt allocation, including for duplicates and explicit redispatches. It sets the alarm only when absent or later than `now + 30 seconds`; an earlier or overdue alarm is left unchanged. This conditional write retains Cloudflare's normal output gating, and unrelated writes on the global object can also gate outgoing traffic. Same-ID active attempts are deduplicated across names through complete response consumption and result persistence; an active duplicate cannot change routing. Explicit redispatch of a merely pending ID can recheck immediately with a corrected name.
+External dispatch validates the batch, then launches distinct identities in memory before checking the warming alarm once per nonempty request. It performs no task writes, schedule scans, or durable attempt allocation. It sets the alarm only when absent or later than `now + 30 seconds`; an earlier or overdue alarm is left unchanged. This conditional write retains Cloudflare's normal output gating, and unrelated writes on the global object can also gate outgoing traffic. Active attempts deduplicate by published ID or singleton name through complete response consumption and result persistence. An active published duplicate cannot change routing; explicit redispatch of a merely pending ID can recheck immediately with a corrected name.
 
-One alarm selects `min(nextHeartbeatAtMs, earliest task deadline)`, where a running attempt contributes its watchdog deadline. The independent 30-second heartbeat continues while idle; an earlier task alarm does not postpone it. Alarms inspect persisted state, prepare all due attempts durably, then launch **every due distinct ID** without a Bellows concurrency cap, batching delay, or serialized processor queue, subject to Cloudflare/platform limits.
+An **in-memory singleton set** suppresses repeated `ensure` requests, never recovery `run` requests or alarms. Reconstruction clears it; PostgreSQL makes rechecking safe. This reduces requests without blocking recovery.
 
-Only a fully consumed, successful, matching-ID `done` response deletes tracking; unsaved completion performs no writes. Any valid `retryAt`, including a past deadline, persists the schedule and resets infrastructure backoff. Transport/body errors, non-success responses, and invalid envelopes retry with deterministic exponential backoff from one second to thirty seconds: in memory for unsaved tasks, durably for already-persisted tasks. A valid business retry, including immediate failure, bypasses this backoff. Scheduled tasks remain persisted while running. Their 60-second watchdog supersedes interrupted or hung attempts, schedules infrastructure retry, and ignores stale results; best-effort transport cancellation does not prove that business work stopped. Unsaved external attempts have no durable watchdog.
+One alarm selects `min(nextHeartbeatAtMs, earliest task deadline)`, where a running attempt contributes its watchdog deadline. The independent 30-second heartbeat continues while idle; an earlier task alarm does not postpone it. Alarms inspect persisted state, prepare all due attempts durably, then launch **every due distinct identity** without a Bellows concurrency cap, batching delay, or serialized processor queue, subject to Cloudflare/platform limits.
 
-PostgreSQL remains authoritative. A lease expiration is only a hint: another invocation may observe renewal and report a later deadline without building a worker. Successful self-rescheduling and scheduled failures retain the same task ID after database finalization. Alarms and attempts are at-least-once; side effects and completion are separate operations, **not exactly-once**. Make side effects idempotent.
+Only a fully consumed, successful, matching-identity `done` response deletes tracking; unsaved completion performs no writes. Any valid `retryAt`, including a past deadline, persists the schedule and resets infrastructure backoff. Transport/body errors, non-success responses, and invalid envelopes retry with deterministic exponential backoff from one second to thirty seconds: in memory for unsaved tasks, durably for already-persisted tasks. A valid business retry, including immediate failure, bypasses this backoff. Scheduled tasks remain persisted while running. Their 60-second watchdog supersedes interrupted or hung attempts, schedules infrastructure retry, and ignores stale results; best-effort transport cancellation does not prove that business work stopped. Unsaved external attempts have no durable watchdog.
+
+PostgreSQL remains authoritative. A lease expiration is only a hint: another invocation may observe renewal and report a later deadline without building a worker. Successful self-rescheduling and scheduled failures retain the same task ID after database finalization. **Singleton success without a deadline immediately repeats**; use `TaskSuccess::schedule_next_run` / `TaskSuccess.scheduleNextRun` to space runs. Alarms and attempts are at-least-once; side effects and completion are separate operations, **not exactly-once**. Make side effects idempotent.
 
 Dispatcher durability starts when a processor's valid `retryAt` hint is persisted, not at dispatch acceptance or PostgreSQL publication. Minute-Cron discovery adds recovery for lost initial dispatches, due abandoned leases, and committed retry/self-reschedule hints that never reached the DO. It does not strengthen in-memory acceptance into a durable acknowledgement or replace prompt dispatch and known-schedule alarms. There is no atomic publication-to-dispatch transaction, outbox, automatic republishing, or added callback delivery.
 

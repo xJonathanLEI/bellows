@@ -1,4 +1,7 @@
 import { Pool } from "pg";
+
+export { PostgresSingletonTaskIdError } from "./postgres-operations.js";
+
 import type {
   ClaimedTask,
   FailedTask,

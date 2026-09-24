@@ -33,10 +33,11 @@ describe.sequential.each([
   ["TypeScript", "Rust"],
   ["Rust", "TypeScript"],
 ])("Cloudflare %s producer/DO -> %s processor -> PostgreSQL", (producer, processor) =>
-  cloudflareTopology(() => {
+  cloudflareTopology((singleton) => {
     const createFixture =
       producer === "Rust" ? createRustFixture : createTypeScriptFixture;
     return createFixture({
+      singleton,
       producer: producer === "Rust" ? rust("producer") : typescript("producer"),
       processor:
         processor === "Rust" ? rust("processor") : typescript("processor"),

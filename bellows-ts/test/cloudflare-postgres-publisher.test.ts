@@ -86,7 +86,7 @@ function receiver(events: string[] = []) {
     async (_input: RequestInfo | URL, _init?: RequestInit) => {
       events.push("dispatch");
       dispatched.release();
-      return new Response("accepted");
+      return Response.json({ ok: true });
     },
   );
   const getByName = vi.fn((_name: string) => {
@@ -207,7 +207,14 @@ describe.each(["publish", "publishFuture"] as const)("%s", (method) => {
       {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ taskId: "17", taskName: task.name }),
+        body: JSON.stringify({
+          tasks: [
+            {
+              task: { kind: "published", taskId: "17", taskName: task.name },
+              intent: "run",
+            },
+          ],
+        }),
       },
     );
     expect(f.backend.events).toEqual([
@@ -244,8 +251,22 @@ describe.each(["publish", "publishFuture"] as const)("%s", (method) => {
     expect(
       f.fetch.mock.calls.map(([, init]) => JSON.parse(String(init?.body))),
     ).toEqual([
-      { taskId: "17", taskName: voidTask.name },
-      { taskId: "17", taskName: custom.name },
+      {
+        tasks: [
+          {
+            task: { kind: "published", taskId: "17", taskName: voidTask.name },
+            intent: "run",
+          },
+        ],
+      },
+      {
+        tasks: [
+          {
+            task: { kind: "published", taskId: "17", taskName: custom.name },
+            intent: "run",
+          },
+        ],
+      },
     ]);
   });
 
@@ -314,7 +335,18 @@ describe.each(["publish", "publishFuture"] as const)("%s", (method) => {
       taskId: String(taskId),
     });
     expect(f.fetch.mock.calls[0][1]?.body).toBe(
-      JSON.stringify({ taskId: String(taskId), taskName: task.name }),
+      JSON.stringify({
+        tasks: [
+          {
+            task: {
+              kind: "published",
+              taskId: String(taskId),
+              taskName: task.name,
+            },
+            intent: "run",
+          },
+        ],
+      }),
     );
   });
 
@@ -369,7 +401,10 @@ describe.each(["publish", "publishFuture"] as const)("%s", (method) => {
     const bodyGate = new Gate();
     const reading = new Gate();
     let consumed = false;
-    const body = `${secret.message}${"x".repeat(2000)}tail`;
+    const body =
+      status === 200
+        ? `{"ok":true}${" ".repeat(2000)}\n`
+        : `${secret.message}${"x".repeat(2000)}tail`;
     const response = new Response(
       new ReadableStream<Uint8Array>({
         async start(controller) {

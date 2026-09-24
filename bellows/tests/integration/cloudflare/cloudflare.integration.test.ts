@@ -18,8 +18,9 @@ const rust = (component: "producer" | "processor") => {
 
 // Suites are sequential: local Hyperdrive configuration is process-wide.
 describe.sequential("Cloudflare Rust producer/DO -> Rust processor -> PostgreSQL", () =>
-  cloudflareTopology(() =>
+  cloudflareTopology((singleton) =>
     createCloudflarePostgresFixture({
+      singleton,
       producer: rust("producer"),
       processor: rust("processor"),
     }),

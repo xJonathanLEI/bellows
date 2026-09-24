@@ -2,13 +2,13 @@
 
 This executable example runs a **producer Worker -> `global` Durable Object dispatcher -> service-bound processor Worker**. This directory owns TypeScript -> TypeScript topology scenarios, direct publishing-backend contracts, and publisher-adapter contracts. See the independent [Rust/Wasm harness](../../../../bellows/tests/integration/cloudflare/README.md) for Rust -> Rust and workerd contracts, and the [mixed-language suite](../../../../interop-tests/cloudflare/README.md) for both cross-language directions.
 
-PostgreSQL stores payloads and decides claimability. The SQLite-backed Durable Object accepts dispatches in memory, persists processor scheduling hints, suppresses active duplicate IDs even across different names, and shares one alarm between scheduling and idle warming heartbeats. The processor routes definitions by name, claims before building, renews leases, and reports a next action only after finalization and owned cleanup.
+PostgreSQL stores payloads and decides claimability. Published and singleton definitions share the [logical identity and bulk protocol](../../../../README.md#logical-identity-and-bulk-protocol) and [scheduling guarantees](../../../../README.md#durable-scheduling-and-limits).
 
 ## Files and APIs
 
 | File                                                    | Purpose                                                                              |
 | ------------------------------------------------------- | ------------------------------------------------------------------------------------ |
-| `task.ts`                                               | Greeting, full-name, and controlled scheduling definitions.                          |
+| `task.ts`                                               | Published and singleton definitions with controlled scheduling.                      |
 | `workers/producer.ts`                                   | Typed publication, minute-Cron sweeping, fixtures, and the `TaskDispatcher` wrapper. |
 | `workers/processor.ts`                                  | Processor delegate configuration and the `processed_tasks` side effect.              |
 | `workers/publishing.ts`, `publishing-contracts.ts`      | Test-only direct publishing contracts; no dispatch or processing. Do not deploy.     |
@@ -19,7 +19,7 @@ PostgreSQL stores payloads and decides claimability. The SQLite-backed Durable O
 The examples import repository source. In an application, use:
 
 - `@xjonathanlei/bellows` for task definitions, `WorkerFactory`, and `TaskSuccess`.
-- `@xjonathanlei/bellows/cloudflare` for `dispatchTask` and `RetainedTaskDispatcher`.
+- `@xjonathanlei/bellows/cloudflare` for `dispatchTasks`, its published wrapper `dispatchTask`, and `RetainedTaskDispatcher`.
 - `@xjonathanlei/bellows/cloudflare/postgres` for `createPostgresPublisher`, `PostgresPublisherError`, `createPostgresProcessor`, `createPostgresProcessorTask`, and `createPostgresSweeper`.
 - `@xjonathanlei/bellows/backends/postgres` for direct, Node-side schema initialization.
 - `@xjonathanlei/bellows/backends/postgres-publishing` for listener-free typed publication.
@@ -38,7 +38,7 @@ Await the call within the request; the adapter does not extend request lifetime.
 
 ## Scheduled sweeper
 
-The producer composes `createPostgresSweeper(publisherConfig).scheduled` with `fetch`; [`wrangler.producer.jsonc`](./wrangler.producer.jsonc) registers `* * * * *`. The [standalone export fixture](./workers/postgres-sweeper.typecheck.ts) checks compatibility with generated Workers types. See [setup examples](../../../README.md#sweeper) and [recovery semantics](../../../../README.md#minute-cron-postgresql-recovery).
+The producer composes the sweeper's `scheduled` handler with `fetch`; [`wrangler.producer.jsonc`](./wrangler.producer.jsonc) registers `* * * * *`. The [standalone export fixture](./workers/postgres-sweeper.typecheck.ts) checks Workers types, including singleton bootstrap. See [setup examples](../../../README.md#sweeper) and [recovery semantics](../../../../README.md#minute-cron-postgresql-recovery).
 
 Tests inject real workerd scheduled events to verify recovery and observable failures, without waiting for Cron delivery. Coverage is shared across all four language topologies; see the [shared harness](../../../../interop-tests/cloudflare/README.md#shared-support). Hosted Cron delivery is not tested.
 
@@ -84,7 +84,7 @@ pnpm --dir bellows-ts test:cloudflare
 
 `BELLOWS_CLOUDFLARE_TEST_POSTGRES_URL` overrides the Cloudflare database URL. This TypeScript adapter falls back to `BELLOWS_TS_TEST_POSTGRES_URL`, then `postgres://postgres:postgres@localhost:5432/postgres`. The focused suite needs schema creation/deletion privileges and initializes each isolated schema with the production `initializePostgresSchema`. The full TypeScript suite also creates temporary databases and uses `BELLOWS_TS_TEST_POSTGRES_URL` for its other PostgreSQL tests. Native Rust tests use the local default URL, not these overrides.
 
-The shared topology scenarios cover high-level future publication, automatic lease-delayed execution after renewal, scheduled/immediate failure, successful self-rescheduling, transient failure repair, lost completion responses, and simultaneous deadlines across definitions. They retain early acceptance, exact routing, ownership/redelivery, validation/cleanup, insert failure without republishing, and exact-ID boundary coverage. SQL execution timestamps prove future work and rescheduled attempts do not execute early; all fan-out business operations remain gated until every task starts.
+Shared scenarios cover published and singleton tasks through real scheduled events and alarms. Singleton bootstrap is fixture-opt-in; see [shared coverage](../../../../interop-tests/cloudflare/README.md#shared-support).
 
 Real storage contracts reconstruct delegates with pending and in-flight records and preserve absolute alarms. Reconstruction is not an induced platform eviction. Long-watchdog expiry, stale responses, failed persistence, and 300-ID unrestricted fan-out use deterministic unit-test clocks; the topology suite uses real automatic alarms without a second dispatch or manual alarm invocation. Fixture-only inspection, reconstruction, response-loss, and cleanup routes must not be deployed.
 
@@ -110,20 +110,15 @@ Worker typechecking generates its runtime declarations and also runs under norma
 
 - `POST /tasks` accepts a non-blank `name`; `POST /full-names` accepts non-blank `firstName` and `lastName`. Each component must be a string of at most 200 UTF-16 code units; validation does not trim values. An optional `?availableFromMs=<Unix milliseconds>` selects high-level future publication. Publication commits and its connection closes before immediate dispatch. HTTP **202** returns the ID after in-memory acceptance, not durable scheduling or completion.
 - Test-only `POST /scheduled` accepts `{ name, mode, availableFromMs }`. On its first execution, `mode` selects `failure`, `success`, or `immediate` rescheduling; the second execution completes under the same ID. The fixture records SQL execution timestamps independently of Bellows state.
-- Both `POST /dispatch` and `POST /process` require `{ taskId: string, taskName: string }`, for example `{ "taskId": "17", "taskName": "cloudflare_full_name" }`. Dispatch forwards exactly those fields, not payloads or scheduling metadata, and accepts opaque IDs of 1–200 UTF-16 code units. Both PostgreSQL processors require 1–16 ASCII decimal digits, starting with 1–9, with a value no greater than `9007199254740991`. IDs remain strings in responses; extra request properties are ignored.
-- Names come from `TaskDefinition::NAME` / `factory.task.name` and match exactly, without trimming, case folding, or a length limit. Missing, non-string, or empty names return **400** even with one registration. Registries must be non-empty with unique, non-empty names; invalid registries are **500** configuration failures. Valid unknown names return **404** `{ error: "unknown task name" }` without acquisition. Claims check both ID and persisted name before decoding; a registered-name mismatch is an ordinary no-claim attempt.
-- HTTP **200** reports `{ taskId, nextAction: { type: "done" } }` for an absent matching task or committed completion, or `{ taskId, nextAction: { type: "retryAt", atMs } }` for observed availability/leases and committed retries or self-rescheduling. `atMs` is an absolute Unix millisecond timestamp within the non-negative JavaScript Date range; past timestamps request a prompt recheck. Rust rounds hints up to millisecond precision, never adding query or cleanup latency. This describes a known next action, not business success. Responses await finalization, application cleanup, and backend shutdown.
-- Runtime uncertainty and configuration, randomness, acquisition, uncaught attempt, application cleanup, or backend-close failures return HTTP **500** with `{ "error": "task processing attempt failed" }`. Server diagnostics identify only the validated ID and lifecycle stage, not configuration or driver error strings.
+- See the [wire contract](../../../../README.md#logical-identity-and-bulk-protocol) for `POST /dispatch` batches and `POST /process` identities.
+- Invalid identities return **400**. Invalid registries return **500**; unknown names or wrong-kind registrations return **404** without backend acquisition. Runtime uncertainty and lifecycle failures return sanitized **500** responses; automatic diagnostics contain kind and stage, not names or driver errors. See the [processor contract](../../../../README.md#processor-and-deployment).
 - A publisher close/dispatch failure returns HTTP **503** with the existing ID and unconfirmed acceptance. Recover with trusted redispatch, not republishing. A `task-id` failure uses the same envelope but its ID is unsupported: inspect database state and choose a different recovery action. A no-receipt publication failure is an unknown outcome, not proof of rollback.
 - Schema initialization belongs outside Worker requests. Qualify tables and parameterize values. Schema names use lowercase ASCII letters, digits, and underscores, starting with a letter or underscore; choose short names to avoid PostgreSQL truncation.
-- The shared alarm selects the earliest persisted task/watchdog deadline or independent 30-second heartbeat. Every due distinct ID launches without a Bellows concurrency limit; platform limits still apply. Active duplicates preserve the original routing; pending IDs permit explicit corrected redispatch. Only a fully consumed, successful matching-ID `done` removes tracking.
-- External dispatch launches in memory before checking the warming alarm, with no task writes or schedule scans. It sets the alarm only when missing or later than `now + 30 seconds`, preserving earlier and overdue alarms. Any valid `retryAt` starts persistence and resets backoff. Infrastructure uncertainty retries with one-to-thirty-second exponential delays, in memory for unsaved tasks and durably for saved schedules. The 60-second watchdog applies only to scheduled attempts; supersession ignores stale results but does not guarantee business cancellation. PostgreSQL remains authoritative. See [durable scheduling guarantees](../../../../README.md#durable-scheduling-and-limits).
-- Prompt publisher dispatch, DO alarms for known schedules, and minute-Cron PostgreSQL rediscovery complement each other. Sweeping adds recovery for earlier loss without strengthening in-memory acceptance into durable tracking, which starts with a persisted `retryAt` hint. There is no outbox, automatic republishing, atomic publication-to-dispatch transaction, or added callback delivery, and abrupt termination has no async-cleanup guarantee.
-- Side effects and completion are separate operations, **not exactly-once**. Use idempotent side effects and protect producer access; this unauthenticated example is not production-complete.
+- Follow the shared [recovery](../../../../README.md#minute-cron-postgresql-recovery) and [scheduling guarantees](../../../../README.md#durable-scheduling-and-limits), and protect producer access; this unauthenticated example is not production-complete.
 
 ## Opt-in hosted verification
 
-Hosted verification is manual, requires Cloudflare permissions, and may incur charges. Before adapting these projects, remove all fixture-only `__test` routes and the controlled scheduling task. Use a disposable database and private deployment configuration:
+Hosted verification is manual, requires Cloudflare permissions, and may incur charges. Before adapting these projects, remove all fixture-only `__test` routes, bindings, and controlled scheduling tasks. Use a disposable database and private deployment configuration:
 
 1. Initialize an isolated schema through a **direct administrative connection**, using `initializePostgresSchema`. Create `processed_tasks` with `task_id BIGINT PRIMARY KEY`, `name TEXT NOT NULL`, and `execution_count INTEGER NOT NULL CHECK (execution_count > 0)`.
 2. Disable the `bellows_tasks_notify_available` trigger **only in this callback-free, explicit-dispatch schema**. Hyperdrive does not support `LISTEN`/`NOTIFY`; leave triggers intact for listening deployments.

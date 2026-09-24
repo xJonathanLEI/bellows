@@ -2,11 +2,14 @@ import { afterEach, expect, test, vi } from "vitest";
 import {
   type DispatcherRecords,
   type DispatcherStorage,
+  type DispatchTask,
   type DurableObjectNamespaceLike,
   type DurableObjectStubLike,
   dispatchTask,
+  dispatchTasks,
   type ProcessorFetcher,
   RetainedTaskDispatcher,
+  type TaskIdentity,
 } from "../src/cloudflare.js";
 
 class Deferred<T> {
@@ -30,14 +33,365 @@ class Deferred<T> {
   }
 }
 
+function singleton(
+  taskName = "7",
+  intent: "run" | "ensure" = "ensure",
+): DispatchTask {
+  return { task: { kind: "singleton", taskName }, intent };
+}
+
+function singletonRecord(
+  storage: FakeAlarmStorage,
+  name = "7",
+): StoredTask | undefined {
+  return storage.records.get(`task:singleton:${name}`) as
+    | StoredTask
+    | undefined;
+}
+
+test.each([
+  { task: { kind: "published", taskName: "7", taskId: "" }, intent: "run" },
+  {
+    task: { kind: "published", taskName: "7", taskId: `${"😀".repeat(100)}a` },
+    intent: "run",
+  },
+  { task: { kind: "singleton", taskName: null }, intent: "ensure" },
+  { task: { kind: "singleton", taskName: "7", taskId: "7" }, intent: "run" },
+  { task: { kind: "singleton", taskName: "7", extra: true }, intent: "run" },
+  { task: { kind: "publish", taskName: "7", taskId: "7" }, intent: "run" },
+  { task: { kind: "published", taskName: "7" }, intent: "run" },
+  { task: { kind: "published", taskName: "7", taskId: "7" }, intent: "ensure" },
+  { task: { kind: "singleton", taskName: "" }, intent: "run" },
+  { task: { kind: "singleton", taskName: "7" }, intent: "unknown" },
+  { task: { kind: "singleton", taskName: "7" } },
+  { ...singleton(), extra: true },
+  singleton("😀".repeat(509)),
+  singleton("\ud800"),
+])("validates the entire batch before side effects: %j", async (invalid) => {
+  const storage = new FakeAlarmStorage();
+  const processor = new DeferredProcessor();
+  const dispatcher = new RetainedTaskDispatcher(storage, processor);
+  const alarm = vi.spyOn(storage, "getAlarm");
+  const transaction = vi.spyOn(storage, "transaction");
+  expect(
+    (await dispatcher.fetch(batchRequest([singleton(), invalid]))).status,
+  ).toBe(400);
+  expect(processor.calls).toHaveLength(0);
+  expect(alarm).not.toHaveBeenCalled();
+  expect(transaction).not.toHaveBeenCalled();
+  expect(storage.records.size).toBe(0);
+});
+
+test("immediate completions still dispatch each batch identity only once", async () => {
+  const storage = new FakeAlarmStorage();
+  const fetch = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) =>
+    Response.json({
+      task: JSON.parse(String(init?.body)).task,
+      nextAction: { type: "done" },
+    }),
+  );
+  const dispatcher = new RetainedTaskDispatcher(storage, { fetch });
+  const entries = [
+    singleton(),
+    {
+      task: { kind: "published", taskId: "7", taskName: "published" },
+      intent: "run",
+    },
+  ];
+  await dispatcher.fetch(
+    batchRequest(Array.from({ length: 1000 }, () => entries).flat()),
+  );
+  expect(fetch).toHaveBeenCalledTimes(2);
+});
+
+test("batch helpers validate before lookup and empty batches do no I/O", async () => {
+  const namespace = new RecordingNamespace();
+  await dispatchTasks(namespace, []);
+  expect(namespace.names).toEqual([]);
+  await expect(
+    dispatchTasks(namespace, [singleton(), singleton("x".repeat(2034))]),
+  ).rejects.toThrow("byte limit");
+  expect(namespace.names).toEqual([]);
+  const tasks = [
+    singleton(`${"😀".repeat(508)}x`),
+    singleton(" published:7 雪\n"),
+  ];
+  await dispatchTasks(namespace, tasks);
+  expect(namespace.names).toEqual(["global"]);
+  expect(await namespace.stub.requests[0]?.json()).toEqual({ tasks });
+  const storage = new FakeAlarmStorage();
+  const alarm = vi.spyOn(storage, "getAlarm");
+  await expectJson(
+    await new RetainedTaskDispatcher(storage, new DeferredProcessor()).fetch(
+      batchRequest([]),
+    ),
+    200,
+    { ok: true },
+  );
+  expect(alarm).not.toHaveBeenCalled();
+});
+
+test("all 300 distinct mixed entries launch before a single blocked warming check", async () => {
+  const storage = new FakeAlarmStorage();
+  storage.getGate = new Deferred<void>();
+  const gate = storage.getGate;
+  const alarm = vi.spyOn(storage, "getAlarm");
+  const transaction = vi.spyOn(storage, "transaction");
+  const get = vi.spyOn(storage, "get");
+  const processor = new DeferredProcessor();
+  const dispatcher = new RetainedTaskDispatcher(storage, processor);
+  const tasks: DispatchTask[] = Array.from({ length: 300 }, (_, i) =>
+    i % 2 === 0
+      ? singleton(String(i / 2))
+      : {
+          task: {
+            kind: "published",
+            taskId: String((i - 1) / 2),
+            taskName: "published",
+          },
+          intent: "run",
+        },
+  );
+  const acceptance = dispatcher.fetch(batchRequest([...tasks, ...tasks]));
+  await waitFor(() => processor.calls.length === 300);
+  expect(alarm).toHaveBeenCalledTimes(1);
+  expect(transaction).not.toHaveBeenCalled();
+  expect(get).not.toHaveBeenCalled();
+  expect(storage.records.size).toBe(0);
+  gate.resolve(undefined);
+  await expectJson(await acceptance, 200, { ok: true });
+  expect(storage.scheduledAlarms).toHaveLength(1);
+  for (let i = 0; i < 300; i++) {
+    reply(processor, i, { type: "done" });
+    await waitFor(() => get.mock.calls.length === i + 1);
+  }
+});
+
+test("singleton bootstrap suppression never suppresses run, and current done forgets it", async () => {
+  const storage = new FakeAlarmStorage();
+  const processor = new DeferredProcessor();
+  const dispatcher = new RetainedTaskDispatcher(storage, processor);
+  await dispatcher.fetch(batchRequest([singleton(), singleton()]));
+  expect(processor.calls).toHaveLength(1);
+  const body = controlledResponse();
+  processor.calls[0]?.response.resolve(body.response);
+  await waitFor(() => body.response.bodyUsed);
+  await dispatcher.fetch(batchRequest([singleton(), singleton("7", "run")]));
+  expect(processor.calls).toHaveLength(1);
+  body.finish(
+    JSON.stringify({
+      task: singleton().task,
+      nextAction: { type: "retryAt", atMs: Date.now() + 60_000 },
+    }),
+  );
+  await body.consumed;
+  await waitFor(() => singletonRecord(storage)?.state.type === "pending");
+  const alarm = vi.spyOn(storage, "getAlarm");
+  await dispatcher.fetch(batchRequest([singleton(), singleton()]));
+  expect(alarm).toHaveBeenCalledTimes(1);
+  expect(processor.calls).toHaveLength(1);
+  await dispatcher.fetch(batchRequest([singleton(), singleton("7", "run")]));
+  expect(processor.calls).toHaveLength(2);
+  reply(processor, 1, { type: "done" });
+  await waitFor(() => !singletonRecord(storage));
+  for (let i = 0; i < 100 && processor.calls.length < 3; i++)
+    await dispatcher.fetch(batchRequest([singleton()]));
+  expect(processor.calls).toHaveLength(3);
+  await finish(processor, 2);
+  // Unsaved done also releases suppression.
+  for (let i = 0; i < 100 && processor.calls.length < 4; i++)
+    await dispatcher.fetch(batchRequest([singleton()]));
+  expect(processor.calls).toHaveLength(4);
+  await finish(processor, 3);
+});
+
+test.each([
+  "run",
+  "ensure",
+] as const)("singleton %s chains survive reconstruction and alarm launches establish suppression", async (intent) => {
+  let now = 1_700_000_000_000;
+  vi.spyOn(Date, "now").mockImplementation(() => now);
+  const storage = new FakeAlarmStorage();
+  const processor = new DeferredProcessor();
+  let dispatcher = new RetainedTaskDispatcher(storage, processor);
+  const name = `singleton: published:7 雪🦀 ${"x".repeat(300)}`;
+  await dispatcher.fetch(batchRequest([singleton(name, intent)]));
+  reply(processor, 0, { type: "retryAt", atMs: now + 10_000 });
+  await waitFor(() => singletonRecord(storage, name)?.state.type === "pending");
+  expect(singletonRecord(storage, name)?.task).toEqual(singleton(name).task);
+  await dispatcher.fetch(batchRequest([singleton(name)]));
+  expect(processor.calls).toHaveLength(1);
+  dispatcher = new RetainedTaskDispatcher(storage, processor);
+  await dispatcher.fetch(batchRequest([singleton(name)]));
+  expect(processor.calls).toHaveLength(2);
+  reply(processor, 1, { type: "retryAt", atMs: now + 10_001 });
+  await waitFor(
+    () => singletonRecord(storage, name)?.nextAttemptAtMs === now + 10_001,
+  );
+  dispatcher = new RetainedTaskDispatcher(storage, processor);
+  now += 10_001;
+  await dispatcher.alarm();
+  expect(processor.calls).toHaveLength(3);
+  await dispatcher.fetch(batchRequest([singleton(name)]));
+  expect(processor.calls).toHaveLength(3);
+  reply(processor, 2, { type: "retryAt", atMs: now + 60_000 });
+  await waitFor(() => singletonRecord(storage, name)?.state.type === "pending");
+  await dispatcher.fetch(batchRequest([singleton(name)]));
+  expect(processor.calls).toHaveLength(3);
+});
+
+test("singleton infrastructure retries retain bootstrap suppression and reset on past hints", async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(1_700_000_000_000);
+  vi.spyOn(console, "error").mockImplementation(() => undefined);
+  const storage = new FakeAlarmStorage();
+  const processor = new DeferredProcessor();
+  let dispatcher = new RetainedTaskDispatcher(storage, processor);
+  await dispatcher.fetch(batchRequest([singleton()]));
+  processor.calls[0]?.response.reject(new Error("network"));
+  await vi.advanceTimersByTimeAsync(0);
+  await dispatcher.fetch(batchRequest([singleton()]));
+  expect(processor.calls).toHaveLength(1);
+  expect(storage.records.size).toBe(0);
+  await vi.advanceTimersByTimeAsync(1_000);
+  expect(processor.calls).toHaveLength(2);
+  reply(processor, 1, { type: "retryAt", atMs: Date.now() });
+  await waitFor(() => singletonRecord(storage)?.state.type === "pending");
+  for (let failures = 1; failures <= 7; failures++) {
+    dispatcher = new RetainedTaskDispatcher(storage, processor);
+    await dispatcher.alarm();
+    processor.calls.at(-1)?.response.reject(new Error("network"));
+    await vi.advanceTimersByTimeAsync(0);
+    const record = singletonRecord(storage);
+    if (!record) throw new Error("missing singleton schedule");
+    expect(record.infrastructureFailures).toBe(Math.min(failures, 6));
+    const delay = Math.min(1_000 * 2 ** (failures - 1), 30_000);
+    expect(record.nextAttemptAtMs).toBe(Date.now() + delay);
+    const count = processor.calls.length;
+    await dispatcher.fetch(batchRequest([singleton()]));
+    expect(processor.calls).toHaveLength(count);
+    await vi.advanceTimersByTimeAsync(delay);
+  }
+  await dispatcher.alarm();
+  reply(processor, processor.calls.length - 1, {
+    type: "retryAt",
+    atMs: Date.now() - 1,
+  });
+  await waitFor(() => singletonRecord(storage)?.infrastructureFailures === 0);
+});
+
+test.each([
+  "done",
+  "retryAt",
+  "error",
+])("stale singleton %s cannot replace or forget a newer chain", async (action) => {
+  let now = 1_700_000_000_000;
+  vi.spyOn(Date, "now").mockImplementation(() => now);
+  vi.spyOn(console, "error").mockImplementation(() => undefined);
+  const storage = new FakeAlarmStorage();
+  const processor = new DeferredProcessor();
+  const dispatcher = new RetainedTaskDispatcher(storage, processor);
+  await dispatcher.fetch(batchRequest([singleton()]));
+  reply(processor, 0, { type: "retryAt", atMs: now });
+  await waitFor(() => singletonRecord(storage)?.state.type === "pending");
+  await dispatcher.alarm();
+  const body = controlledResponse();
+  processor.calls[1]?.response.resolve(body.response);
+  await waitFor(() => body.response.bodyUsed);
+  now += 60_000;
+  await dispatcher.alarm();
+  now += 1_000;
+  await dispatcher.alarm();
+  expect(processor.calls).toHaveLength(3);
+  reply(processor, 2, { type: "retryAt", atMs: now + 50_000 });
+  await waitFor(() => singletonRecord(storage)?.state.type === "pending");
+  const saved = structuredClone(singletonRecord(storage));
+  if (action === "error") body.fail(new Error("late error"));
+  else
+    body.finish(
+      JSON.stringify({
+        task: singleton().task,
+        nextAction:
+          action === "done" ? { type: "done" } : { type: "retryAt", atMs: 0 },
+      }),
+    );
+  await body.consumed;
+  await dispatcher.fetch(batchRequest([singleton()]));
+  expect(processor.calls).toHaveLength(3);
+  expect(singletonRecord(storage)).toEqual(saved);
+});
+
+test("a singleton record under another identity's storage key is rejected", async () => {
+  const storage = new FakeAlarmStorage();
+  seedSchedule(storage);
+  const record = storedTask(storage);
+  if (!record) throw new Error("missing schedule");
+  record.task = singleton().task;
+  const processor = new DeferredProcessor();
+  await expect(
+    new RetainedTaskDispatcher(storage, processor).alarm(),
+  ).rejects.toThrow("task record");
+  expect(processor.calls).toHaveLength(0);
+});
+
+test.each([
+  false,
+  true,
+])("singleton persistence failure preserves a retry chain (uncertain=%s)", async (uncertain) => {
+  vi.useFakeTimers();
+  vi.setSystemTime(1_700_000_000_000);
+  vi.spyOn(console, "error").mockImplementation(() => undefined);
+  const storage = new FakeAlarmStorage();
+  const processor = new DeferredProcessor();
+  const dispatcher = new RetainedTaskDispatcher(storage, processor);
+  await dispatcher.fetch(batchRequest([singleton()]));
+  if (uncertain) storage.uncertainCommit = true;
+  else storage.setFailures = 1;
+  reply(processor, 0, { type: "retryAt", atMs: Date.now() });
+  await vi.advanceTimersByTimeAsync(0);
+  expect(singletonRecord(storage) !== undefined).toBe(uncertain);
+  await dispatcher.fetch(batchRequest([singleton()]));
+  expect(processor.calls).toHaveLength(1);
+  await vi.advanceTimersByTimeAsync(1_000);
+  expect(processor.calls).toHaveLength(2);
+  reply(processor, 1, { type: "retryAt", atMs: Date.now() + 60_000 });
+  await waitFor(
+    () => singletonRecord(storage)?.nextAttemptAtMs === Date.now() + 60_000,
+  );
+  expect(singletonRecord(storage)?.infrastructureFailures).toBe(0);
+  await dispatcher.fetch(batchRequest([singleton()]));
+  expect(processor.calls).toHaveLength(2);
+});
+
+test.each([
+  { kind: "singleton", taskName: "7 " },
+  { kind: "published", taskName: "7", taskId: "7" },
+  { kind: "singleton", taskName: "7", taskId: "7" },
+])("a mismatched singleton response cannot end its chain: %j", async (task) => {
+  vi.useFakeTimers();
+  vi.spyOn(console, "error").mockImplementation(() => undefined);
+  const storage = new FakeAlarmStorage();
+  const processor = new DeferredProcessor();
+  const dispatcher = new RetainedTaskDispatcher(storage, processor);
+  await dispatcher.fetch(batchRequest([singleton()]));
+  reply(processor, 0, { type: "retryAt", atMs: Date.now() });
+  await waitFor(() => singletonRecord(storage)?.state.type === "pending");
+  await dispatcher.alarm();
+  processor.calls[1]?.response.resolve(
+    Response.json({ task, nextAction: { type: "done" } }),
+  );
+  await waitFor(() => singletonRecord(storage)?.infrastructureFailures === 1);
+  await dispatcher.fetch(batchRequest([singleton()]));
+  expect(processor.calls).toHaveLength(2);
+});
+
 function seedSchedule(storage: FakeAlarmStorage, taskName = "contract"): void {
   storage.records.set("scheduler", {
     nextHeartbeatAtMs: Date.now() + 30_000,
     nextAttemptId: 0,
   });
-  storage.records.set("task:id", {
-    taskId: "id",
-    taskName,
+  storage.records.set("task:published:id", {
+    task: { kind: "published", taskId: "id", taskName },
     nextAttemptAtMs: Date.now(),
     infrastructureFailures: 0,
     state: { type: "pending" },
@@ -134,6 +488,7 @@ interface ProcessorCall {
   readonly request: Request;
   readonly response: Deferred<Response>;
   readonly taskId: string;
+  readonly task: TaskIdentity;
 }
 
 class DeferredProcessor implements ProcessorFetcher {
@@ -144,7 +499,8 @@ class DeferredProcessor implements ProcessorFetcher {
     this.calls.push({
       request: new Request(input, init),
       response,
-      taskId: (JSON.parse(init?.body as string) as { taskId: string }).taskId,
+      taskId: JSON.parse(init?.body as string).task.taskId,
+      task: JSON.parse(init?.body as string).task,
     });
     return response.promise;
   }
@@ -152,7 +508,7 @@ class DeferredProcessor implements ProcessorFetcher {
 
 class RecordingStub implements DurableObjectStubLike {
   readonly requests: Request[] = [];
-  response: Response = new Response("accepted");
+  response: Response = Response.json({ ok: true });
   error: Error | null = null;
 
   fetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
@@ -178,12 +534,18 @@ class RecordingNamespace implements DurableObjectNamespaceLike {
 }
 
 function dispatchRequest(taskId: string, taskName = "contract"): Request {
+  return batchRequest([
+    { task: { kind: "published", taskId, taskName }, intent: "run" },
+  ]);
+}
+
+function batchRequest(tasks: readonly unknown[]): Request {
   return new Request("https://dispatcher/dispatch", {
     method: "POST",
     headers: {
       "content-type": "application/json",
     },
-    body: JSON.stringify({ taskId, taskName }),
+    body: JSON.stringify({ tasks }),
   });
 }
 
@@ -233,8 +595,8 @@ function controlledResponse(status = 200) {
 async function finish(processor: DeferredProcessor, index: number) {
   const control = controlledResponse();
   processor.calls[index]?.response.resolve(control.response);
-  const taskId = processor.calls[index]?.taskId;
-  control.finish(JSON.stringify({ taskId, nextAction: { type: "done" } }));
+  const task = processor.calls[index]?.task;
+  control.finish(JSON.stringify({ task, nextAction: { type: "done" } }));
   await control.consumed;
 }
 
@@ -250,18 +612,18 @@ async function expectJson(response: Response, status: number, body: unknown) {
 
 async function expectRedispatchAllowed(
   dispatcher: RetainedTaskDispatcher,
+  processor: DeferredProcessor,
   taskId: string,
   taskName = "contract",
 ) {
+  const count = processor.calls.length;
   for (let attempt = 0; attempt < 100; attempt += 1) {
-    const response = await dispatcher.fetch(dispatchRequest(taskId, taskName));
-    expect(response.status).toBe(200);
-    const body = (await response.json()) as { duplicate?: boolean };
-    if (body.duplicate === undefined) {
-      expect(body).toEqual({ ok: true, taskId });
-      return;
-    }
-    expect(body).toEqual({ duplicate: true, ok: true, taskId });
+    await expectJson(
+      await dispatcher.fetch(dispatchRequest(taskId, taskName)),
+      200,
+      { ok: true },
+    );
+    if (processor.calls.length > count) return;
   }
   throw new Error("completed attempt did not permit explicit redispatch");
 }
@@ -286,8 +648,8 @@ test("healthy dispatch and unsaved completion perform no writes or schedule scan
   expect(processor.calls).toHaveLength(1);
   expect(get).not.toHaveBeenCalled();
   reply(processor, 0, { type: "done" });
-  await expectRedispatchAllowed(dispatcher, "id");
-  expect(get).toHaveBeenCalledExactlyOnceWith("task:id");
+  await expectRedispatchAllowed(dispatcher, processor, "id");
+  expect(get).toHaveBeenCalledExactlyOnceWith("task:published:id");
   expect(transaction).not.toHaveBeenCalled();
   expect(list).not.toHaveBeenCalled();
   expect(put).not.toHaveBeenCalled();
@@ -337,8 +699,8 @@ test("explicit redispatch reconciles a saved schedule only after its response", 
   expect(processor.calls).toHaveLength(1);
   expect(storedTask(storage)).toBeDefined();
   reply(processor, 0, { type: "retryAt", atMs: Date.now() + 10_000 });
-  await waitFor(() => storedTask(storage)?.taskName === "corrected");
-  await expectRedispatchAllowed(dispatcher, "id");
+  await waitFor(() => storedTask(storage)?.task.taskName === "corrected");
+  await expectRedispatchAllowed(dispatcher, processor, "id");
   reply(processor, 1, { type: "done" });
   await waitFor(() => !storedTask(storage));
 });
@@ -453,13 +815,13 @@ test.each([
   await successor.fetch(dispatchRequest("id"));
   reply(processor, 1, { type: "done" });
   await waitFor(() => !storedTask(storage));
-  await expectRedispatchAllowed(successor, "id", "new");
+  await expectRedispatchAllowed(successor, processor, "id", "new");
   const current = structuredClone(storedTask(storage));
   if (action === "body-error") body.fail(new Error("late body error"));
   else
     body.finish(
       JSON.stringify({
-        taskId: "id",
+        task: { kind: "published", taskId: "id", taskName: "contract" },
         nextAction:
           action === "done" ? { type: "done" } : { type: "retryAt", atMs: 0 },
       }),
@@ -468,9 +830,7 @@ test.each([
   await original.alarm();
   expect(storedTask(storage)).toEqual(current);
   await expectJson(await successor.fetch(dispatchRequest("id", "wrong")), 200, {
-    duplicate: true,
     ok: true,
-    taskId: "id",
   });
   expect(processor.calls).toHaveLength(3);
   await finish(processor, 2);
@@ -495,8 +855,7 @@ test("later results and duplicate acknowledgements cannot postpone earlier deadl
 });
 
 interface StoredTask {
-  taskId: string;
-  taskName: string;
+  task: TaskIdentity;
   nextAttemptAtMs: number;
   infrastructureFailures: number;
   state: { type: "pending" } | { type: "running"; attemptId: number };
@@ -506,7 +865,7 @@ function storedTask(
   storage: FakeAlarmStorage,
   id = "id",
 ): StoredTask | undefined {
-  return storage.records.get(`task:${id}`) as StoredTask | undefined;
+  return storage.records.get(`task:published:${id}`) as StoredTask | undefined;
 }
 
 function reply(
@@ -516,9 +875,7 @@ function reply(
 ): void {
   const call = processor.calls[index];
   if (!call) throw new Error("missing processor call");
-  call.response.resolve(
-    Response.json({ taskId: call.taskId, nextAction: action }),
-  );
+  call.response.resolve(Response.json({ task: call.task, nextAction: action }));
 }
 
 test("future hints survive reconstruction, preserve heartbeat, and remove only on done", async () => {
@@ -586,13 +943,16 @@ test.each([
   await dispatcher.fetch(dispatchRequest("id", "must-not-replace"));
   expect(processor.calls).toHaveLength(3);
   expect(await processor.calls[2]?.request.json()).toEqual({
-    taskId: "id",
-    taskName: "corrected",
+    task: {
+      kind: "published",
+      taskId: "id",
+      taskName: "corrected",
+    },
   });
-  expect(storedTask(storage)?.taskName).toBe("old");
+  expect(storedTask(storage)?.task.taskName).toBe("old");
   reply(processor, 2, { type: "done" });
   await waitFor(() => !storedTask(storage));
-  await expectRedispatchAllowed(dispatcher, "id");
+  await expectRedispatchAllowed(dispatcher, processor, "id");
   expect(storedTask(storage)?.state).not.toEqual(first);
   await finish(processor, 3);
 });
@@ -608,9 +968,12 @@ test("all 300 due IDs launch while every processor response is gated", async () 
     nextAttemptId: 0,
   });
   for (let id = 0; id < 300; id++) {
-    storage.records.set(`task:${id}`, {
-      taskId: String(id),
-      taskName: id % 2 ? "first" : "second",
+    storage.records.set(`task:published:${id}`, {
+      task: {
+        kind: "published",
+        taskId: String(id),
+        taskName: id % 2 ? "first" : "second",
+      },
       state: { type: "pending" },
       infrastructureFailures: 0,
       nextAttemptAtMs: now + 1_000,
@@ -623,7 +986,7 @@ test("all 300 due IDs launch while every processor response is gated", async () 
   await dispatcher.alarm();
   expect(processor.calls).toHaveLength(300);
   for (const record of storage.records.values()) {
-    if ("taskId" in (record as object))
+    if ("task" in (record as object))
       expect((record as StoredTask).state.type).toBe("running");
   }
 });
@@ -636,9 +999,19 @@ test.each([
   '{"taskId":"id","attemptFinished":true}',
   '{"taskId":"other","nextAction":{"type":"done"}}',
   '{"taskId":"id","nextAction":{"type":"unknown"}}',
+  ...[
+    { kind: "published", taskId: "other", taskName: "contract" },
+    { kind: "published", taskId: "id", taskName: "contract " },
+    { kind: "singleton", taskName: "contract" },
+    { kind: "published", taskId: "id", taskName: "contract", extra: true },
+    { kind: "publish", taskId: "id", taskName: "contract" },
+  ].map((task) => JSON.stringify({ task, nextAction: { type: "done" } })),
   ...[-1, 0.5, 8_640_000_000_000_001, 9_007_199_254_740_992, "1", null].map(
     (atMs) =>
-      JSON.stringify({ taskId: "id", nextAction: { type: "retryAt", atMs } }),
+      JSON.stringify({
+        task: { kind: "published", taskId: "id", taskName: "contract" },
+        nextAction: { type: "retryAt", atMs },
+      }),
   ),
 ])("uncertain response %s remains durable with infrastructure backoff", async (body) => {
   vi.spyOn(console, "error").mockImplementation(() => undefined);
@@ -717,7 +1090,7 @@ test("corrupt current records never become an empty queue", async () => {
   for (const [key, value] of [
     ["scheduler", {}],
     ["scheduler", null],
-    ["task:id", { taskId: "id" }],
+    ["task:published:id", { taskId: "id" }],
   ] as const) {
     const storage = new FakeAlarmStorage();
     storage.records.set(key, value);
@@ -741,7 +1114,7 @@ test("dispatchTask targets the global object and consumes the response", async (
   await waitFor(() => control.response.bodyUsed);
   expect(accepted).toBe(false);
 
-  control.finish("accepted");
+  control.finish(JSON.stringify({ ok: true }));
   await dispatch;
   await control.consumed;
 
@@ -753,8 +1126,12 @@ test("dispatchTask targets the global object and consumes the response", async (
     "application/json",
   );
   expect(await namespace.stub.requests[0]?.json()).toEqual({
-    taskId: "123",
-    taskName: "contract",
+    tasks: [
+      {
+        task: { kind: "published", taskId: "123", taskName: "contract" },
+        intent: "run",
+      },
+    ],
   });
   expect(namespace.stub.response.bodyUsed).toBe(true);
 });
@@ -789,43 +1166,40 @@ test("retained dispatch accepts before processor completion and observes its res
   await waitFor(() => processor.calls.length === 1);
   const acceptance = await acceptancePromise;
 
-  await expectJson(acceptance, 200, {
-    ok: true,
-    taskId: "task-1",
-  });
+  await expectJson(acceptance, 200, { ok: true });
   expect(processor.calls[0]?.request.url).toBe("https://processor/process");
   expect(processor.calls[0]?.request.method).toBe("POST");
   expect(processor.calls[0]?.request.headers.get("content-type")).toBe(
     "application/json",
   );
   expect(await processor.calls[0]?.request.json()).toEqual({
-    taskId: "task-1",
-    taskName: "contract",
+    task: {
+      kind: "published",
+      taskId: "task-1",
+      taskName: "contract",
+    },
   });
 
   const duplicate = await dispatcher.fetch(dispatchRequest("task-1", "other"));
   expect(duplicate.status).toBe(200);
-  expect(await duplicate.json()).toEqual({
-    duplicate: true,
-    ok: true,
-    taskId: "task-1",
-  });
+  expect(await duplicate.json()).toEqual({ ok: true });
   expect(processor.calls).toHaveLength(1);
 
   const control = controlledResponse();
   processor.calls[0]?.response.resolve(control.response);
   await waitFor(() => control.response.bodyUsed);
   await expectJson(await dispatcher.fetch(dispatchRequest("task-1")), 200, {
-    duplicate: true,
     ok: true,
-    taskId: "task-1",
   });
   expect(processor.calls).toHaveLength(1);
   control.finish(
-    JSON.stringify({ taskId: "task-1", nextAction: { type: "done" } }),
+    JSON.stringify({
+      task: { kind: "published", taskId: "task-1", taskName: "contract" },
+      nextAction: { type: "done" },
+    }),
   );
   await control.consumed;
-  await expectRedispatchAllowed(dispatcher, "task-1");
+  await expectRedispatchAllowed(dispatcher, processor, "task-1");
   expect(processor.calls).toHaveLength(2);
   await finish(processor, 1);
 });
@@ -848,8 +1222,8 @@ test("different task IDs can retain concurrent processor requests", async () => 
   expect(
     await Promise.all(processor.calls.map(({ request }) => request.json())),
   ).toEqual([
-    { taskId: "task-1", taskName: "contract" },
-    { taskId: "task-2", taskName: "other" },
+    { task: { kind: "published", taskId: "task-1", taskName: "contract" } },
+    { task: { kind: "published", taskId: "task-2", taskName: "other" } },
   ]);
 
   await Promise.all([finish(processor, 0), finish(processor, 1)]);
@@ -896,9 +1270,7 @@ test.each([
   await waitFor(() => control.response.bodyUsed);
   expect(log).not.toHaveBeenCalled();
   await expectJson(await dispatcher.fetch(dispatchRequest("task-1")), 200, {
-    duplicate: true,
     ok: true,
-    taskId: "task-1",
   });
   const message = status === 404 ? '{"error":"unknown task name"}' : "failed";
   control.finish(message);
@@ -906,11 +1278,11 @@ test.each([
   await waitFor(() => log.mock.calls.length === 1);
   expect(log).toHaveBeenCalledWith(
     "task processor failed",
-    "task-1",
+    "published",
     `task processor returned HTTP ${status}: ${message}`,
   );
 
-  await expectRedispatchAllowed(dispatcher, "task-1");
+  await expectRedispatchAllowed(dispatcher, processor, "task-1");
   expect(processor.calls).toHaveLength(2);
   await finish(processor, 1);
 });
@@ -934,7 +1306,14 @@ test("generic IDs use UTF-16 limits and round trip without numeric parsing", asy
     const namespace = new RecordingNamespace();
     await dispatchTask(namespace, "contract", taskId);
     const body = await namespace.stub.requests[0]?.text();
-    expect(JSON.parse(body ?? "")).toEqual({ taskId, taskName: "contract" });
+    expect(JSON.parse(body ?? "")).toEqual({
+      tasks: [
+        {
+          task: { kind: "published", taskId, taskName: "contract" },
+          intent: "run",
+        },
+      ],
+    });
     const processor = new DeferredProcessor();
     const dispatcher = new RetainedTaskDispatcher(
       new FakeAlarmStorage(),
@@ -945,10 +1324,7 @@ test("generic IDs use UTF-16 limits and round trip without numeric parsing", asy
       headers: { "content-type": "Application/JSON; charset=utf-8" },
       body,
     });
-    await expectJson(await dispatcher.fetch(request), 200, {
-      ok: true,
-      taskId,
-    });
+    await expectJson(await dispatcher.fetch(request), 200, { ok: true });
     await finish(processor, 0);
   }
 });
@@ -1005,8 +1381,8 @@ test("invalid routes and inputs do not launch work or schedule alarms", async ()
   ]) {
     const error =
       body !== null && typeof body === "object" && !Array.isArray(body)
-        ? "taskId must be a non-empty string no longer than 200 characters"
-        : "request body must be a JSON object";
+        ? "request must contain a tasks array"
+        : "invalid dispatcher state or processor response";
     const request = new Request("https://dispatcher/dispatch", {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -1048,16 +1424,12 @@ test("dispatch only repairs a missing or too-late heartbeat alarm", async () => 
     const dispatcher = new RetainedTaskDispatcher(storage, processor);
     const expected =
       alarm === null || alarm > now + 30_000 ? [now + 30_000] : [];
-    for (const duplicate of [false, true]) {
+    for (const _duplicate of [false, true]) {
       storage.alarm = alarm;
       storage.scheduledAlarms.length = 0;
-      await expectJson(
-        await dispatcher.fetch(dispatchRequest("task-1")),
-        200,
-        duplicate
-          ? { duplicate: true, ok: true, taskId: "task-1" }
-          : { ok: true, taskId: "task-1" },
-      );
+      await expectJson(await dispatcher.fetch(dispatchRequest("task-1")), 200, {
+        ok: true,
+      });
       expect(storage.scheduledAlarms).toEqual(expected);
     }
     await finish(processor, 0);
@@ -1078,7 +1450,7 @@ test.each([
     dispatchTask(namespace, taskName as string, "17"),
   ).rejects.toThrow("taskName must be a non-empty string");
   await expect(dispatchTask(namespace, taskName as string, "")).rejects.toThrow(
-    "taskId must be a non-empty string no longer than 200 characters",
+    "taskName must be a non-empty string",
   );
   expect(namespace.names).toEqual([]);
   const storage = new FakeAlarmStorage();
@@ -1087,7 +1459,11 @@ test.each([
   const input = new Request("https://dispatcher/dispatch", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ taskId: "17", taskName }),
+    body: JSON.stringify({
+      tasks: [
+        { task: { kind: "published", taskId: "17", taskName }, intent: "run" },
+      ],
+    }),
   });
   await expectJson(await dispatcher.fetch(input), 400, {
     error: "taskName must be a non-empty string",
@@ -1106,7 +1482,14 @@ test.each([
   const namespace = new RecordingNamespace();
   await dispatchTask(namespace, taskName, "opaque");
   const body = await namespace.stub.requests[0]?.json();
-  expect(body).toEqual({ taskId: "opaque", taskName });
+  expect(body).toEqual({
+    tasks: [
+      {
+        task: { kind: "published", taskId: "opaque", taskName },
+        intent: "run",
+      },
+    ],
+  });
   const processor = new DeferredProcessor();
   const dispatcher = new RetainedTaskDispatcher(
     new FakeAlarmStorage(),
@@ -1117,13 +1500,15 @@ test.each([
       new Request("https://dispatcher/dispatch", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ ...body, payload: { untrusted: true } }),
+        body: JSON.stringify(body),
       }),
     ),
     200,
-    { ok: true, taskId: "opaque" },
+    { ok: true },
   );
-  expect(await processor.calls[0]?.request.json()).toEqual(body);
+  expect(await processor.calls[0]?.request.json()).toEqual({
+    task: body.tasks[0].task,
+  });
   await finish(processor, 0);
 });
 
@@ -1149,10 +1534,10 @@ test("rejected processor fetches and body reads are retained and permit explicit
     await waitFor(() => log.mock.calls.length === 1);
     expect(log).toHaveBeenCalledWith(
       "task processor failed",
-      "task-1",
+      "published",
       status === null ? "fetch rejected" : "body read rejected",
     );
-    await expectRedispatchAllowed(dispatcher, "task-1");
+    await expectRedispatchAllowed(dispatcher, processor, "task-1");
     expect(processor.calls).toHaveLength(2);
     await finish(processor, 1);
   }
@@ -1214,7 +1599,7 @@ test("diagnostic truncation is Unicode-safe and never limits body consumption", 
     await waitFor(() => log.mock.calls.length === 1);
     expect(log).toHaveBeenCalledWith(
       "task processor failed",
-      "id",
+      "published",
       `${prefix}${"a".repeat(499 - prefix.length)}`,
     );
   }
@@ -1246,9 +1631,7 @@ test("request-read and storage errors use the existing error envelope", async ()
   storage.getError = null;
   storage.setError = null;
   await expectJson(await dispatcher.fetch(dispatchRequest("id")), 200, {
-    duplicate: true,
     ok: true,
-    taskId: "id",
   });
   expect(processor.calls).toHaveLength(1);
   await finish(processor, 0);
@@ -1275,16 +1658,9 @@ test("launch precedes heartbeat storage and never persists acceptance", async ()
   await waitFor(() => processor.calls.length === 2);
   expect(storage.records.size).toBe(0);
   gate.resolve(undefined);
-  await expectJson(await acceptance, 200, { ok: true, taskId: "id" });
-  await expectJson(await duplicate, 200, {
-    duplicate: true,
-    ok: true,
-    taskId: "id",
-  });
-  await expectJson(await other, 200, {
-    ok: true,
-    taskId: "other",
-  });
+  await expectJson(await acceptance, 200, { ok: true });
+  await expectJson(await duplicate, 200, { ok: true });
+  await expectJson(await other, 200, { ok: true });
   await finish(processor, 0);
   await finish(processor, 1);
 });
@@ -1297,11 +1673,12 @@ test("synchronously thrown processor errors are logged and permit explicit redis
     },
   });
   for (const count of [1, 2]) {
-    await expectRedispatchAllowed(dispatcher, "id");
+    await waitFor(() => count === 1 || log.mock.calls.length === count - 1);
+    await dispatcher.fetch(dispatchRequest("id"));
     await waitFor(() => log.mock.calls.length === count);
     expect(log).toHaveBeenLastCalledWith(
       "task processor failed",
-      "id",
+      "published",
       "fetch threw",
     );
   }

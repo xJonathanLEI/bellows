@@ -1,9 +1,11 @@
-import { afterEach, beforeEach, expect, test } from "vitest";
+import { afterEach, beforeEach, describe, expect, test } from "vitest";
 import {
   type CloudflarePostgresFixture,
+  type CloudflareProjects,
   type ConsumedResponse,
   poll,
 } from "./postgres-fixture.js";
+import { singletonTopology } from "./singleton-topology.js";
 
 const json = (body: unknown) => ({
   method: "POST",
@@ -12,6 +14,15 @@ const json = (body: unknown) => ({
 });
 
 export function cloudflareTopology(
+  createFixture: (
+    singleton?: CloudflareProjects["singleton"],
+  ) => CloudflarePostgresFixture,
+): void {
+  describe("published", () => publishedTopology(() => createFixture()));
+  singletonTopology(createFixture);
+}
+
+function publishedTopology(
   createFixture: () => CloudflarePostgresFixture,
 ): void {
   let fixture: CloudflarePostgresFixture;
@@ -29,10 +40,11 @@ export function cloudflareTopology(
     nextAction: { type: "done" } | { type: "retryAt"; atMs: number } = {
       type: "done",
     },
+    taskName = "cloudflare_greeting",
   ): void {
     expect(response.status, response.body).toBe(200);
     expect(JSON.parse(response.body)).toEqual({
-      taskId,
+      task: { kind: "published", taskId, taskName },
       nextAction,
     });
   }
@@ -171,12 +183,23 @@ export function cloudflareTopology(
       const response = await fixture.consume(
         fixture.processor.fetch(
           "/process",
-          json({ taskId, taskName: "cloudflare_scheduling" }),
+          json({
+            task: {
+              kind: "published",
+              taskId,
+              taskName: "cloudflare_scheduling",
+            },
+          }),
         ),
         "direct attempt with deliberately lost scheduling hint",
       );
       const action = JSON.parse(response.body).nextAction;
-      assertAttempt(response, taskId, { type: "retryAt", atMs: action.atMs });
+      assertAttempt(
+        response,
+        taskId,
+        { type: "retryAt", atMs: action.atMs },
+        "cloudflare_scheduling",
+      );
       expect(action.atMs).toBeGreaterThanOrEqual(atMs);
       expect(action.atMs).toBeLessThanOrEqual(atMs + 1);
       await fixture.waitForIdle();
@@ -290,7 +313,7 @@ export function cloudflareTopology(
     await completed([{ taskId, name: "After repair" }]);
   });
 
-  test("Cron preserves unsupported exact identities, excludes singletons and isolates the configured schema", async () => {
+  test("Cron preserves unsupported exact identities and future singleton rows and isolates the configured schema", async () => {
     const otherSchema = `${fixture.schema}_other`;
     await fixture.admin.query(`CREATE SCHEMA "${otherSchema}"`);
     try {
@@ -319,10 +342,10 @@ export function cloudflareTopology(
         );
       }
       await fixture.admin.query(
-        `INSERT INTO ${fixture.table} (task_id, task_name, payload_json, task_unique_key)
+        `INSERT INTO ${fixture.table} (task_id, task_name, payload_json, task_unique_key, available_from_unix_ms)
          OVERRIDING SYSTEM VALUE
-         VALUES (1, '', 'not JSON', NULL),
-                (2, 'cloudflare_greeting', 'not JSON', 'singleton')`,
+         VALUES (1, '', 'not JSON', NULL, NULL),
+                (2, ' singleton:7 🦀 ', 'null', ' singleton:7 🦀 ', 9223372036854775807)`,
       );
       await nextTaskId("3");
       const taskId = await seed("cloudflare_full_name", {
@@ -370,7 +393,7 @@ export function cloudflareTopology(
       `persisted pending instruction for ${taskId}`,
       () => fixture.schedule(),
       ({ tasks }) => {
-        const task = tasks[`task:${taskId}`];
+        const task = tasks[`task:published:${taskId}`];
         return (
           task?.state.type === "pending" &&
           (atMs === undefined ||
@@ -378,7 +401,7 @@ export function cloudflareTopology(
         );
       },
     );
-    return state.tasks[`task:${taskId}`];
+    return state.tasks[`task:published:${taskId}`];
   }
 
   async function forgotten() {
@@ -416,7 +439,7 @@ export function cloudflareTopology(
     );
     expect(extended.now).toBeLessThan(secondExpiration);
     expect(extended.alarm).toBe(
-      extended.tasks[`task:${taskId}`].nextAttemptAtMs,
+      extended.tasks[`task:published:${taskId}`].nextAttemptAtMs,
     );
     expect((await fixture.state()).tasks[0].lease_worker_id).toBe("123");
     expect(await fixture.activeRequestClients()).toHaveLength(0);
@@ -503,7 +526,9 @@ export function cloudflareTopology(
     );
     await gate.blocked(1);
     const running = await fixture.schedule();
-    expect(running.tasks[`task:${taskId}`].state.type).toBe("running");
+    expect(running.tasks[`task:published:${taskId}`].state.type).toBe(
+      "running",
+    );
     const dispatcher = await fixture.dispatcher();
     await fixture.consume(
       dispatcher.fetch("https://dispatcher/__test/reconstruct"),
@@ -520,18 +545,22 @@ export function cloudflareTopology(
     expect(retry.infrastructureFailures).toBe(1);
     expectedLogs.push({
       level: "error",
-      message: `task processor failed ${taskId} task processor returned HTTP 503: fixture response lost`,
+      message: `task processor failed published task processor returned HTTP 503: fixture response lost`,
     });
     await fixture.consume(
       dispatcher.fetch("https://dispatcher/__test/reconstruct"),
       "reconstruct the persisted infrastructure retry",
     );
-    expect((await fixture.schedule()).tasks[`task:${taskId}`]).toEqual(retry);
+    expect(
+      (await fixture.schedule()).tasks[`task:published:${taskId}`],
+    ).toEqual(retry);
     // Automatic retry observes the missing PostgreSQL row; no new business worker is built.
     const missingGate = await fixture.gate("bellows_tasks");
     const pids = await missingGate.blocked(1);
     const retrying = await fixture.schedule();
-    expect(retrying.tasks[`task:${taskId}`].state.type).toBe("running");
+    expect(retrying.tasks[`task:published:${taskId}`].state.type).toBe(
+      "running",
+    );
     expect(retrying.metadata.nextAttemptId).toBeGreaterThan(
       running.metadata.nextAttemptId,
     );
@@ -596,15 +625,18 @@ export function cloudflareTopology(
     const pending = await poll(
       "committed future hint",
       inspect,
-      (state) => state.tasks[`task:${taskId}`]?.state.type === "pending",
+      (state) =>
+        state.tasks[`task:published:${taskId}`]?.state.type === "pending",
     );
     expect(
-      pending.tasks[`task:${taskId}`].nextAttemptAtMs,
+      pending.tasks[`task:published:${taskId}`].nextAttemptAtMs,
     ).toBeGreaterThanOrEqual(atMs);
-    expect(pending.tasks[`task:${taskId}`].nextAttemptAtMs).toBeLessThanOrEqual(
-      atMs + 1,
+    expect(
+      pending.tasks[`task:published:${taskId}`].nextAttemptAtMs,
+    ).toBeLessThanOrEqual(atMs + 1);
+    expect(pending.alarm).toBe(
+      pending.tasks[`task:published:${taskId}`].nextAttemptAtMs,
     );
-    expect(pending.alarm).toBe(pending.tasks[`task:${taskId}`].nextAttemptAtMs);
     expect(pending.now).toBeLessThan(atMs);
     expect((await fixture.state()).tasks[0].lease_worker_id).toBeNull();
     expect((await fixture.state()).tasks[0].available_from_unix_ms).toBe(
@@ -695,27 +727,25 @@ export function cloudflareTopology(
     const response = await fixture.consume(
       dispatcher.fetch(
         "https://dispatcher/dispatch",
-        json({ taskId, taskName }),
+        json({
+          tasks: [
+            { task: { kind: "published", taskId, taskName }, intent: "run" },
+          ],
+        }),
       ),
       `Durable Object acceptance for ${taskId}`,
     );
     expect(response.status, response.body).toBe(200);
     const body = JSON.parse(response.body) as {
       ok: boolean;
-      taskId: string;
-      duplicate?: boolean;
     };
-    expect(body).toMatchObject({ ok: true, taskId });
+    expect(body).toMatchObject({ ok: true });
     return body;
   }
 
   async function redispatch(taskName: string, taskId: string) {
-    const response = await poll(
-      `dispatcher to release the previous attempt for ${taskId}`,
-      () => dispatch(taskName, taskId),
-      (body) => body.duplicate !== true,
-    );
-    expect(response).toEqual({ ok: true, taskId });
+    await fixture.waitForIdle();
+    expect(await dispatch(taskName, taskId)).toEqual({ ok: true });
   }
 
   async function claimed(
@@ -901,8 +931,6 @@ export function cloudflareTopology(
     );
     expect(await dispatch("cloudflare_greeting", firstId)).toEqual({
       ok: true,
-      taskId: firstId,
-      duplicate: true,
     });
 
     const secondId = await publish("/full-names", fullName);
@@ -918,11 +946,7 @@ export function cloudflareTopology(
     await gate.blocked(2);
     for (const taskId of [firstId, secondId]) {
       for (const taskName of ["cloudflare_greeting", "cloudflare_full_name"]) {
-        expect(await dispatch(taskName, taskId)).toEqual({
-          ok: true,
-          taskId,
-          duplicate: true,
-        });
+        expect(await dispatch(taskName, taskId)).toEqual({ ok: true });
       }
     }
     await gate.blocked(2);
@@ -956,9 +980,7 @@ export function cloudflareTopology(
       fixture.processor.fetch(
         "/process",
         json({
-          taskId,
-          taskName: "cloudflare_greeting",
-          payload: { name: "Not the persisted definition or payload" },
+          task: { kind: "published", taskId, taskName: "cloudflare_greeting" },
         }),
       ),
       "mismatched definition attempt and complete backend shutdown",
@@ -970,7 +992,6 @@ export function cloudflareTopology(
     const gate = await fixture.gate();
     expect(await dispatch("cloudflare_full_name", taskId)).toEqual({
       ok: true,
-      taskId,
     });
     await claimed(taskId, "cloudflare_full_name", JSON.stringify(payload));
     await gate.blocked(1);
@@ -997,9 +1018,7 @@ export function cloudflareTopology(
       fixture.processor.fetch(
         "/process",
         json({
-          taskId,
-          taskName: "cloudflare_greeting",
-          payload: { name: "Not the claimed payload" },
+          task: { kind: "published", taskId, taskName: "cloudflare_greeting" },
         }),
       ),
       "competing processor attempt to finish without claiming or writing",
@@ -1041,7 +1060,9 @@ export function cloudflareTopology(
     const response = fixture.consume(
       fixture.processor.fetch(
         "/process",
-        json({ taskId, taskName: "cloudflare_greeting" }),
+        json({
+          task: { kind: "published", taskId, taskName: "cloudflare_greeting" },
+        }),
       ),
       "future scheduling instruction after blocked claim and backend shutdown",
     );
@@ -1173,7 +1194,8 @@ ADD CONSTRAINT reject_retry_name CHECK (name <> 'Retry after repair')
       ],
       ["/process", { ...json({}), body: "{" }, 400, "invalid JSON"],
       ...[null, [], "1", {}, { taskId: 1 }].map(
-        (body) => ["/process", json(body), 400, canonicalError] as const,
+        (body) =>
+          ["/process", json(body), 400, "invalid task identity"] as const,
       ),
       ...[
         "",
@@ -1197,14 +1219,26 @@ ADD CONSTRAINT reject_retry_name CHECK (name <> 'Retry after repair')
         (taskId) =>
           [
             "/process",
-            json({ taskId, taskName: "cloudflare_greeting" }),
+            json({
+              task: {
+                kind: "published",
+                taskId,
+                taskName: "cloudflare_greeting",
+              },
+            }),
             400,
             canonicalError,
           ] as const,
       ),
       [
         "/process",
-        json({ taskId: "9007199254740992" }),
+        json({
+          task: {
+            kind: "published",
+            taskId: "9007199254740992",
+            taskName: "cloudflare_greeting",
+          },
+        }),
         400,
         "taskId must encode a positive safe integer canonically",
       ],
@@ -1224,9 +1258,11 @@ ADD CONSTRAINT reject_retry_name CHECK (name <> 'Retry after repair')
         fixture.processor.fetch(
           "/process",
           json({
-            taskId,
-            taskName: "cloudflare_greeting",
-            payload: { name: "Ignored" },
+            task: {
+              kind: "published",
+              taskId,
+              taskName: "cloudflare_greeting",
+            },
           }),
         ),
         `safe-integer boundary ${taskId} with no task to claim`,
@@ -1240,13 +1276,10 @@ ADD CONSTRAINT reject_retry_name CHECK (name <> 'Retry after repair')
     const expectedError = {
       level: "error",
       message:
-        `task processor failed ${taskId} task processor returned HTTP 400: ` +
+        `task processor failed published task processor returned HTTP 400: ` +
         '{"error":"taskId must be a canonical positive decimal string"}',
     };
-    expect(await dispatch("cloudflare_greeting", taskId)).toEqual({
-      ok: true,
-      taskId,
-    });
+    expect(await dispatch("cloudflare_greeting", taskId)).toEqual({ ok: true });
     await poll(
       "captured real processor rejection",
       () => fixture.server.getLogs(),
@@ -1277,12 +1310,29 @@ ADD CONSTRAINT reject_retry_name CHECK (name <> 'Retry after repair')
         [fixture.processor, "/process"],
       ] as const) {
         const response = await fixture.consume(
-          target.fetch(path, json({ taskId, taskName })),
+          target.fetch(
+            path,
+            json(
+              target === dispatcher
+                ? {
+                    tasks: [
+                      {
+                        task: { kind: "published", taskId, taskName },
+                        intent: "run",
+                      },
+                    ],
+                  }
+                : { task: { kind: "published", taskId, taskName } },
+            ),
+          ),
           `invalid task name ${JSON.stringify(taskName)} at ${path}`,
         );
         expect(response.status, response.body).toBe(400);
         expect(JSON.parse(response.body)).toEqual({
-          error: "taskName must be a non-empty string",
+          error:
+            target === dispatcher
+              ? expect.any(String)
+              : "invalid task identity",
           ...(target === dispatcher ? { ok: false } : {}),
         });
         expect(await fixture.state()).toEqual(unclaimed);
@@ -1296,7 +1346,10 @@ ADD CONSTRAINT reject_retry_name CHECK (name <> 'Retry after repair')
       "__proto__",
     ]) {
       const response = await fixture.consume(
-        fixture.processor.fetch("/process", json({ taskId, taskName })),
+        fixture.processor.fetch(
+          "/process",
+          json({ task: { kind: "published", taskId, taskName } }),
+        ),
         `unknown task name ${taskName}`,
       );
       expect(response.status, response.body).toBe(404);
@@ -1307,14 +1360,11 @@ ADD CONSTRAINT reject_retry_name CHECK (name <> 'Retry after repair')
       expect(await fixture.activeRequestClients()).toHaveLength(0);
     }
 
-    expect(await dispatch("cloudflare_unknown", taskId)).toEqual({
-      ok: true,
-      taskId,
-    });
+    expect(await dispatch("cloudflare_unknown", taskId)).toEqual({ ok: true });
     const expectedError = {
       level: "error",
       message:
-        `task processor failed ${taskId} task processor returned HTTP 404: ` +
+        `task processor failed published task processor returned HTTP 404: ` +
         '{"error":"unknown task name"}',
     };
     await poll(

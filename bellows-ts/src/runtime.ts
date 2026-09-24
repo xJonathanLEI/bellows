@@ -241,7 +241,9 @@ export async function runTaskOnce<TTask extends TaskDefinition>(
   backend: TaskExecutionBackend,
   factory: WorkerFactory<TTask>,
   workerId: number,
-  dispatchToken: PublishDispatchToken,
+  dispatchToken: TTask extends { readonly kind: "singleton" }
+    ? undefined
+    : PublishDispatchToken,
 ): Promise<TaskAttemptOutcome> {
   const runtime = new WorkerRuntime(
     backend,

@@ -1,7 +1,8 @@
 import { PostgresExecutionBackend } from "../backends/postgres-execution.js";
 import type { PostgresBackendOptions } from "../backends/postgres-operations.js";
 import { runTaskOnce, type TaskAttemptOutcome } from "../runtime.js";
-import type { PublishTaskDefinition, WorkerFactory } from "../types.js";
+import type { TaskDefinition, WorkerFactory } from "../types.js";
+import { type TaskIdentity, taskIdentity } from "./protocol.js";
 
 export {
   createPostgresPublisher,
@@ -12,6 +13,7 @@ export {
 } from "./postgres-publisher.js";
 export {
   createPostgresSweeper,
+  type PostgresSweepCandidate,
   type PostgresSweeperConfig,
   PostgresSweeperError,
   type PostgresSweeperStage,
@@ -20,23 +22,34 @@ export {
 
 const executeTask = Symbol("executeTask");
 
-/** A typed published factory registered under its definition's exact name. */
+/** A typed factory registered under its definition's exact name and kind. */
 export interface PostgresProcessorTask {
   readonly name: string;
+  readonly kind: TaskIdentity["kind"];
   readonly [executeTask]: (
     backend: PostgresExecutionBackend,
     workerId: number,
-    taskId: number,
+    taskId: number | undefined,
   ) => Promise<TaskAttemptOutcome>;
 }
 
-export function createPostgresProcessorTask<
-  TTask extends PublishTaskDefinition<unknown, unknown>,
->(factory: WorkerFactory<TTask>): PostgresProcessorTask {
+export function createPostgresProcessorTask<TTask extends TaskDefinition>(
+  factory: WorkerFactory<TTask>,
+): PostgresProcessorTask {
   return {
     name: factory.task.name,
+    kind: factory.task.kind === "publish" ? "published" : "singleton",
     [executeTask]: (backend, workerId, taskId) =>
-      runTaskOnce(backend, factory, workerId, { type: "task", taskId }),
+      runTaskOnce(
+        backend,
+        factory,
+        workerId,
+        (factory.task.kind === "singleton" || taskId === undefined
+          ? undefined
+          : { type: "task", taskId }) as Parameters<
+          typeof runTaskOnce<TTask>
+        >[3],
+      ),
   };
 }
 
@@ -54,12 +67,14 @@ export interface PostgresProcessorConfig extends PostgresBackendOptions {
 }
 
 /**
- * Delegates POST `/process` with `{ taskId, taskName }` to typed published factories.
+ * Delegates POST `/process` with `{ task: TaskIdentity }` to typed factories.
  *
- * Unknown names return 404 without acquisition; claims still check the persisted definition name.
+ * Unknown names or mismatched kinds return 404 without acquisition. Claims precede construction;
+ * singleton workers receive undefined payloads and the actual backend-managed row ID.
  * Configuration is synchronous and runs only after validation, once per request.
  * Connections are request-scoped; application cleanup and Bellows shutdown are awaited.
  * HTTP 200 reports `nextAction`: `done` or `retryAt` with absolute Unix `atMs`, not business success.
+ * The response echoes the full identity. Singleton success without a deadline retries immediately.
  * Uncertain runtime outcomes return a sanitized HTTP 500. This does not cancel
  * arbitrary promises, extend request lifetime, or retry tasks.
  * If configuration throws before returning, it owns its partially created resources.
@@ -95,33 +110,41 @@ export function createPostgresProcessor<TEnv>(
       } catch {
         return errorResponse(400, "invalid JSON");
       }
-      if (
-        body === null ||
-        typeof body !== "object" ||
-        Array.isArray(body) ||
-        !("taskId" in body) ||
-        typeof body.taskId !== "string" ||
+      let identity: TaskIdentity;
+      try {
+        if (
+          body === null ||
+          typeof body !== "object" ||
+          Array.isArray(body) ||
+          !("task" in body) ||
+          Object.keys(body).length !== 1
+        )
+          throw new Error("invalid task envelope");
+        identity = taskIdentity(body.task);
+      } catch {
+        return errorResponse(400, "invalid task identity");
+      }
+      let taskId: number | undefined;
+      if (identity.kind === "published") {
         // `$` also matches before a final newline; require the complete string.
-        /^[1-9][0-9]{0,15}$/.exec(body.taskId)?.[0] !== body.taskId
-      ) {
-        return errorResponse(
-          400,
-          "taskId must be a canonical positive decimal string",
-        );
-      }
-      const taskId = Number(body.taskId);
-      if (!Number.isSafeInteger(taskId) || String(taskId) !== body.taskId) {
-        return errorResponse(
-          400,
-          "taskId must encode a positive safe integer canonically",
-        );
-      }
-      if (
-        !("taskName" in body) ||
-        typeof body.taskName !== "string" ||
-        body.taskName.length === 0
-      ) {
-        return errorResponse(400, "taskName must be a non-empty string");
+        if (
+          /^[1-9][0-9]{0,15}$/.exec(identity.taskId)?.[0] !== identity.taskId
+        ) {
+          return errorResponse(
+            400,
+            "taskId must be a canonical positive decimal string",
+          );
+        }
+        taskId = Number(identity.taskId);
+        if (
+          !Number.isSafeInteger(taskId) ||
+          String(taskId) !== identity.taskId
+        ) {
+          return errorResponse(
+            400,
+            "taskId must encode a positive safe integer canonically",
+          );
+        }
       }
 
       let config: PostgresProcessorConfig | undefined;
@@ -136,7 +159,9 @@ export function createPostgresProcessor<TEnv>(
       const failure = (stage: string) => {
         failed = true;
         // Never log configuration, driver errors, or request-supplied properties.
-        console.error(`task processing attempt failed ${taskId} ${stage}`);
+        console.error(
+          `task processing attempt failed ${identity.kind} ${stage}`,
+        );
       };
       try {
         config = configure(env);
@@ -152,8 +177,8 @@ export function createPostgresProcessor<TEnv>(
           }
           tasks.set(task.name, task);
         }
-        const task = tasks.get(body.taskName);
-        if (!task) {
+        const task = tasks.get(identity.taskName);
+        if (!task || task.kind !== identity.kind) {
           unknownName = true;
         } else {
           stage = "worker-id";
@@ -205,7 +230,7 @@ export function createPostgresProcessor<TEnv>(
         ? errorResponse(500, "task processing attempt failed")
         : unknownName
           ? errorResponse(404, "unknown task name")
-          : jsonResponse({ taskId: body.taskId, nextAction }, 200);
+          : jsonResponse({ task: identity, nextAction }, 200);
     },
   };
 }

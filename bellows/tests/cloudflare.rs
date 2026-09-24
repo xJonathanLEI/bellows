@@ -9,8 +9,9 @@ use std::{
 };
 
 use bellows::cloudflare::{
-    BoxDispatchError, DispatcherState, DispatcherStorage, DurableObjectNamespaceLike,
-    ProcessorFetcher, RetainedTaskDispatcher, ScheduleUpdate, TextBody, dispatch_task,
+    BoxDispatchError, DispatchIntent, DispatchTask, DispatcherState, DispatcherStorage,
+    DurableObjectNamespaceLike, ProcessorFetcher, RetainedTaskDispatcher, ScheduleUpdate,
+    TaskIdentity, TextBody, dispatch_task, dispatch_tasks,
 };
 use http::{Request, Response};
 use serde_json::{Value, json};
@@ -19,8 +20,502 @@ use tokio::sync::oneshot;
 type IoResult<T> = Result<T, BoxDispatchError>;
 const NOW: i64 = 1_700_000_000_000;
 
+fn singleton(name: &str, intent: DispatchIntent) -> DispatchTask {
+    DispatchTask {
+        task: TaskIdentity::Singleton {
+            task_name: name.into(),
+        },
+        intent,
+    }
+}
+
+fn batch_request(tasks: Value) -> Request<TextBody> {
+    Request::post("/dispatch")
+        .header("content-type", "application/json")
+        .body(text_body(json!({ "tasks": tasks }).to_string()))
+        .unwrap()
+}
+
+fn singleton_record(
+    storage: &FakeAlarmStorage,
+    name: &str,
+) -> Option<bellows::cloudflare::DispatcherTask> {
+    storage
+        .0
+        .lock()
+        .unwrap()
+        .durable
+        .tasks
+        .get(&format!("singleton:{name}"))
+        .cloned()
+}
+
+#[tokio::test]
+async fn entire_batch_is_validated_before_any_side_effect() {
+    let ensure = singleton("7", DispatchIntent::Ensure);
+    for invalid in [
+        json!({"task": {"kind": "published", "taskName": "7", "taskId": ""}, "intent": "run"}),
+        json!({"task": {"kind": "published", "taskName": "7", "taskId": format!("{}a", "😀".repeat(100))}, "intent": "run"}),
+        json!({"task": {"kind": "singleton", "taskName": null}, "intent": "ensure"}),
+        json!({"task": {"kind": "singleton", "taskName": "7", "taskId": "7"}, "intent": "run"}),
+        json!({"task": {"kind": "singleton", "taskName": "7", "extra": true}, "intent": "run"}),
+        json!({"task": {"kind": "publish", "taskName": "7", "taskId": "7"}, "intent": "run"}),
+        json!({"task": {"kind": "published", "taskName": "7"}, "intent": "run"}),
+        json!({"task": {"kind": "published", "taskName": "7", "taskId": "7"}, "intent": "ensure"}),
+        json!({"task": {"kind": "singleton", "taskName": ""}, "intent": "run"}),
+        json!({"task": {"kind": "singleton", "taskName": "7"}, "intent": "unknown"}),
+        json!({"task": {"kind": "singleton", "taskName": "7"}}),
+        json!({"task": ensure.task, "intent": "ensure", "extra": true}),
+        json!(singleton(&"😀".repeat(509), DispatchIntent::Ensure)),
+    ] {
+        let storage = FakeAlarmStorage::default();
+        let processor = DeferredProcessor::default();
+        let dispatcher =
+            RetainedTaskDispatcher::with_clock(storage.clone(), processor.clone(), now);
+        assert_eq!(
+            dispatcher
+                .fetch(batch_request(json!([ensure, invalid])))
+                .await
+                .status(),
+            400
+        );
+        assert_eq!(processor.count(), 0);
+        let state = storage.0.lock().unwrap();
+        assert_eq!(state.alarm_reads, 0);
+        assert_eq!(state.transactions, 0);
+        assert!(state.durable.tasks.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn batch_helpers_validate_before_lookup_and_empty_batches_do_no_io() {
+    let namespace = RecordingNamespace::default();
+    dispatch_tasks(&namespace, &[]).await.unwrap();
+    assert!(namespace.names.lock().unwrap().is_empty());
+    assert!(
+        dispatch_tasks(
+            &namespace,
+            &[
+                singleton("7", DispatchIntent::Ensure),
+                singleton(&"x".repeat(2034), DispatchIntent::Ensure),
+            ]
+        )
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("byte limit")
+    );
+    assert!(namespace.names.lock().unwrap().is_empty());
+    let tasks = [
+        singleton(&format!("{}x", "😀".repeat(508)), DispatchIntent::Ensure),
+        singleton(" published:7 雪\n", DispatchIntent::Run),
+    ];
+    namespace.stub.0.lock().unwrap().response =
+        Some(Ok(response(200, text_body(r#"{"ok":true}"#))));
+    dispatch_tasks(&namespace, &tasks).await.unwrap();
+    assert_eq!(*namespace.names.lock().unwrap(), ["global"]);
+    assert_eq!(
+        serde_json::from_str::<Value>(namespace.stub.0.lock().unwrap().requests[0].body()).unwrap(),
+        json!({"tasks": tasks})
+    );
+    let storage = FakeAlarmStorage::default();
+    let dispatcher =
+        RetainedTaskDispatcher::with_clock(storage.clone(), DeferredProcessor::default(), now);
+    assert_json(
+        dispatcher.fetch(batch_request(json!([]))).await,
+        200,
+        json!({"ok": true}),
+    );
+    assert_eq!(storage.0.lock().unwrap().alarm_reads, 0);
+}
+
+#[tokio::test]
+async fn all_300_distinct_mixed_entries_launch_before_one_blocked_warming_check() {
+    let storage = FakeAlarmStorage::default();
+    let (release, gate) = oneshot::channel();
+    storage.0.lock().unwrap().get_gate = Some(gate);
+    let processor = DeferredProcessor::default();
+    let dispatcher = Arc::new(RetainedTaskDispatcher::with_clock(
+        storage.clone(),
+        processor.clone(),
+        now,
+    ));
+    let tasks: Vec<_> = (0..300)
+        .map(|i| {
+            if i % 2 == 0 {
+                singleton(&(i / 2).to_string(), DispatchIntent::Ensure)
+            } else {
+                DispatchTask {
+                    task: TaskIdentity::Published {
+                        task_id: ((i - 1) / 2).to_string(),
+                        task_name: "published".into(),
+                    },
+                    intent: DispatchIntent::Run,
+                }
+            }
+        })
+        .collect();
+    let batch: Vec<_> = tasks.iter().chain(&tasks).collect();
+    let request = batch_request(json!(batch));
+    let acceptance = tokio::spawn(async move { dispatcher.fetch(request).await });
+    wait_for(|| processor.count() == 300).await;
+    {
+        let state = storage.0.lock().unwrap();
+        assert_eq!(state.alarm_reads, 1);
+        assert_eq!(state.transactions, 0);
+        assert_eq!(state.task_reads, 0);
+        assert!(state.durable.tasks.is_empty());
+    }
+    release.send(()).unwrap();
+    assert_json(acceptance.await.unwrap(), 200, json!({"ok": true}));
+    assert_eq!(storage.0.lock().unwrap().scheduled.len(), 1);
+    for i in 0..300 {
+        finish(&processor, i).await;
+    }
+}
+
+#[tokio::test]
+async fn bootstrap_suppression_never_suppresses_run_and_current_done_forgets_it() {
+    let storage = FakeAlarmStorage::default();
+    let processor = DeferredProcessor::default();
+    let dispatcher = RetainedTaskDispatcher::with_clock(storage.clone(), processor.clone(), now);
+    let ensure = singleton("7", DispatchIntent::Ensure);
+    let run = singleton("7", DispatchIntent::Run);
+    dispatcher
+        .fetch(batch_request(json!([ensure, ensure])))
+        .await;
+    wait_for(|| processor.count() == 1).await;
+    dispatcher.fetch(batch_request(json!([ensure, run]))).await;
+    assert_eq!(processor.count(), 1);
+    reply(
+        &processor,
+        0,
+        json!({"type": "retryAt", "atMs": NOW + 60_000}),
+    )
+    .await;
+    let reads = storage.0.lock().unwrap().alarm_reads;
+    dispatcher
+        .fetch(batch_request(json!([ensure, ensure])))
+        .await;
+    assert_eq!(processor.count(), 1);
+    assert_eq!(storage.0.lock().unwrap().alarm_reads, reads + 1);
+    dispatcher.fetch(batch_request(json!([ensure, run]))).await;
+    reply(&processor, 1, json!({"type": "done"})).await;
+    assert!(singleton_record(&storage, "7").is_none());
+    dispatcher.fetch(batch_request(json!([ensure]))).await;
+    finish(&processor, 2).await;
+    dispatcher.fetch(batch_request(json!([ensure]))).await;
+    finish(&processor, 3).await;
+}
+
+#[tokio::test]
+async fn singleton_chains_survive_reconstruction_and_alarm_launches_establish_suppression() {
+    for intent in [DispatchIntent::Run, DispatchIntent::Ensure] {
+        let storage = FakeAlarmStorage::default();
+        let processor = DeferredProcessor::default();
+        let make = || {
+            RetainedTaskDispatcher::with_clock(storage.clone(), processor.clone(), scheduler_now)
+        };
+        let mut dispatcher = make();
+        let name = format!("singleton: published:7 雪🦀 {}", "x".repeat(300));
+        let ensure = singleton(&name, DispatchIntent::Ensure);
+        dispatcher
+            .fetch(batch_request(json!([singleton(&name, intent)])))
+            .await;
+        let deadline = scheduler_now() + 10_000;
+        reply(&processor, 0, json!({"type": "retryAt", "atMs": deadline})).await;
+        assert_eq!(singleton_record(&storage, &name).unwrap().task, ensure.task);
+        dispatcher.fetch(batch_request(json!([ensure]))).await;
+        assert_eq!(processor.count(), 1);
+        dispatcher = make();
+        dispatcher.fetch(batch_request(json!([ensure]))).await;
+        reply(
+            &processor,
+            1,
+            json!({"type": "retryAt", "atMs": deadline + 1}),
+        )
+        .await;
+        dispatcher = make();
+        advance(10_001);
+        dispatcher.alarm().await.unwrap();
+        wait_for(|| processor.count() == 3).await;
+        dispatcher.fetch(batch_request(json!([ensure]))).await;
+        assert_eq!(processor.count(), 3);
+        reply(
+            &processor,
+            2,
+            json!({"type": "retryAt", "atMs": scheduler_now() + 60_000}),
+        )
+        .await;
+        dispatcher.fetch(batch_request(json!([ensure]))).await;
+        assert_eq!(processor.count(), 3);
+    }
+}
+
+#[tokio::test]
+async fn singleton_infrastructure_retries_keep_suppression_and_reset_on_past_hints() {
+    let storage = FakeAlarmStorage::default();
+    let processor = DeferredProcessor::default();
+    let make =
+        || RetainedTaskDispatcher::with_clock(storage.clone(), processor.clone(), scheduler_now);
+    let mut dispatcher = make();
+    let ensure = singleton("7", DispatchIntent::Ensure);
+    dispatcher.fetch(batch_request(json!([ensure]))).await;
+    wait_for(|| processor.count() == 1).await;
+    processor.complete(0, Err("network".into()));
+    wait_for(|| storage.0.lock().unwrap().task_reads == 1).await;
+    dispatcher.fetch(batch_request(json!([ensure]))).await;
+    assert_eq!(processor.count(), 1);
+    assert!(storage.0.lock().unwrap().durable.tasks.is_empty());
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while processor.count() != 2 {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
+    reply(
+        &processor,
+        1,
+        json!({"type": "retryAt", "atMs": scheduler_now()}),
+    )
+    .await;
+    for failures in 1..=7 {
+        dispatcher = make();
+        dispatcher.alarm().await.unwrap();
+        let count = failures as usize + 2;
+        wait_for(|| processor.count() == count).await;
+        processor.complete(count - 1, Err("network".into()));
+        wait_for(|| {
+            singleton_record(&storage, "7").unwrap().state
+                == bellows::cloudflare::TaskSchedule::Pending
+        })
+        .await;
+        let record = singleton_record(&storage, "7").unwrap();
+        assert_eq!(record.infrastructure_failures, failures.min(6));
+        let delay = (1_000_i64 << (failures - 1)).min(30_000);
+        assert_eq!(record.next_attempt_at_ms, scheduler_now() + delay);
+        dispatcher.fetch(batch_request(json!([ensure]))).await;
+        assert_eq!(processor.count(), count);
+        advance(delay);
+    }
+    dispatcher.alarm().await.unwrap();
+    reply(
+        &processor,
+        9,
+        json!({"type": "retryAt", "atMs": scheduler_now() - 1}),
+    )
+    .await;
+    assert_eq!(
+        singleton_record(&storage, "7")
+            .unwrap()
+            .infrastructure_failures,
+        0
+    );
+}
+
+#[tokio::test]
+async fn stale_singleton_outcomes_cannot_replace_or_forget_a_newer_chain() {
+    for action in ["done", "retryAt", "error"] {
+        let storage = FakeAlarmStorage::default();
+        let processor = DeferredProcessor::default();
+        let dispatcher =
+            RetainedTaskDispatcher::with_clock(storage.clone(), processor.clone(), scheduler_now);
+        let ensure = singleton("7", DispatchIntent::Ensure);
+        dispatcher.fetch(batch_request(json!([ensure]))).await;
+        reply(
+            &processor,
+            0,
+            json!({"type": "retryAt", "atMs": scheduler_now()}),
+        )
+        .await;
+        dispatcher.alarm().await.unwrap();
+        wait_for(|| processor.count() == 2).await;
+        // Another delegate leaves the old future alive, exercising durable attempt fencing.
+        let successor =
+            RetainedTaskDispatcher::with_clock(storage.clone(), processor.clone(), scheduler_now);
+        advance(60_000);
+        successor.alarm().await.unwrap();
+        advance(1_000);
+        successor.alarm().await.unwrap();
+        reply(
+            &processor,
+            2,
+            json!({"type": "retryAt", "atMs": scheduler_now() + 50_000}),
+        )
+        .await;
+        let saved = singleton_record(&storage, "7");
+        if action == "error" {
+            processor.complete(1, Err("late error".into()));
+            for _ in 0..20 {
+                tokio::task::yield_now().await;
+            }
+        } else {
+            reply(
+                &processor,
+                1,
+                if action == "done" {
+                    json!({"type": "done"})
+                } else {
+                    json!({"type": "retryAt", "atMs": 0})
+                },
+            )
+            .await;
+        }
+        successor.fetch(batch_request(json!([ensure]))).await;
+        assert_eq!(processor.count(), 3);
+        assert_eq!(singleton_record(&storage, "7"), saved);
+    }
+}
+
+#[tokio::test]
+async fn a_singleton_record_under_another_identity_key_is_rejected() {
+    let storage = FakeAlarmStorage::default();
+    seed_schedule(&storage, "contract");
+    storage
+        .0
+        .lock()
+        .unwrap()
+        .durable
+        .tasks
+        .get_mut("published:id")
+        .unwrap()
+        .task = singleton("7", DispatchIntent::Ensure).task;
+    let processor = DeferredProcessor::default();
+    let dispatcher = RetainedTaskDispatcher::with_clock(storage, processor.clone(), now);
+    assert!(
+        dispatcher
+            .alarm()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("task record")
+    );
+    assert_eq!(processor.count(), 0);
+}
+
 fn now() -> i64 {
     NOW
+}
+
+#[tokio::test]
+async fn singleton_persistence_failures_preserve_the_retry_chain() {
+    for uncertain in [false, true] {
+        let storage = FakeAlarmStorage::default();
+        let processor = DeferredProcessor::default();
+        let dispatcher =
+            RetainedTaskDispatcher::with_clock(storage.clone(), processor.clone(), now);
+        let ensure = singleton("7", DispatchIntent::Ensure);
+        dispatcher.fetch(batch_request(json!([ensure]))).await;
+        if uncertain {
+            storage.0.lock().unwrap().uncertain_commit = true;
+        } else {
+            storage.0.lock().unwrap().set_failures = 1;
+        }
+        reply(&processor, 0, json!({"type": "retryAt", "atMs": NOW})).await;
+        assert_eq!(singleton_record(&storage, "7").is_some(), uncertain);
+        dispatcher.fetch(batch_request(json!([ensure]))).await;
+        assert_eq!(processor.count(), 1);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while processor.count() != 2 {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        reply(
+            &processor,
+            1,
+            json!({"type": "retryAt", "atMs": NOW + 60_000}),
+        )
+        .await;
+        assert_eq!(
+            singleton_record(&storage, "7")
+                .unwrap()
+                .infrastructure_failures,
+            0
+        );
+        dispatcher.fetch(batch_request(json!([ensure]))).await;
+        assert_eq!(processor.count(), 2);
+    }
+}
+
+#[tokio::test]
+async fn mismatched_singleton_responses_cannot_end_the_chain() {
+    for task in [
+        json!({"kind": "singleton", "taskName": "7 "}),
+        json!({"kind": "published", "taskName": "7", "taskId": "7"}),
+        json!({"kind": "singleton", "taskName": "7", "taskId": "7"}),
+    ] {
+        let storage = FakeAlarmStorage::default();
+        let processor = DeferredProcessor::default();
+        let dispatcher =
+            RetainedTaskDispatcher::with_clock(storage.clone(), processor.clone(), now);
+        let ensure = singleton("7", DispatchIntent::Ensure);
+        dispatcher.fetch(batch_request(json!([ensure]))).await;
+        reply(&processor, 0, json!({"type": "retryAt", "atMs": NOW})).await;
+        dispatcher.alarm().await.unwrap();
+        wait_for(|| processor.count() == 2).await;
+        processor.complete(
+            1,
+            Ok(response(
+                200,
+                text_body(json!({"task": task, "nextAction": {"type": "done"}}).to_string()),
+            )),
+        );
+        wait_for(|| {
+            singleton_record(&storage, "7")
+                .unwrap()
+                .infrastructure_failures
+                == 1
+        })
+        .await;
+        dispatcher.fetch(batch_request(json!([ensure]))).await;
+        assert_eq!(processor.count(), 2);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn immediate_completions_still_dispatch_each_batch_identity_only_once() {
+    use std::sync::atomic::AtomicUsize;
+    struct ImmediateProcessor(Arc<AtomicUsize>);
+    impl ProcessorFetcher for ImmediateProcessor {
+        async fn fetch(&self, request: Request<String>) -> IoResult<Response<TextBody>> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            let body: Value = serde_json::from_str(request.body())?;
+            Ok(response(
+                200,
+                text_body(
+                    json!({"task": body["task"], "nextAction": {"type": "done"}}).to_string(),
+                ),
+            ))
+        }
+    }
+    let count = Arc::new(AtomicUsize::new(0));
+    let storage = FakeAlarmStorage::default();
+    let dispatcher =
+        RetainedTaskDispatcher::with_clock(storage.clone(), ImmediateProcessor(count.clone()), now);
+    let entries: Vec<_> = (0..1000)
+        .flat_map(|_| {
+            [
+                singleton("7", DispatchIntent::Ensure),
+                DispatchTask {
+                    task: TaskIdentity::Published {
+                        task_id: "7".into(),
+                        task_name: "published".into(),
+                    },
+                    intent: DispatchIntent::Run,
+                },
+            ]
+        })
+        .collect();
+    assert_json(
+        dispatcher.fetch(batch_request(json!(entries))).await,
+        200,
+        json!({"ok": true}),
+    );
+    wait_for(|| storage.0.lock().unwrap().task_reads >= 2).await;
+    assert_eq!(count.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]
@@ -91,7 +586,10 @@ async fn explicit_redispatch_reconciles_saved_schedules_only_after_its_response(
         json!({"type": "retryAt", "atMs": NOW + 10_000}),
     )
     .await;
-    assert_eq!(stored_task(&storage, "id").unwrap().task_name, "corrected");
+    assert_eq!(
+        stored_task(&storage, "id").unwrap().task.name(),
+        "corrected"
+    );
     dispatcher.fetch(dispatch_request("id")).await;
     reply(&processor, 1, json!({"type": "done"})).await;
     assert!(stored_task(&storage, "id").is_none());
@@ -155,10 +653,12 @@ fn seed_schedule(storage: &FakeAlarmStorage, name: &str) {
         next_attempt_id: 0,
     });
     state.durable.tasks.insert(
-        "id".into(),
+        "published:id".into(),
         DispatcherTask {
-            task_id: "id".into(),
-            task_name: name.into(),
+            task: TaskIdentity::Published {
+                task_id: "id".into(),
+                task_name: name.into(),
+            },
             next_attempt_at_ms: scheduler_now(),
             infrastructure_failures: 0,
             state: TaskSchedule::Pending,
@@ -171,6 +671,7 @@ struct AlarmState {
     durable: DispatcherState,
     transactions: usize,
     task_reads: usize,
+    alarm_reads: usize,
     alarm: Option<i64>,
     scheduled: Vec<i64>,
     get_error: Option<&'static str>,
@@ -185,7 +686,11 @@ struct FakeAlarmStorage(Arc<Mutex<AlarmState>>);
 
 impl DispatcherStorage for FakeAlarmStorage {
     async fn get_alarm(&self) -> IoResult<Option<i64>> {
-        let gate = self.0.lock().unwrap().get_gate.take();
+        let gate = {
+            let mut state = self.0.lock().unwrap();
+            state.alarm_reads += 1;
+            state.get_gate.take()
+        };
         if let Some(gate) = gate {
             gate.await?;
         }
@@ -357,7 +862,7 @@ fn named_request(task_name: &str, task_id: &str) -> Request<TextBody> {
     Request::post("https://dispatcher/dispatch")
         .header("content-type", "application/json")
         .body(text_body(
-            json!({ "taskId": task_id, "taskName": task_name }).to_string(),
+            json!({ "tasks": [{ "task": { "kind": "published", "taskId": task_id, "taskName": task_name }, "intent": "run" }] }).to_string(),
         ))
         .unwrap()
 }
@@ -392,12 +897,12 @@ async fn finish(processor: &DeferredProcessor, index: usize) {
     let (body, control) = controlled_body();
     processor.complete(index, Ok(response(200, body)));
     let id = serde_json::from_str::<Value>(processor.0.lock().unwrap()[index].request.body())
-        .unwrap()["taskId"]
+        .unwrap()["task"]
         .clone();
     control
         .sender
         .send(Ok(
-            json!({"taskId": id, "nextAction": {"type": "done"}}).to_string()
+            json!({"task": id, "nextAction": {"type": "done"}}).to_string()
         ))
         .unwrap();
     wait_for(|| control.finished.load(Ordering::SeqCst)).await;
@@ -488,10 +993,10 @@ async fn dispatch_targets_global_and_fully_consumes_the_response() {
         assert_eq!(request.headers()["content-type"], "application/json");
         assert_eq!(
             serde_json::from_str::<Value>(request.body()).unwrap(),
-            json!({ "taskId": "123", "taskName": "contract" })
+            json!({ "tasks": [{ "task": { "kind": "published", "taskId": "123", "taskName": "contract" }, "intent": "run" }] })
         );
     }
-    control.sender.send(Ok("accepted".into())).unwrap();
+    control.sender.send(Ok(r#"{"ok":true}"#.into())).unwrap();
     dispatch.await.unwrap().unwrap();
     assert!(control.finished.load(Ordering::SeqCst));
 }
@@ -526,7 +1031,7 @@ async fn retained_dispatch_accepts_early_and_suppresses_duplicates_through_body_
     assert_json(
         dispatcher.fetch(dispatch_request("task-1")).await,
         200,
-        json!({ "ok": true, "taskId": "task-1" }),
+        json!({ "ok": true }),
     );
     wait_for(|| processor.count() == 1).await;
     {
@@ -537,10 +1042,10 @@ async fn retained_dispatch_accepts_early_and_suppresses_duplicates_through_body_
         assert_eq!(request.headers()["content-type"], "application/json");
         assert_eq!(
             serde_json::from_str::<Value>(request.body()).unwrap(),
-            json!({ "taskId": "task-1", "taskName": "contract" })
+            json!({ "task": { "kind": "published", "taskId": "task-1", "taskName": "contract" } })
         );
     }
-    let duplicate = json!({ "duplicate": true, "ok": true, "taskId": "task-1" });
+    let duplicate = json!({ "ok": true });
     assert_json(
         dispatcher.fetch(named_request("other", "task-1")).await,
         200,
@@ -558,7 +1063,7 @@ async fn retained_dispatch_accepts_early_and_suppresses_duplicates_through_body_
     control
         .sender
         .send(Ok(
-            json!({"taskId": "task-1", "nextAction": {"type": "done"}}).to_string(),
+            json!({"task": {"kind": "published", "taskId": "task-1", "taskName": "contract"}, "nextAction": {"type": "done"}}).to_string(),
         ))
         .unwrap();
     wait_for(|| control.finished.load(Ordering::SeqCst)).await;
@@ -567,7 +1072,7 @@ async fn retained_dispatch_accepts_early_and_suppresses_duplicates_through_body_
     assert_json(
         dispatcher.fetch(dispatch_request("task-1")).await,
         200,
-        json!({ "ok": true, "taskId": "task-1" }),
+        json!({ "ok": true }),
     );
     finish(&processor, 1).await;
 }
@@ -581,8 +1086,8 @@ async fn different_task_ids_retain_concurrent_processor_requests() {
         dispatcher.fetch(dispatch_request("task-1")),
         dispatcher.fetch(named_request("other", "task-2")),
     );
-    assert_json(first, 200, json!({ "ok": true, "taskId": "task-1" }));
-    assert_json(second, 200, json!({ "ok": true, "taskId": "task-2" }));
+    assert_json(first, 200, json!({ "ok": true }));
+    assert_json(second, 200, json!({ "ok": true }));
     wait_for(|| processor.count() == 2).await;
     assert!(
         processor
@@ -599,8 +1104,12 @@ async fn different_task_ids_retain_concurrent_processor_requests() {
         .iter()
         .map(|call| serde_json::from_str(call.request.body()).unwrap())
         .collect();
-    assert!(bodies.contains(&json!({ "taskId": "task-1", "taskName": "contract" })));
-    assert!(bodies.contains(&json!({ "taskId": "task-2", "taskName": "other" })));
+    assert!(bodies.contains(
+        &json!({ "task": { "kind": "published", "taskId": "task-1", "taskName": "contract" } })
+    ));
+    assert!(bodies.contains(
+        &json!({ "task": { "kind": "published", "taskId": "task-2", "taskName": "other" } })
+    ));
     finish(&processor, 0).await;
     finish(&processor, 1).await;
 }
@@ -653,14 +1162,14 @@ async fn processor_http_failures_are_consumed_and_permit_explicit_redispatch() {
         assert_json(
             dispatcher.fetch(dispatch_request("task-1")).await,
             200,
-            json!({ "duplicate": true, "ok": true, "taskId": "task-1" }),
+            json!({ "ok": true }),
         );
         control.sender.send(Ok(message.into())).unwrap();
         wait_for(|| logs.0.lock().unwrap().len() == 1).await;
         {
             let logs = logs.0.lock().unwrap();
             assert_eq!(logs[0]["message"], "task processor failed");
-            assert_eq!(logs[0]["task_id"], "task-1");
+            assert_eq!(logs[0]["kind"], "published");
             assert_eq!(
                 logs[0]["error"],
                 format!("task processor returned HTTP {status}: {message}")
@@ -670,7 +1179,7 @@ async fn processor_http_failures_are_consumed_and_permit_explicit_redispatch() {
         assert_json(
             dispatcher.fetch(dispatch_request("task-1")).await,
             200,
-            json!({ "ok": true, "taskId": "task-1" }),
+            json!({ "ok": true }),
         );
         finish(&processor, 1).await;
     }
@@ -698,12 +1207,13 @@ async fn generic_ids_use_utf16_limits_and_round_trip_without_numeric_parsing() {
         format!("{}😀", "a".repeat(198)),
     ] {
         let namespace = RecordingNamespace::default();
-        namespace.stub.0.lock().unwrap().response = Some(Ok(response(200, text_body("accepted"))));
+        namespace.stub.0.lock().unwrap().response =
+            Some(Ok(response(200, text_body(r#"{"ok":true}"#))));
         dispatch_task(&namespace, "contract", &id).await.unwrap();
         let encoded = namespace.stub.0.lock().unwrap().requests[0].body().clone();
         assert_eq!(
             serde_json::from_str::<Value>(&encoded).unwrap(),
-            json!({ "taskId": id, "taskName": "contract" })
+            json!({ "tasks": [{ "task": { "kind": "published", "taskId": id, "taskName": "contract" }, "intent": "run" }] })
         );
         let processor = DeferredProcessor::default();
         let dispatcher =
@@ -713,11 +1223,7 @@ async fn generic_ids_use_utf16_limits_and_round_trip_without_numeric_parsing() {
             .header("content-type", "Application/JSON; charset=utf-8")
             .body(text_body(encoded))
             .unwrap();
-        assert_json(
-            dispatcher.fetch(request).await,
-            200,
-            json!({ "ok": true, "taskId": id }),
-        );
+        assert_json(dispatcher.fetch(request).await, 200, json!({ "ok": true }));
         finish(&processor, 0).await;
     }
 }
@@ -774,12 +1280,7 @@ async fn invalid_routes_and_inputs_do_not_launch_work_or_schedule_alarms() {
         json!({ "taskId": "a".repeat(201) }).to_string(),
         json!({ "taskId": format!("{}a", "😀".repeat(100)) }).to_string(),
     ] {
-        let parsed: Value = serde_json::from_str(&body).unwrap();
-        let error = if parsed.is_object() {
-            "taskId must be a non-empty string no longer than 200 characters"
-        } else {
-            "request body must be a JSON object"
-        };
+        let error = "invalid dispatch batch";
         let request = Request::post("/dispatch")
             .header("content-type", "application/json")
             .body(text_body(body))
@@ -818,7 +1319,7 @@ async fn invalid_names_reject_before_lookup_launch_or_alarm() {
             .await
             .unwrap_err()
             .to_string(),
-        "taskId must be a non-empty string no longer than 200 characters"
+        "taskName must be a non-empty string"
     );
     assert!(namespace.names.lock().unwrap().is_empty());
     let processor = DeferredProcessor::default();
@@ -845,7 +1346,7 @@ async fn invalid_names_reject_before_lookup_launch_or_alarm() {
             dispatcher.fetch(request).await,
             400,
             json!({
-                "error": "taskName must be a non-empty string", "ok": false
+                "error": "invalid dispatch batch", "ok": false
             }),
         );
     }
@@ -862,13 +1363,16 @@ async fn exact_names_round_trip_both_hops_without_forwarding_payloads() {
         "x".repeat(1000),
     ] {
         let namespace = RecordingNamespace::default();
-        namespace.stub.0.lock().unwrap().response = Some(Ok(response(200, text_body("accepted"))));
+        namespace.stub.0.lock().unwrap().response =
+            Some(Ok(response(200, text_body(r#"{"ok":true}"#))));
         dispatch_task(&namespace, &name, "opaque").await.unwrap();
         let body: Value =
             serde_json::from_str(namespace.stub.0.lock().unwrap().requests[0].body()).unwrap();
-        assert_eq!(body, json!({ "taskId": "opaque", "taskName": name }));
-        let mut incoming = body.clone();
-        incoming["payload"] = json!({ "untrusted": true });
+        assert_eq!(
+            body,
+            json!({ "tasks": [{ "task": { "kind": "published", "taskId": "opaque", "taskName": name }, "intent": "run" }] })
+        );
+        let incoming = body.clone();
         let processor = DeferredProcessor::default();
         let dispatcher =
             RetainedTaskDispatcher::with_clock(FakeAlarmStorage::default(), processor.clone(), now);
@@ -876,15 +1380,11 @@ async fn exact_names_round_trip_both_hops_without_forwarding_payloads() {
             .header("content-type", "application/json")
             .body(text_body(incoming.to_string()))
             .unwrap();
-        assert_json(
-            dispatcher.fetch(request).await,
-            200,
-            json!({ "ok": true, "taskId": "opaque" }),
-        );
+        assert_json(dispatcher.fetch(request).await, 200, json!({ "ok": true }));
         wait_for(|| processor.count() == 1).await;
         assert_eq!(
             serde_json::from_str::<Value>(processor.0.lock().unwrap()[0].request.body()).unwrap(),
-            body
+            json!({"task": {"kind": "published", "taskId": "opaque", "taskName": name}})
         );
         finish(&processor, 0).await;
     }
@@ -910,7 +1410,7 @@ async fn dispatch_only_repairs_a_missing_or_too_late_heartbeat_alarm() {
         } else {
             vec![]
         };
-        for duplicate in [false, true] {
+        for _ in [false, true] {
             {
                 let mut state = storage.0.lock().unwrap();
                 state.alarm = alarm;
@@ -918,10 +1418,7 @@ async fn dispatch_only_repairs_a_missing_or_too_late_heartbeat_alarm() {
             }
             let result = dispatcher.fetch(dispatch_request("task-1")).await;
             let body: Value = serde_json::from_str(result.body()).unwrap();
-            assert_eq!(
-                body.get("duplicate"),
-                duplicate.then_some(&Value::Bool(true))
-            );
+            assert_eq!(body, json!({ "ok": true }));
             assert_eq!(storage.0.lock().unwrap().scheduled, expected);
         }
         finish(&processor, 0).await;
@@ -956,7 +1453,7 @@ async fn rejected_processor_fetches_and_body_reads_permit_explicit_redispatch() 
         assert_json(
             dispatcher.fetch(dispatch_request("task-1")).await,
             200,
-            json!({ "ok": true, "taskId": "task-1" }),
+            json!({ "ok": true }),
         );
         finish(&processor, 1).await;
     }
@@ -1080,7 +1577,7 @@ async fn request_read_errors_and_storage_errors_use_the_existing_error_envelope(
     assert_json(
         dispatcher.fetch(dispatch_request("id")).await,
         200,
-        json!({ "duplicate": true, "ok": true, "taskId": "id" }),
+        json!({ "ok": true }),
     );
     finish(&processor, 0).await;
 }
@@ -1105,20 +1602,16 @@ async fn launch_precedes_heartbeat_storage_and_never_persists_acceptance() {
     wait_for(|| processor.count() == 1).await;
     assert_eq!(storage.0.lock().unwrap().transactions, 0);
     release.send(()).unwrap();
-    assert_json(
-        acceptance.await.unwrap(),
-        200,
-        json!({ "ok": true, "taskId": "id" }),
-    );
+    assert_json(acceptance.await.unwrap(), 200, json!({ "ok": true }));
     assert_json(
         dispatcher.fetch(dispatch_request("id")).await,
         200,
-        json!({ "duplicate": true, "ok": true, "taskId": "id" }),
+        json!({ "ok": true }),
     );
     assert_json(
         dispatcher.fetch(dispatch_request("other")).await,
         200,
-        json!({ "ok": true, "taskId": "other" }),
+        json!({ "ok": true }),
     );
     finish(&processor, 0).await;
     finish(&processor, 1).await;
@@ -1143,7 +1636,7 @@ async fn native_processor_panics_are_logged_and_permit_explicit_redispatch() {
         assert_json(
             dispatcher.fetch(dispatch_request("id")).await,
             200,
-            json!({ "ok": true, "taskId": "id" }),
+            json!({ "ok": true }),
         );
         wait_for(|| logs.0.lock().unwrap().len() == count).await;
         tokio::task::yield_now().await;
@@ -1228,7 +1721,7 @@ async fn stale_done_retry_and_body_errors_cannot_affect_an_id_accepted_again_aft
             .send(if action == "body-error" {
                 Err("late body error".into())
             } else {
-                Ok(json!({"taskId": "id", "nextAction": if action == "done" {
+                Ok(json!({"task": {"kind": "published", "taskId": "id", "taskName": "contract"}, "nextAction": if action == "done" {
                     json!({"type": "done"})
                 } else {
                     json!({"type": "retryAt", "atMs": 0})
@@ -1242,7 +1735,7 @@ async fn stale_done_retry_and_body_errors_cannot_affect_an_id_accepted_again_aft
         assert_json(
             successor.fetch(named_request("wrong", "id")).await,
             200,
-            json!({"duplicate": true, "ok": true, "taskId": "id"}),
+            json!({ "ok": true }),
         );
         wait_for(|| processor.count() == 3).await;
         finish(&processor, 2).await;
@@ -1318,19 +1811,26 @@ fn stored_task(
     storage: &FakeAlarmStorage,
     id: &str,
 ) -> Option<bellows::cloudflare::DispatcherTask> {
-    storage.0.lock().unwrap().durable.tasks.get(id).cloned()
+    storage
+        .0
+        .lock()
+        .unwrap()
+        .durable
+        .tasks
+        .get(&format!("published:{id}"))
+        .cloned()
 }
 
 async fn reply(processor: &DeferredProcessor, index: usize, action: Value) {
     wait_for(|| processor.count() > index).await;
     let id = serde_json::from_str::<Value>(processor.0.lock().unwrap()[index].request.body())
-        .unwrap()["taskId"]
+        .unwrap()["task"]
         .clone();
     processor.complete(
         index,
         Ok(response(
             200,
-            text_body(json!({"taskId": id, "nextAction": action}).to_string()),
+            text_body(json!({"task": id, "nextAction": action}).to_string()),
         )),
     );
     tokio::task::yield_now().await;
@@ -1423,9 +1923,10 @@ async fn watchdog_recovers_hung_and_reconstructed_attempts_and_ignores_stale_res
             .fetch(named_request("must-not-replace", "id"))
             .await;
         wait_for(|| processor.count() == 3).await;
-        assert_eq!(stored_task(&storage, "id").unwrap().task_name, "old");
+        assert_eq!(stored_task(&storage, "id").unwrap().task.name(), "old");
         assert_eq!(
-            serde_json::from_str::<Value>(processor.0.lock().unwrap()[2].request.body()).unwrap()["taskName"],
+            serde_json::from_str::<Value>(processor.0.lock().unwrap()[2].request.body()).unwrap()["task"]
+                ["taskName"],
             "corrected"
         );
         reply(&processor, 2, json!({"type": "done"})).await;
@@ -1448,10 +1949,12 @@ async fn all_300_due_ids_launch_while_every_response_is_gated() {
         });
         for id in 0..300 {
             state.durable.tasks.insert(
-                id.to_string(),
+                format!("published:{id}"),
                 DispatcherTask {
-                    task_id: id.to_string(),
-                    task_name: if id % 2 == 0 { "first" } else { "second" }.into(),
+                    task: TaskIdentity::Published {
+                        task_id: id.to_string(),
+                        task_name: if id % 2 == 0 { "first" } else { "second" }.into(),
+                    },
                     next_attempt_at_ms: NOW + 1_000,
                     infrastructure_failures: 0,
                     state: TaskSchedule::Pending,
@@ -1494,6 +1997,15 @@ async fn uncertain_envelopes_retain_durable_tracking_and_back_off() {
         r#"{"taskId":"other","nextAction":{"type":"done"}}"#.to_owned(),
         r#"{"taskId":"id","nextAction":{"type":"unknown"}}"#.to_owned(),
     ];
+    for task in [
+        json!({ "kind": "published", "taskId": "other", "taskName": "contract" }),
+        json!({ "kind": "published", "taskId": "id", "taskName": "contract " }),
+        json!({ "kind": "singleton", "taskName": "contract" }),
+        json!({ "kind": "published", "taskId": "id", "taskName": "contract", "extra": true }),
+        json!({ "kind": "publish", "taskId": "id", "taskName": "contract" }),
+    ] {
+        invalid.push(json!({ "task": task, "nextAction": { "type": "done" } }).to_string());
+    }
     for at in [
         json!(-1),
         json!(0.5),
@@ -1503,7 +2015,7 @@ async fn uncertain_envelopes_retain_durable_tracking_and_back_off() {
         Value::Null,
     ] {
         invalid.push(
-            json!({"taskId": "id", "nextAction": {"type": "retryAt", "atMs": at}}).to_string(),
+            json!({"task": {"kind": "published", "taskId": "id", "taskName": "contract"}, "nextAction": {"type": "retryAt", "atMs": at}}).to_string(),
         );
     }
     for body in invalid {

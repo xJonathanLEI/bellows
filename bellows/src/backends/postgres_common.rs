@@ -64,6 +64,7 @@ pub struct PostgresSweepWindow {
 pub struct PostgresDiscoveryCandidate {
     pub task_id: i64,
     pub task_name: String,
+    pub is_singleton: bool,
 }
 
 // Only validated, quoted table identifiers are formatted here. All application values remain
@@ -72,15 +73,14 @@ pub(super) fn discovery_window_sql(table_name: &str) -> String {
     format!(
         "SELECT FLOOR(EXTRACT(EPOCH FROM statement_timestamp()) * 1000)::bigint AS cutoff_unix_ms,
                 MAX(task_id) AS upper_id
-         FROM {table_name} WHERE task_unique_key IS NULL"
+         FROM {table_name}"
     )
 }
 
 pub(super) fn discovery_page_sql(table_name: &str) -> String {
     format!(
-        "SELECT task_id, task_name FROM {table_name}
-         WHERE task_unique_key IS NULL
-           AND (available_from_unix_ms IS NULL OR available_from_unix_ms <= $1)
+        "SELECT task_id, task_name, task_unique_key IS NOT NULL AS is_singleton FROM {table_name}
+         WHERE (available_from_unix_ms IS NULL OR available_from_unix_ms <= $1)
            AND task_id <= $2
            AND ($3::bigint IS NULL OR task_id > $3)
          ORDER BY task_id LIMIT $4"

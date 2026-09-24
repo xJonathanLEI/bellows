@@ -7,8 +7,9 @@ import { publishingContracts } from "./publishing-contracts.js";
 // Fresh workerd instances and schemas per test. Never run these concurrently:
 // Wrangler reads a process-wide environment variable for local Hyperdrive.
 describe.sequential("Cloudflare TypeScript producer/DO -> TypeScript processor -> PostgreSQL", () =>
-  cloudflareTopology(() =>
+  cloudflareTopology((singleton) =>
     createCloudflarePostgresFixture({
+      singleton,
       producer: {
         configPath: new URL("./wrangler.producer.jsonc", import.meta.url),
       },

@@ -125,6 +125,7 @@ pub struct PublisherReceiver {
     status: Cell<u16>,
     statuses: RefCell<VecDeque<u16>>,
     dispatches: RefCell<Vec<Value>>,
+    requests: Cell<usize>,
     drained: Arc<AtomicUsize>,
     release: Arc<Semaphore>,
 }
@@ -135,6 +136,7 @@ impl DurableObject for PublisherReceiver {
             status: Cell::new(200),
             statuses: RefCell::new(VecDeque::new()),
             dispatches: RefCell::new(Vec::new()),
+            requests: Cell::new(0),
             drained: Arc::new(AtomicUsize::new(0)),
             release: Arc::new(Semaphore::new(0)),
         }
@@ -145,6 +147,7 @@ impl DurableObject for PublisherReceiver {
             "/publisher/state" => Response::from_json(&json!({
                 "dispatches": *self.dispatches.borrow(),
                 "drained": self.drained.load(Ordering::SeqCst),
+                "requests": self.requests.get(),
             })),
             "/publisher/response" => {
                 let body: Value = request.json().await?;
@@ -166,21 +169,38 @@ impl DurableObject for PublisherReceiver {
                 Response::empty()
             }
             "/dispatch" => {
-                let body = request.json().await?;
-                self.dispatches.borrow_mut().push(body);
+                let entries = super::dispatch_entries(&request.json().await?)?;
+                self.requests.set(self.requests.get() + 1);
+                self.dispatches.borrow_mut().extend(
+                    entries
+                        .into_iter()
+                        .map(|entry| serde_json::to_value(entry).unwrap()),
+                );
+                let status = self
+                    .statuses
+                    .borrow_mut()
+                    .pop_front()
+                    .unwrap_or(self.status.get());
                 let release = self.release.clone();
                 let drained = self.drained.clone();
                 let stream = stream::unfold(
                     (0, release, drained),
-                    |(part, release, drained)| async move {
+                    move |(part, release, drained)| async move {
                         let bytes = match part {
                             // Send more than the diagnostic excerpt before withholding the tail.
+                            0 if status == 200 => {
+                                format!("{{\"ok\":true}}{}", " ".repeat(10_000)).into_bytes()
+                            }
                             0 => format!("fixture-secret:{}", "a".repeat(10_000)).into_bytes(),
                             1 => {
                                 if let Ok(permit) = release.acquire().await {
                                     permit.forget();
                                 }
-                                "🦀:complete".as_bytes().to_vec()
+                                if status == 200 {
+                                    b"\n".to_vec()
+                                } else {
+                                    "🦀:complete".as_bytes().to_vec()
+                                }
                             }
                             _ => {
                                 drained.fetch_add(1, Ordering::SeqCst);
@@ -190,11 +210,6 @@ impl DurableObject for PublisherReceiver {
                         Some((Ok::<_, Error>(bytes), (part + 1, release, drained)))
                     },
                 );
-                let status = self
-                    .statuses
-                    .borrow_mut()
-                    .pop_front()
-                    .unwrap_or(self.status.get());
                 Ok(Response::from_stream(stream)?.with_status(status))
             }
             _ => Response::error("not-found", 404),

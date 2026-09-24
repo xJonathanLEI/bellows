@@ -1,5 +1,11 @@
+import { Pool } from "pg";
 import { afterEach, beforeEach, expect, expectTypeOf, test, vi } from "vitest";
+import { InMemoryBackend } from "../src/backends/in-memory.js";
 import { PostgresExecutionBackend } from "../src/backends/postgres-execution.js";
+import {
+  PostgresSingletonTaskIdError,
+  PostgresTaskOperations,
+} from "../src/backends/postgres-operations.js";
 import {
   createPostgresProcessor,
   createPostgresProcessorTask,
@@ -12,6 +18,7 @@ import {
   defineSingletonTask,
   LeaseLostError,
   type PublishTaskDefinition,
+  type SingletonTaskDefinition,
   type TaskCallback,
   type TaskDefinition,
   type TaskExecutionBackend,
@@ -32,7 +39,7 @@ const countTask = definePublishTask<{ count: number }, number[]>(
   'Count/"\\\n雪🦀',
 );
 const secret = new Error("postgres://user:secret@private/database");
-const canonical = "taskId must be a canonical positive decimal string";
+const invalidIdentity = "invalid task identity";
 const safe = "taskId must encode a positive safe integer canonically";
 
 class Execution implements TaskExecutionBackend {
@@ -69,9 +76,20 @@ class Execution implements TaskExecutionBackend {
   claimEarliestPublished = vi.fn(async (): Promise<never> => {
     throw new Error("must claim the explicit ID");
   });
-  claimSingleton = vi.fn(async (): Promise<never> => {
-    throw new Error("must claim a published task");
-  });
+  claimSingleton = vi.fn(
+    async (
+      _task: SingletonTaskDefinition<unknown>,
+      _workerId: number,
+      leaseExpirationMs: number,
+    ): Promise<ClaimedTask<undefined>> => {
+      if (this.claimError) throw this.claimError;
+      return {
+        taskId: 73,
+        taskPayload: undefined,
+        leaseExpirationMs: this.renewalDue ? Date.now() : leaseExpirationMs,
+      };
+    },
+  );
   renew = vi.fn(async (): Promise<never> => {
     this.renewing.release();
     await this.renewalGate.wait();
@@ -104,6 +122,319 @@ class Execution implements TaskExecutionBackend {
     if (this.finalizationError) throw this.finalizationError;
   }
 }
+
+const singletonTask = defineSingletonTask<number[]>(" singleton/雪🦀 ");
+
+test.each([
+  "",
+  "0",
+  "-1",
+  "+1",
+  "01",
+  " 1",
+  "1 ",
+  "1\n",
+  "1.0",
+  "1e1",
+  "١",
+  "１",
+  "10000000000000000",
+])("published identity preserves canonical ID validation for %j", async (taskId) => {
+  const f = fixture();
+  await envelope(
+    await f.processor.fetch(request({ taskId, taskName: task.name }), env),
+    400,
+    { error: "taskId must be a canonical positive decimal string" },
+  );
+  expect(f.configure).not.toHaveBeenCalled();
+});
+
+function singletonRequest(taskName = singletonTask.name): Request {
+  return new Request("https://processor/process", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ task: { kind: "singleton", taskName } }),
+  });
+}
+
+function singletonFixture() {
+  const f = fixture();
+  const process = vi.fn(
+    async (_id: number, _payload: undefined): Promise<TaskResult<number[]>> =>
+      TaskSuccess.done([73]),
+  );
+  const factory = { task: singletonTask, build: vi.fn(() => ({ process })) };
+  const processor = createPostgresProcessor(() => ({
+    connectionString: env.url,
+    tasks: [...f.tasks, createPostgresProcessorTask(factory)],
+    cleanup: f.cleanup,
+  }));
+  return { ...f, process, factory, processor };
+}
+
+test.each([
+  "done",
+  "scheduled",
+  "failure",
+  "scheduled-failure",
+] as const)("singleton %s uses the claimed row ID and always returns a name-based retry", async (mode) => {
+  const f = singletonFixture();
+  random();
+  const now = Date.now();
+  const atMs = mode.includes("scheduled") ? now + 60_000 : now;
+  f.process.mockResolvedValue(
+    mode.includes("failure")
+      ? mode === "failure"
+        ? TaskFailure.retryImmediately()
+        : TaskFailure.retryAt(atMs)
+      : mode === "done"
+        ? TaskSuccess.done([73])
+        : TaskSuccess.scheduleNextRun([73], atMs),
+  );
+  const close = new Gate();
+  f.backend.closeGate = close;
+  const response = f.processor.fetch(singletonRequest(), env);
+  const unsettled = pending(response);
+  await f.backend.closing.wait();
+  unsettled();
+  close.release();
+  await envelope(await response, 200, {
+    task: { kind: "singleton", taskName: singletonTask.name },
+    nextAction: { type: "retryAt", atMs },
+  });
+  expect(f.backend.claimSingleton).toHaveBeenCalledExactlyOnceWith(
+    singletonTask,
+    23,
+    now + 20_000,
+  );
+  expect(f.backend.claimPublished).not.toHaveBeenCalled();
+  expect(f.factory.build).toHaveBeenCalledExactlyOnceWith(23);
+  expect(f.process).toHaveBeenCalledExactlyOnceWith(73, undefined);
+  expect(f.cleanup).toHaveBeenCalledTimes(1);
+  expect(f.backend.close).toHaveBeenCalledTimes(1);
+  if (mode.includes("failure"))
+    expect(f.backend.fail).toHaveBeenCalledWith(
+      23,
+      73,
+      mode === "failure" ? null : atMs,
+    );
+  else
+    expect(f.backend.finish).toHaveBeenCalledWith(
+      singletonTask,
+      23,
+      73,
+      [73],
+      mode === "done" ? null : atMs,
+    );
+  expect(console.error).not.toHaveBeenCalled();
+});
+
+test.each([
+  "future",
+  "leased",
+  "claim",
+  "finalization",
+  "cleanup",
+  "close",
+] as const)("singleton %s preserves hints or reports sanitized uncertainty after cleanup", async (stage) => {
+  const f = singletonFixture();
+  random();
+  const atMs = Date.now() + 60_000;
+  if (stage === "future") f.backend.claimError = new TaskUnavailableError(atMs);
+  if (stage === "leased") f.backend.claimError = new TaskLeasedError(atMs);
+  if (stage === "claim") f.backend.claimError = secret;
+  if (stage === "finalization") f.backend.finalizationError = secret;
+  if (stage === "cleanup") f.cleanup.mockRejectedValue(secret);
+  if (stage === "close") f.backend.close.mockRejectedValue(secret);
+  const hinted = stage === "future" || stage === "leased";
+  await envelope(
+    await f.processor.fetch(singletonRequest(), env),
+    hinted ? 200 : 500,
+    hinted
+      ? {
+          task: { kind: "singleton", taskName: singletonTask.name },
+          nextAction: { type: "retryAt", atMs },
+        }
+      : { error: "task processing attempt failed" },
+  );
+  if (hinted || stage === "claim")
+    expect(f.factory.build).not.toHaveBeenCalled();
+  expect(f.cleanup).toHaveBeenCalledTimes(1);
+  expect(f.backend.close).toHaveBeenCalledTimes(1);
+  expect(JSON.stringify(vi.mocked(console.error).mock.calls)).not.toContain(
+    singletonTask.name,
+  );
+});
+
+test("singleton lease loss does not authorize a hint and drains application work", async () => {
+  const f = singletonFixture();
+  random();
+  f.backend.renewalDue = true;
+  const business = new Gate();
+  const work = business.wait();
+  const started = new Gate();
+  const cleaning = new Gate();
+  f.process.mockImplementation(async () => {
+    started.release();
+    await work;
+    return TaskSuccess.done([73]);
+  });
+  f.cleanup.mockImplementation(async () => {
+    cleaning.release();
+    await work;
+  });
+  const response = f.processor.fetch(singletonRequest(), env);
+  const unsettled = pending(response);
+  await started.wait();
+  await vi.advanceTimersByTimeAsync(0);
+  await f.backend.renewing.wait();
+  f.backend.renewalGate.release();
+  await cleaning.wait();
+  unsettled();
+  expect(f.backend.close).not.toHaveBeenCalled();
+  business.release();
+  await envelope(await response, 500, {
+    error: "task processing attempt failed",
+  });
+  expect(f.backend.finish).not.toHaveBeenCalled();
+  expect(f.backend.fail).not.toHaveBeenCalled();
+  expect(f.backend.close).toHaveBeenCalledTimes(1);
+});
+
+test("singleton requests create and reuse one backend-managed row without publication", async () => {
+  const backend = new InMemoryBackend();
+  const close = vi.fn(async () => {});
+  vi.spyOn(PostgresExecutionBackend, "connect").mockResolvedValue(
+    Object.assign(backend, { close }) as unknown as PostgresExecutionBackend,
+  );
+  random([
+    [0, 0, 0, 0, 0, 1],
+    [0, 0, 0, 0, 0, 2],
+  ]);
+  const process = vi.fn(async (_id: number, _payload: undefined) =>
+    TaskSuccess.done([73]),
+  );
+  const processor = createPostgresProcessor(() => ({
+    connectionString: env.url,
+    tasks: [
+      createPostgresProcessorTask({
+        task: singletonTask,
+        build: () => ({ process }),
+      }),
+    ],
+  }));
+  for (let i = 0; i < 2; i++) {
+    await envelope(await processor.fetch(singletonRequest(), env), 200, {
+      task: { kind: "singleton", taskName: singletonTask.name },
+      nextAction: { type: "retryAt", atMs: Date.now() },
+    });
+  }
+  const claimed = await backend.claimSingleton(
+    singletonTask,
+    3,
+    Date.now() + 20_000,
+  );
+  expect(process.mock.calls).toEqual([
+    [claimed.taskId, undefined],
+    [claimed.taskId, undefined],
+  ]);
+  expect(close).toHaveBeenCalledTimes(2);
+});
+
+test.each([
+  "9007199254740992",
+  "9007199254740993",
+  "9223372036854775807",
+])("unsafe singleton row %s cannot reach business execution or rounded finalization", async (taskId) => {
+  const f = singletonFixture();
+  random();
+  const pool = new Pool();
+  const query = vi
+    .spyOn(pool, "query")
+    .mockResolvedValue({ rows: [{ task_id: taskId }] } as never);
+  const operations = new PostgresTaskOperations(pool);
+  f.backend.claimSingleton.mockImplementation(
+    operations.claimSingleton.bind(operations),
+  );
+  await expect(
+    operations.claimSingleton(singletonTask, 23, Date.now() + 20_000),
+  ).rejects.toMatchObject({ name: "PostgresSingletonTaskIdError", taskId });
+  await envelope(await f.processor.fetch(singletonRequest(), env), 500, {
+    error: "task processing attempt failed",
+  });
+  expect(query).toHaveBeenCalledTimes(2);
+  expect(f.factory.build).not.toHaveBeenCalled();
+  expect(f.backend.renew).not.toHaveBeenCalled();
+  expect(f.backend.finish).not.toHaveBeenCalled();
+  expect(f.backend.fail).not.toHaveBeenCalled();
+  expect(f.backend.close).toHaveBeenCalledTimes(1);
+  expect(new PostgresSingletonTaskIdError(taskId).taskId).toBe(taskId);
+  await pool.end();
+});
+
+test.each([
+  { taskId: "17", taskName: task.name },
+  { task: { kind: "singleton", taskName: singletonTask.name, taskId: "17" } },
+  { task: { kind: "singleton", taskName: singletonTask.name, extra: true } },
+  { task: { kind: "publish", taskName: task.name, taskId: "17" } },
+  { task: { kind: "unknown", taskName: task.name } },
+  { task: { kind: "published", taskName: task.name } },
+  {
+    task: { kind: "published", taskName: task.name, taskId: "17", extra: true },
+  },
+])("rejects malformed identities and old envelopes %j before configuration", async (body) => {
+  const f = fixture();
+  const input = new Request("https://processor/process", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  await envelope(await f.processor.fetch(input, env), 400, {
+    error: invalidIdentity,
+  });
+  expect(f.configure).not.toHaveBeenCalled();
+  expect(f.connect).not.toHaveBeenCalled();
+});
+
+test.each([
+  "published",
+  "singleton",
+  "duplicate",
+] as const)("wrong-kind or duplicate %s registration cannot acquire a backend", async (kind) => {
+  const f = singletonFixture();
+  const processor = createPostgresProcessor(() => ({
+    connectionString: env.url,
+    tasks:
+      kind === "duplicate"
+        ? [
+            createPostgresProcessorTask(f.factory),
+            createPostgresProcessorTask({
+              ...f.countFactory,
+              task: { ...countTask, name: singletonTask.name },
+            }),
+          ]
+        : [createPostgresProcessorTask(f.factory), ...f.tasks],
+    cleanup: f.cleanup,
+  }));
+  const input =
+    kind === "published"
+      ? request({ taskId: "17", taskName: singletonTask.name })
+      : singletonRequest(kind === "singleton" ? task.name : singletonTask.name);
+  await envelope(
+    await processor.fetch(input, env),
+    kind === "duplicate" ? 500 : 404,
+    {
+      error:
+        kind === "duplicate"
+          ? "task processing attempt failed"
+          : "unknown task name",
+    },
+  );
+  expect(f.connect).not.toHaveBeenCalled();
+  expect(f.factory.build).not.toHaveBeenCalled();
+  expect(f.countFactory.build).not.toHaveBeenCalled();
+  expect(f.cleanup).toHaveBeenCalledTimes(1);
+});
 
 interface Env {
   url: string;
@@ -164,7 +495,12 @@ function request(
   return new Request("https://processor/process", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify(body),
+    body: JSON.stringify({
+      task:
+        body !== null && typeof body === "object" && !Array.isArray(body)
+          ? { kind: "published", ...body }
+          : body,
+    }),
   });
 }
 
@@ -202,7 +538,7 @@ test("application cleanup is optional", async () => {
     tasks: [createPostgresProcessorTask(f.factory)],
   }));
   await envelope(await processor.fetch(request(), env), 200, {
-    taskId: "17",
+    task: { kind: "published", taskId: "17", taskName: task.name },
     nextAction: { type: "done" },
   });
   expect(f.cleanup).not.toHaveBeenCalled();
@@ -329,7 +665,7 @@ test.each([
   const f = fixture();
   const rng = random();
   await envelope(await f.processor.fetch(request(body), env), 400, {
-    error: canonical,
+    error: invalidIdentity,
   });
   expect(f.configure).not.toHaveBeenCalled();
   expect(rng).not.toHaveBeenCalled();
@@ -370,12 +706,11 @@ test.each([
   const input = request({
     taskName: task.name,
     taskId,
-    payload: { name: "untrusted" },
   });
   input.headers.set("content-type", "Application/JSON; charset=utf-8");
   const { fetch } = f.processor;
   await envelope(await fetch(input, env), 200, {
-    taskId,
+    task: { kind: "published", taskId, taskName: task.name },
     nextAction: { type: "done" },
   });
   expect(rng).toHaveBeenCalledTimes(2);
@@ -422,7 +757,7 @@ test.each([
   await envelope(
     await f.processor.fetch(request({ taskId: "17", taskName }), env),
     400,
-    { error: "taskName must be a non-empty string" },
+    { error: invalidIdentity },
   );
   expect(f.configure).not.toHaveBeenCalled();
   expect(rng).not.toHaveBeenCalled();
@@ -500,9 +835,11 @@ test.each([
     expect(f.cleanup).toHaveBeenCalledTimes(1);
     expect(f.backend.close).not.toHaveBeenCalled();
     expect(vi.mocked(console.error).mock.calls).toEqual([
-      ...(invalid ? [["task processing attempt failed 17 configuration"]] : []),
+      ...(invalid
+        ? [["task processing attempt failed published configuration"]]
+        : []),
       ...(cleanupFails
-        ? [["task processing attempt failed 17 application-cleanup"]]
+        ? [["task processing attempt failed published application-cleanup"]]
         : []),
     ]);
   }
@@ -526,12 +863,14 @@ test.each([
       request({
         taskId: "17",
         taskName: definition.name,
-        payload: { name: "untrusted", count: 99 },
       }),
       env,
     ),
     200,
-    { taskId: "17", nextAction: { type: "done" } },
+    {
+      task: { kind: "published", taskId: "17", taskName: definition.name },
+      nextAction: { type: "done" },
+    },
   );
   expect(f.backend.claimPublished).toHaveBeenCalledExactlyOnceWith(
     definition,
@@ -605,7 +944,7 @@ test("a persisted-name mismatch cannot decode or build either worker", async () 
   const decode = vi.spyOn(task.codec, "decode");
   const otherDecode = vi.spyOn(countTask.codec, "decode");
   await envelope(await f.processor.fetch(request(), env), 200, {
-    taskId: "17",
+    task: { kind: "published", taskId: "17", taskName: task.name },
     nextAction: { type: "done" },
   });
   expect(f.backend.claimPublished).toHaveBeenCalledExactlyOnceWith(
@@ -643,7 +982,10 @@ test.each([
   await envelope(
     await processor.fetch(request({ taskId: "17", taskName: name }), env),
     200,
-    { taskId: "17", nextAction: { type: "done" } },
+    {
+      task: { kind: "published", taskId: "17", taskName: definition.name },
+      nextAction: { type: "done" },
+    },
   );
   expect(f.factory.build).toHaveBeenCalledExactlyOnceWith(23);
   expect(f.backend.claimPublished).toHaveBeenCalledExactlyOnceWith(
@@ -702,9 +1044,16 @@ test("annotated environments infer task payload and callback types", () => {
       }),
     ],
   }));
-  const singleton = { task: defineSingletonTask("singleton"), build: vi.fn() };
-  // @ts-expect-error A wire ID must never be interpreted as singleton activation.
-  createPostgresProcessorTask(singleton);
+  createPostgresProcessorTask({
+    task: defineSingletonTask<number[]>("singleton"),
+    build: () => ({
+      async process(id, payload) {
+        expectTypeOf(id).toEqualTypeOf<number>();
+        expectTypeOf(payload).toEqualTypeOf<undefined>();
+        return TaskSuccess.done([id]);
+      },
+    }),
+  });
   createPostgresProcessorTask({
     task,
     build: () => ({
@@ -741,7 +1090,10 @@ test.each([
     await f.processor.fetch(request(), env),
     nextAction ? 200 : 500,
     nextAction
-      ? { taskId: "17", nextAction }
+      ? {
+          task: { kind: "published", taskId: "17", taskName: task.name },
+          nextAction,
+        }
       : { error: "task processing attempt failed" },
   );
   expect(f.factory.build).not.toHaveBeenCalled();
@@ -801,7 +1153,7 @@ test.each([
   stillPending();
   f.backend.closeGate.release();
   await envelope(await response, 200, {
-    taskId: "17",
+    task: { kind: "published", taskId: "17", taskName: task.name },
     nextAction:
       outcome === "success"
         ? { type: "done" }
@@ -860,8 +1212,8 @@ test.each([
     expect(f.backend.close).toHaveBeenCalledTimes(1);
   }
   expect(vi.mocked(console.error).mock.calls).toEqual([
-    ["task processing attempt failed 17 attempt"],
-    ["task processing attempt failed 17 attempt"],
+    ["task processing attempt failed published attempt"],
+    ["task processing attempt failed published attempt"],
   ]);
 });
 
@@ -922,7 +1274,7 @@ test.each([
     await vi.advanceTimersByTimeAsync(321);
     f.backend.closeGate.release();
     await envelope(await response, 200, {
-      taskId: "17",
+      task: { kind: "published", taskId: "17", taskName: task.name },
       nextAction: { type: "retryAt", atMs },
     });
     expect(f.backend.finish).toHaveBeenCalledTimes(
@@ -952,7 +1304,7 @@ test.each([
   expect(f.cleanup).toHaveBeenCalledTimes(1);
   expect(f.backend.close).toHaveBeenCalledTimes(1);
   expect(console.error).toHaveBeenCalledExactlyOnceWith(
-    "task processing attempt failed 17 attempt",
+    "task processing attempt failed published attempt",
   );
 });
 
@@ -962,7 +1314,7 @@ test.each([
   const f = fixture();
   f.backend.claimError = new TaskUnavailableError(atMs);
   await envelope(await f.processor.fetch(request(), env), 200, {
-    taskId: "17",
+    task: { kind: "published", taskId: "17", taskName: task.name },
     nextAction: { type: "retryAt", atMs },
   });
 });
@@ -993,7 +1345,7 @@ test.each([
     error: "task processing attempt failed",
   });
   expect(console.error).toHaveBeenCalledExactlyOnceWith(
-    `task processing attempt failed 17 ${stage}`,
+    `task processing attempt failed published ${stage}`,
   );
   expect(f.cleanup).toHaveBeenCalledTimes(stage === "configuration" ? 0 : 1);
   expect(f.backend.close).toHaveBeenCalledTimes(
@@ -1013,7 +1365,7 @@ test("reports every failure without skipping shutdown", async () => {
   });
   expect(vi.mocked(console.error).mock.calls).toEqual(
     ["attempt", "application-cleanup", "backend-close"].map((stage) => [
-      `task processing attempt failed 17 ${stage}`,
+      `task processing attempt failed published ${stage}`,
     ]),
   );
   expect(f.cleanup).toHaveBeenCalledTimes(1);
@@ -1054,13 +1406,13 @@ test("fresh concurrent scopes and backends do not share cleanup", async () => {
   secondPending();
   gates[1].release();
   await envelope(await second, 200, {
-    taskId: "18",
+    task: { kind: "published", taskId: "18", taskName: countTask.name },
     nextAction: { type: "done" },
   });
   firstPending();
   gates[0].release();
   await envelope(await first, 200, {
-    taskId: "17",
+    task: { kind: "published", taskId: "17", taskName: task.name },
     nextAction: { type: "done" },
   });
   expect(configure).toHaveBeenCalledTimes(2);
@@ -1141,6 +1493,6 @@ test("renewal loss does not cancel business work; registered cleanup drains it",
   expect(f.backend.finish).not.toHaveBeenCalled();
   expect(f.backend.fail).not.toHaveBeenCalled();
   expect(console.error).toHaveBeenCalledExactlyOnceWith(
-    "task processing attempt failed 17 attempt",
+    "task processing attempt failed published attempt",
   );
 });

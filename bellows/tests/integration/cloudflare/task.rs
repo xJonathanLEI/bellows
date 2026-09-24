@@ -1,7 +1,23 @@
-use bellows::{PublishTrigger, TaskDefinition};
+use bellows::{PublishTrigger, SingletonTrigger, TaskDefinition};
 use serde::{Deserialize, Serialize};
 
+pub struct SingletonTask;
+impl TaskDefinition for SingletonTask {
+    const NAME: &'static str = "cloudflare_singleton";
+    type Callback = ();
+    type Trigger = SingletonTrigger;
+}
+
 pub struct GreetingTask;
+
+// Registered only by processors, deliberately absent from producer bootstrap configuration.
+#[allow(dead_code)]
+pub struct UnconfiguredSingletonTask;
+impl TaskDefinition for UnconfiguredSingletonTask {
+    const NAME: &'static str = " singleton:7 🦀 ";
+    type Callback = ();
+    type Trigger = SingletonTrigger;
+}
 
 #[derive(Serialize, Deserialize)]
 pub struct GreetingPayload {

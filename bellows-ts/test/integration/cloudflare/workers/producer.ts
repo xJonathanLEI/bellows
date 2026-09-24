@@ -6,11 +6,17 @@ import {
   type PostgresPublisherReceipt,
 } from "../../../../src/cloudflare/postgres.js";
 import { RetainedTaskDispatcher } from "../../../../src/cloudflare.js";
-import { fullNameTask, greetingTask, schedulingTask } from "../task.js";
+import {
+  fullNameTask,
+  greetingTask,
+  schedulingTask,
+  singletonTask,
+} from "../task.js";
 
 interface ProducerEnv {
   HYPERDRIVE: Hyperdrive;
   BELLOWS_SCHEMA: string;
+  BELLOWS_SINGLETON_BOOTSTRAP?: string;
   DISPATCHER: DurableObjectNamespace<TaskDispatcher>;
   PROCESSOR: Fetcher;
 }
@@ -40,7 +46,11 @@ function validName(value: unknown): value is string {
 }
 
 export default {
-  scheduled: createPostgresSweeper(publisherConfig).scheduled,
+  scheduled: createPostgresSweeper((env: ProducerEnv) => ({
+    ...publisherConfig(env),
+    singletons:
+      env.BELLOWS_SINGLETON_BOOTSTRAP === "true" ? [singletonTask] : [],
+  })).scheduled,
   async fetch(request, env): Promise<Response> {
     const url = new URL(request.url);
     const path = url.pathname;

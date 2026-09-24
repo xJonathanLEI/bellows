@@ -220,7 +220,11 @@ impl ProcessorFetcher for Stub {
             wait(&state.body_gate).await;
             state.fail(Fault::Body)?;
             state.event("body-end");
-            Ok(response_body())
+            Ok(if state.status == 200 {
+                format!("{{\"ok\":true}}{}\n", " ".repeat(2000))
+            } else {
+                response_body()
+            })
         });
         Ok(Response::builder().status(self.0.status).body(body)?)
     }
@@ -337,7 +341,7 @@ fn assert_dispatch(state: &State, name: &str, id: &str) {
     assert_eq!(requests[0].headers()["content-type"], "application/json");
     assert_eq!(
         serde_json::from_str::<Value>(requests[0].body()).unwrap(),
-        json!({ "taskId": id, "taskName": name })
+        json!({"tasks": [{"task": {"kind": "published", "taskId": id, "taskName": name }, "intent": "run"}]})
     );
 }
 

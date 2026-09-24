@@ -4,6 +4,7 @@ import {
   createPostgresSweeper,
   PostgresPublisherError,
 } from "../../../../src/cloudflare/postgres.js";
+import { dispatchEntry } from "../../../../src/cloudflare/protocol.js";
 import { dispatchTask } from "../../../../src/cloudflare.js";
 import { definePublishTask } from "../../../../src/index.js";
 
@@ -70,6 +71,7 @@ export class PublisherReceiver extends DurableObject<Env> {
   private statuses: number[] = [];
   private readonly dispatches: unknown[] = [];
   private drained = 0;
+  private requests = 0;
   private readonly releases: Array<() => void> = [];
   private draining = false;
 
@@ -79,6 +81,7 @@ export class PublisherReceiver extends DurableObject<Env> {
         return Response.json({
           dispatches: this.dispatches,
           drained: this.drained,
+          requests: this.requests,
         });
       case "/publisher/response": {
         const { status, statuses } = await request.json<{
@@ -97,7 +100,13 @@ export class PublisherReceiver extends DurableObject<Env> {
         for (const release of this.releases.splice(0)) release();
         return new Response(null);
       case "/dispatch": {
-        this.dispatches.push(await request.json());
+        const body = await request.json<{ tasks: unknown[] }>();
+        if (!Array.isArray(body.tasks) || Object.keys(body).length !== 1)
+          return new Response("invalid batch", { status: 400 });
+        const entries = body.tasks.map(dispatchEntry);
+        this.requests++;
+        this.dispatches.push(...entries);
+        const status = this.statuses.shift() ?? this.status;
         const released = this.draining
           ? Promise.resolve()
           : new Promise<void>((resolve) => this.releases.push(resolve));
@@ -110,17 +119,23 @@ export class PublisherReceiver extends DurableObject<Env> {
                 sent = true;
                 // Withhold the tail after more than the dispatch helper's diagnostic excerpt.
                 controller.enqueue(
-                  encoder.encode(`fixture-secret:${"a".repeat(10_000)}`),
+                  encoder.encode(
+                    status === 200
+                      ? `{"ok":true}${" ".repeat(10_000)}`
+                      : `fixture-secret:${"a".repeat(10_000)}`,
+                  ),
                 );
               } else {
                 await released;
-                controller.enqueue(encoder.encode("🦀:complete"));
+                controller.enqueue(
+                  encoder.encode(status === 200 ? "\n" : "🦀:complete"),
+                );
                 controller.close();
                 this.drained += 1;
               }
             },
           }),
-          { status: this.statuses.shift() ?? this.status },
+          { status },
         );
       }
       default:

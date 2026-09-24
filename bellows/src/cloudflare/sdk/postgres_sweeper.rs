@@ -12,7 +12,8 @@ use crate::{
 };
 
 pub use crate::cloudflare::sweeper::{
-    PostgresSweepCandidate, PostgresSweepReport, PostgresSweeperError, PostgresSweeperStage,
+    PostgresSweepCandidate, PostgresSweepReport, PostgresSweeperError, PostgresSweeperSingleton,
+    PostgresSweeperStage,
 };
 
 /// The entire selected schema must belong to the workload served by this dispatcher.
@@ -21,6 +22,7 @@ pub struct PostgresSweeperConfig {
     pub connection_string: String,
     pub options: PostgresBackendOptions,
     pub dispatcher: ObjectNamespace,
+    singletons: Vec<PostgresSweeperSingleton>,
 }
 
 impl PostgresSweeperConfig {
@@ -33,15 +35,26 @@ impl PostgresSweeperConfig {
             connection_string: connection_string.into(),
             options,
             dispatcher,
+            singletons: Vec::new(),
         }
+    }
+
+    /// Bootstrap definitions after discovery. This does not filter database recovery.
+    pub fn with_singletons(
+        mut self,
+        singletons: impl IntoIterator<Item = PostgresSweeperSingleton>,
+    ) -> Self {
+        self.singletons = singletons.into_iter().collect();
+        self
     }
 }
 
-/// Read-only best-effort recovery through the existing `global` dispatcher, without a registry.
+/// Read-only recovery of both task kinds through `global`, plus optional singleton bootstrap.
 ///
 /// Each call owns a fresh backend and awaits dispatches and shutdown, including on errors.
 /// Fixed database time and an upper ID bound each pass, not a snapshot. Pagination does not limit
-/// dispatch concurrency; concurrent changes may await another sweep.
+/// dispatch concurrency; concurrent changes may await another sweep. After successful discovery,
+/// configured singletons not submitted in page batches receive one bulk ensure request.
 ///
 /// Await within the event, sanitize boundary errors, and register the Cron Trigger separately.
 /// With worker 0.8.5, use a rejecting JS promise export: `#[event(scheduled)]` discards returned errors.
@@ -80,6 +93,11 @@ impl<C: Fn(&Env) -> worker::Result<PostgresSweeperConfig>> Sweeper for EventSwee
         Ok(Scope {
             settings: (config.connection_string, config.options),
             dispatcher: config.dispatcher,
+            singletons: config
+                .singletons
+                .iter()
+                .map(|task| task.name().to_owned())
+                .collect(),
         })
     }
 
@@ -101,12 +119,15 @@ impl<C: Fn(&Env) -> worker::Result<PostgresSweeperConfig>> Sweeper for EventSwee
         backend: &Self::Backend,
         window: &Self::Window,
         cursor: Option<i64>,
-    ) -> Result<Vec<(i64, String)>, BoxDispatchError> {
+    ) -> Result<Vec<(i64, String, bool)>, BoxDispatchError> {
+        if window.upper_id.is_none() {
+            return Ok(Vec::new());
+        }
         Ok(backend
             .read_page(window, cursor)
             .await?
             .into_iter()
-            .map(|row| (row.task_id, row.task_name))
+            .map(|row| (row.task_id, row.task_name, row.is_singleton))
             .collect())
     }
 

@@ -277,6 +277,7 @@ impl PostgresTaskOperations {
                 Ok(PostgresDiscoveryCandidate {
                     task_id: row.try_get("task_id")?,
                     task_name: row.try_get("task_name")?,
+                    is_singleton: row.try_get("is_singleton")?,
                 })
             })
             .collect()

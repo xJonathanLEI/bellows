@@ -6,14 +6,17 @@ mod db;
 mod task;
 
 use bellows::{
-    TaskFailure, TaskResult, TaskSuccess, Worker, WorkerFactory,
+    SingletonTrigger, TaskDefinition, TaskFailure, TaskResult, TaskSuccess, Worker, WorkerFactory,
     backends::postgres_execution::PostgresBackendOptions,
-    cloudflare::sdk::{PostgresProcessor, PostgresProcessorConfig, PostgresProcessorTask},
+    cloudflare::{
+        TaskIdentity,
+        sdk::{PostgresProcessor, PostgresProcessorConfig, PostgresProcessorTask},
+    },
 };
 use std::sync::Arc;
 use task::{
     FullNamePayload, FullNameTask, GreetingPayload, GreetingTask, SchedulingMode,
-    SchedulingPayload, SchedulingTask,
+    SchedulingPayload, SchedulingTask, SingletonTask, UnconfiguredSingletonTask,
 };
 use tokio::sync::Mutex;
 use tokio_postgres::types::Type;
@@ -138,21 +141,62 @@ impl WorkerFactory for SchedulingFactory {
     }
 }
 
+struct SingletonFactory<T>(SideEffect, String, std::marker::PhantomData<fn() -> T>);
+struct SingletonWorker<T>(SideEffect, String, std::marker::PhantomData<fn() -> T>);
+
+impl<T: TaskDefinition<Trigger = SingletonTrigger, Callback = ()>> WorkerFactory
+    for SingletonFactory<T>
+{
+    type Worker = SingletonWorker<T>;
+
+    fn build(&self, _worker_id: u64) -> Self::Worker {
+        SingletonWorker(self.0.clone(), self.1.clone(), std::marker::PhantomData)
+    }
+}
+
+impl<T: TaskDefinition<Trigger = SingletonTrigger, Callback = ()>> Worker for SingletonWorker<T> {
+    type Task = T;
+
+    #[worker::send]
+    async fn process(self, task_id: u64, (): ()) -> TaskResult<()> {
+        let count = self.0.record(task_id, T::NAME.into()).await?;
+        let at = task::deadline(
+            Date::now().as_millis()
+                + if count == 1 && self.1 != "park" {
+                    1_000
+                } else {
+                    60_000
+                },
+        );
+        if count == 1 {
+            match self.1.as_str() {
+                "failure" => return Err(TaskFailure::retry_at(at)),
+                "immediate" => return Err(TaskFailure::retry_immediately()),
+                "done" => return Ok(TaskSuccess::done(())),
+                _ => {}
+            }
+        }
+        Ok(TaskSuccess::schedule_next_run((), at))
+    }
+}
+
 thread_local! {
     // Fixture-only response loss after real finalization and cleanup, not a production route.
     static LOST_RESPONSES: std::cell::RefCell<std::collections::HashSet<String>> = Default::default();
+    static SINGLETON_ATTEMPTS: std::cell::RefCell<std::collections::HashMap<String, u64>> = Default::default();
 }
 
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct LostResponseRequest {
-    task_id: String,
+    task_id: Option<String>,
+    task_name: Option<String>,
 }
 
 #[derive(serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ProcessorResponse {
-    task_id: String,
+    task: TaskIdentity,
     next_action: NextAction,
 }
 
@@ -168,14 +212,25 @@ enum NextAction {
 
 #[event(fetch)]
 pub async fn fetch(mut request: Request, env: Env, _ctx: Context) -> Result<Response> {
+    if request.path() == "/__test/attempts" {
+        return SINGLETON_ATTEMPTS.with(|attempts| Response::from_json(&*attempts.borrow()));
+    }
     if request.path() == "/__test/lose-response" {
         let body: LostResponseRequest = request.json().await?;
-        LOST_RESPONSES.with(|ids| ids.borrow_mut().insert(body.task_id));
+        let key = body
+            .task_name
+            .or(body.task_id)
+            .ok_or_else(|| Error::from("missing identity"))?;
+        LOST_RESPONSES.with(|ids| ids.borrow_mut().insert(key));
         return Response::empty();
     }
     let mut response = PostgresProcessor::new(|env: &Env| {
         let url = env.hyperdrive("HYPERDRIVE")?.connection_string();
         let schema = env.var("BELLOWS_SCHEMA")?.to_string();
+        let mode = env
+            .var("BELLOWS_SINGLETON_MODE")
+            .map(|value| value.to_string())
+            .unwrap_or_else(|_| "park".into());
         let side_effect = Arc::new(Mutex::new(None));
         let effect = SideEffect {
             hyperdrive_url: url.clone(),
@@ -190,7 +245,17 @@ pub async fn fetch(mut request: Request, env: Env, _ctx: Context) -> Result<Resp
             vec![
                 PostgresProcessorTask::new(GreetingFactory(effect.clone())),
                 PostgresProcessorTask::new(FullNameFactory(effect.clone())),
-                PostgresProcessorTask::new(SchedulingFactory(effect)),
+                PostgresProcessorTask::new(SchedulingFactory(effect.clone())),
+                PostgresProcessorTask::singleton(SingletonFactory::<SingletonTask>(
+                    effect.clone(),
+                    mode.clone(),
+                    std::marker::PhantomData,
+                )),
+                PostgresProcessorTask::singleton(SingletonFactory::<UnconfiguredSingletonTask>(
+                    effect,
+                    mode,
+                    std::marker::PhantomData,
+                )),
             ],
         )
         .with_cleanup(async move {
@@ -203,13 +268,22 @@ pub async fn fetch(mut request: Request, env: Env, _ctx: Context) -> Result<Resp
     })
     .fetch_worker(request, &env)
     .await?;
-    if response.status_code() != 200 || LOST_RESPONSES.with(|ids| ids.borrow().is_empty()) {
+    if response.status_code() != 200 {
         return Ok(response);
     }
     let body: ProcessorResponse = response.json().await?;
-    if matches!(body.next_action, NextAction::Done)
-        && LOST_RESPONSES.with(|ids| ids.borrow_mut().remove(&body.task_id))
-    {
+    let lost = match &body.task {
+        TaskIdentity::Singleton { task_name } => {
+            SINGLETON_ATTEMPTS
+                .with(|attempts| *attempts.borrow_mut().entry(task_name.clone()).or_default() += 1);
+            LOST_RESPONSES.with(|ids| ids.borrow_mut().remove(task_name))
+        }
+        TaskIdentity::Published { task_id, .. } => {
+            matches!(body.next_action, NextAction::Done)
+                && LOST_RESPONSES.with(|ids| ids.borrow_mut().remove(task_id))
+        }
+    };
+    if lost {
         return Response::error("fixture response lost", 503);
     }
     Response::from_json(&body)

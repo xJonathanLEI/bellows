@@ -1,11 +1,11 @@
 //! Cloudflare PostgreSQL publication, dispatch, processing, and read-only recovery.
 //!
 //! Keep one [`RetainedTaskDispatcher`] per SQLite-backed Durable Object, using the named object
-//! `global`. Dispatch launches with in-memory tracking before checking the warming alarm; active same-ID duplicates
-//! cannot change routing and remain suppressed through full response consumption and result persistence.
-//! A pending ID can be explicitly redispatched immediately with a corrected name.
-//! Generic dispatch accepts opaque IDs; the wasm `sdk::PostgresPublisher`, `sdk::PostgresProcessor`,
-//! and `sdk::PostgresSweeper` delegates require canonical positive decimal IDs up to 9007199254740991.
+//! `global`. Bulk dispatch validates every entry before launching in memory and checking the warming
+//! alarm once. Active duplicates remain suppressed through full response consumption and result persistence,
+//! keyed by published ID or singleton name. A pending published ID can be redispatched with a corrected name.
+//! Generic published dispatch accepts opaque IDs; the wasm PostgreSQL delegates require canonical
+//! positive decimal published IDs up to 9007199254740991. Singleton identities carry only exact names.
 //!
 //! Bind a publisher to one published task and its dispatcher. Synchronous configuration runs once
 //! per call, not at construction. It publishes once, retains an exact string receipt, validates
@@ -18,26 +18,29 @@
 //! `PostgresPublishingBackend` plus [`dispatch_task`] remains a caller-managed alternative.
 //!
 //! `publish_future` records availability but dispatches immediately so PostgreSQL supplies the hint.
-//! Both dispatch hops require only `{ taskId, taskName }`, never payloads or scheduling metadata.
-//! The processor selects a typed
-//! registration by exact definition name; names must be non-empty and unique within the registry.
-//! Unknown names return 404 without acquisition; the database claim still checks both ID and name.
+//! Dispatch accepts `{ tasks: [{ task: TaskIdentity, intent: "run" | "ensure" }] }`. Processor requests carry
+//! `{ task: TaskIdentity }`, never payloads or scheduling metadata. The processor selects a typed
+//! registration by exact definition name and kind; names must be non-empty and globally unique
+//! within the registry. Unknown or mismatched kinds return 404 without acquisition. Published
+//! claims check both ID and name; singleton claims obtain their backend-managed row by exact name.
 //! The processor validates before calling your synchronous environment-to-config callback. For a
 //! selected registration, it owns a fresh backend and awaits the runtime, application cleanup, and
 //! backend shutdown. Applications still own business resources. Use `PostgresExecutionBackend` with
 //! [`crate::run_task_once`] for lower-level integrations with caller-owned cleanup.
 //!
-//! Only a successful, fully consumed, matching-ID `nextAction: { type: "done" }` deletes tracking.
+//! Only a successful, fully consumed, matching-identity `nextAction: { type: "done" }` deletes tracking.
 //! `retryAt` with absolute Unix `atMs` persists the hint and resets infrastructure backoff; HTTP 200
 //! describes a known action, not business success. Invalid responses and transport/body failures
 //! retry with exponential backoff from one to thirty seconds, in memory until a hint is persisted.
 //! One alarm selects the earliest pending/60-second watchdog deadline or independent 30-second
-//! heartbeat. Every due distinct ID launches without a Bellows concurrency cap, subject to platform
+//! heartbeat. Every due distinct identity launches without a Bellows concurrency cap, subject to platform
 //! limits. The watchdog applies to scheduled attempts, not unsaved external dispatches.
 //! Watchdog supersession ignores stale responses but does not guarantee business cancellation.
 //! PostgreSQL remains the execution/lease authority; renewed leases can move hints later.
 //! Durability starts when a scheduling hint is persisted. The wasm `sdk::PostgresSweeper` provides
-//! read-only PostgreSQL rediscovery through the same dispatcher for earlier invocation gaps.
+//! read-only PostgreSQL rediscovery of both kinds through the same dispatcher for earlier invocation gaps,
+//! plus optional typed singleton bootstrap. Bootstrap suppression is delegate-local memory only:
+//! it never blocks discovery or alarms. Singleton success without a deadline immediately repeats.
 //! Applications must install their own scheduled entrypoint and Cron Trigger; its selected schema
 //! must belong entirely to the target workload. Alarms and attempts are at-least-once, not exactly-once side effects.
 //! Publication and dispatch are not atomic; there is no automatic republishing, callback delivery, or
@@ -48,7 +51,7 @@
 //! See the [Rust examples](https://github.com/xJonathanLEI/bellows/tree/master/bellows/tests/integration/cloudflare).
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     pin::Pin,
     sync::{Arc, Mutex},
 };
@@ -70,7 +73,9 @@ mod publisher;
 #[cfg(any(target_arch = "wasm32", test))]
 mod sweeper;
 
+mod protocol;
 mod scheduler;
+pub use protocol::{DispatchIntent, DispatchTask, TaskIdentity};
 use scheduler::HEARTBEAT_INTERVAL_MS;
 pub use scheduler::{
     DispatcherState, DispatcherStorage, DispatcherTask, ScheduleUpdate, SchedulerMetadata,
@@ -125,12 +130,12 @@ enum NextAction {
 
 async fn processor_action(
     response: Response<TextBody>,
-    task_id: &str,
+    task: &TaskIdentity,
 ) -> Result<NextAction, BoxDispatchError> {
     #[derive(serde::Deserialize)]
     #[serde(rename_all = "camelCase", deny_unknown_fields)]
     struct Envelope {
-        task_id: String,
+        task: TaskIdentity,
         next_action: NextAction,
     }
     let status = response.status();
@@ -145,7 +150,7 @@ async fn processor_action(
     }
     let envelope: Envelope = serde_json::from_str(&body)
         .map_err(|_| BoxDispatchError::from("invalid processor next action"))?;
-    if envelope.task_id != task_id
+    if &envelope.task != task
         || matches!(envelope.next_action, NextAction::RetryAt { at_ms } if !scheduler::timestamp(at_ms))
     {
         return Err("invalid processor next action".into());
@@ -177,12 +182,39 @@ pub async fn dispatch_task(
     task_name: &str,
     task_id: &str,
 ) -> Result<(), BoxDispatchError> {
-    validate_task_id(task_id)?;
-    validate_task_name(task_name)?;
+    dispatch_tasks(
+        namespace,
+        &[DispatchTask {
+            task: TaskIdentity::Published {
+                task_id: task_id.to_owned(),
+                task_name: task_name.to_owned(),
+            },
+            intent: DispatchIntent::Run,
+        }],
+    )
+    .await
+}
+
+/// Validates the entire batch before contacting `global`. Empty batches perform no I/O.
+pub async fn dispatch_tasks(
+    namespace: &impl DurableObjectNamespaceLike,
+    tasks: &[DispatchTask],
+) -> Result<(), BoxDispatchError> {
+    for entry in tasks {
+        entry.validate()?;
+    }
+    if tasks.is_empty() {
+        return Ok(());
+    }
     let dispatcher = namespace.get_by_name(DISPATCHER_NAME)?;
     consume_response(
         dispatcher
-            .fetch(processor_request(DISPATCH_URL, task_name, task_id))
+            .fetch(
+                Request::post(DISPATCH_URL)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(json!({ "tasks": tasks }).to_string())
+                    .expect("constant dispatch URL and headers are valid"),
+            )
             .await?,
         "dispatcher",
     )
@@ -199,6 +231,8 @@ type InFlight = Arc<Mutex<HashMap<String, RetainedAttempt>>>;
 
 /// In-memory dispatch and outcome-driven durable scheduling with unrestricted fan-out.
 /// Dispatch only checks/repairs the warming alarm; it never persists task acceptance.
+/// Singleton `ensure` entries use a delegate-local bootstrap set, forgotten on definitive done.
+/// Recovery `run` entries and alarms bypass that optimization; reconstruction starts with an empty set.
 /// Uncertainty backs off in memory until a hint is saved. A sixty-second watchdog recovers
 /// scheduled attempts. Superseding transport does not imply cancellation of business work.
 pub struct RetainedTaskDispatcher<S, P> {
@@ -210,6 +244,8 @@ struct DispatcherCore<S, P> {
     processor: Arc<P>,
     in_flight: InFlight,
     memory_retries: Mutex<HashMap<String, Arc<DispatcherTask>>>,
+    // Bootstrap optimization only. Recovery and alarms never consult it.
+    singletons: Mutex<HashSet<String>>,
     bookkeeping: tokio::sync::Mutex<()>,
     now: fn() -> i64,
 }
@@ -227,6 +263,7 @@ impl<S: DispatcherStorage, P: ProcessorFetcher> RetainedTaskDispatcher<S, P> {
                 processor: Arc::new(processor),
                 in_flight: Arc::default(),
                 memory_retries: Mutex::default(),
+                singletons: Mutex::default(),
                 bookkeeping: tokio::sync::Mutex::new(()),
                 now,
             }),
@@ -269,7 +306,7 @@ impl<S: DispatcherStorage, P: ProcessorFetcher> RetainedTaskDispatcher<S, P> {
                     .tasks
                     .values()
                     .filter(|task| task.next_attempt_at_ms <= now)
-                    .map(|task| task.task_id.clone())
+                    .map(|task| task.task.tracking_key())
                     .collect();
                 let mut launches = Vec::new();
                 let mut expired = Vec::new();
@@ -309,7 +346,7 @@ impl<S: DispatcherStorage, P: ProcessorFetcher> RetainedTaskDispatcher<S, P> {
                 }
                 drop(active);
                 for task in launches {
-                    core.launch_processor(task);
+                    core.launch_processor(task, DispatchIntent::Run);
                 }
                 Ok(())
             }
@@ -345,36 +382,46 @@ impl<S: DispatcherStorage, P: ProcessorFetcher> RetainedTaskDispatcher<S, P> {
         {
             return Err("request content-type must be application/json".into());
         }
-        let body: Value = serde_json::from_str(&request.into_body().await?)?;
-        let object = body
-            .as_object()
-            .ok_or("request body must be a JSON object")?;
-        let task_id = object
-            .get("taskId")
-            .and_then(Value::as_str)
-            .ok_or(INVALID_TASK_ID)?;
-        validate_task_id(task_id)?;
-        let task_name = object
-            .get("taskName")
-            .and_then(Value::as_str)
-            .ok_or(INVALID_TASK_NAME)?;
-        validate_task_name(task_name)?;
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Batch {
+            tasks: Vec<DispatchTask>,
+        }
+        let batch: Batch = serde_json::from_str(&request.into_body().await?)
+            .map_err(|_| "invalid dispatch batch")?;
+        for entry in &batch.tasks {
+            entry.validate()?;
+        }
+        if batch.tasks.is_empty() {
+            return Ok(json_response(json!({ "ok": true }), StatusCode::OK));
+        }
 
         let core = &self.core;
         let now = (core.now)();
-        let failures = core
-            .memory_retries
-            .lock()
-            .unwrap()
-            .get(task_id)
-            .map_or(0, |task| task.infrastructure_failures);
-        let duplicate = !core.launch_processor(DispatcherTask {
-            task_id: task_id.to_owned(),
-            task_name: task_name.to_owned(),
-            next_attempt_at_ms: now,
-            infrastructure_failures: failures,
-            state: TaskSchedule::Pending,
-        });
+        let mut launched = HashSet::new();
+        for entry in batch.tasks {
+            let key = entry.task.tracking_key();
+            if launched.contains(&key) {
+                continue;
+            }
+            let failures = core
+                .memory_retries
+                .lock()
+                .unwrap()
+                .get(&key)
+                .map_or(0, |task| task.infrastructure_failures);
+            if core.launch_processor(
+                DispatcherTask {
+                    task: entry.task,
+                    next_attempt_at_ms: now,
+                    infrastructure_failures: failures,
+                    state: TaskSchedule::Pending,
+                },
+                entry.intent,
+            ) {
+                launched.insert(key);
+            }
+        }
         // Launch before storage access. Serialize only the alarm check with other
         // bookkeeping so heartbeat repair cannot overwrite an earlier task alarm.
         let _lock = core.bookkeeping.lock().await;
@@ -387,30 +434,32 @@ impl<S: DispatcherStorage, P: ProcessorFetcher> RetainedTaskDispatcher<S, P> {
         {
             core.storage.set_alarm(deadline).await?;
         }
-        Ok(json_response(
-            if duplicate {
-                json!({ "duplicate": true, "ok": true, "taskId": task_id })
-            } else {
-                json!({ "ok": true, "taskId": task_id })
-            },
-            StatusCode::OK,
-        ))
+        Ok(json_response(json!({ "ok": true }), StatusCode::OK))
     }
 }
 
 impl<S: DispatcherStorage, P: ProcessorFetcher> DispatcherCore<S, P> {
-    fn launch_processor(self: &Arc<Self>, task: DispatcherTask) -> bool {
-        let task_id = task.task_id.clone();
+    // True reserves this identity for the request, even if a native executor finishes it
+    // before the next entry. A bootstrap-only no-op returns false so a later run can launch.
+    fn launch_processor(self: &Arc<Self>, task: DispatcherTask, intent: DispatchIntent) -> bool {
+        let key = task.task.tracking_key();
         let task = Arc::new(task);
         let mut in_flight = self.in_flight.lock().unwrap();
-        if in_flight.contains_key(&task_id) {
-            return false;
+        if in_flight.contains_key(&key) {
+            return true;
         }
-        self.memory_retries.lock().unwrap().remove(&task_id);
+        if let TaskIdentity::Singleton { task_name } = &task.task {
+            let mut singletons = self.singletons.lock().unwrap();
+            if intent == DispatchIntent::Ensure && singletons.contains(task_name) {
+                return false;
+            }
+            singletons.insert(task_name.clone());
+        }
+        self.memory_retries.lock().unwrap().remove(&key);
         // Reserve before spawning, including on a multithreaded native executor. Insertion of the
         // handle and cleanup use the same short-lived lock, so immediate completion cannot race it.
         in_flight.insert(
-            task_id.clone(),
+            key.clone(),
             RetainedAttempt {
                 task: task.clone(),
                 _handle: None,
@@ -418,7 +467,7 @@ impl<S: DispatcherStorage, P: ProcessorFetcher> DispatcherCore<S, P> {
         );
         let mut cleanup = AttemptCleanup {
             core: self.clone(),
-            task_id: task_id.clone(),
+            key: key.clone(),
             task: task.clone(),
             observed: false,
         };
@@ -426,25 +475,20 @@ impl<S: DispatcherStorage, P: ProcessorFetcher> DispatcherCore<S, P> {
         let core = self.clone();
         let handle = platform::spawn(async move {
             let result = async {
-                let response = processor
-                    .fetch(processor_request(
-                        PROCESSOR_URL,
-                        &task.task_name,
-                        &cleanup.task_id,
-                    ))
-                    .await?;
-                processor_action(response, &cleanup.task_id).await
+                let identity = task.task.clone();
+                let response = processor.fetch(processor_request(&identity)).await?;
+                processor_action(response, &identity).await
             }
             .await;
             if let Err(error) = &result {
-                log_processor_failure(&cleanup.task_id, &error.to_string());
+                log_processor_failure(task.task.kind(), &error.to_string());
             }
             core.complete(task, result.ok()).await;
             cleanup.observed = true;
             // Cleanup also runs if a native fetch/body future panics or the executor cancels it.
             drop(cleanup);
         });
-        in_flight.get_mut(&task_id).unwrap()._handle = Some(handle);
+        in_flight.get_mut(&key).unwrap()._handle = Some(handle);
         true
     }
 
@@ -454,33 +498,34 @@ impl<S: DispatcherStorage, P: ProcessorFetcher> DispatcherCore<S, P> {
             .in_flight
             .lock()
             .unwrap()
-            .get(&attempt.task_id)
+            .get(&attempt.task.tracking_key())
             .is_some_and(|active| Arc::ptr_eq(&active.task, &attempt))
         {
             return;
         }
         let now = (self.now)();
-        let task_id = attempt.task_id.clone();
+        let key = attempt.task.tracking_key();
         let task = attempt.clone();
-        let result: Result<(), BoxDispatchError> = async {
+        let done = matches!(action, Some(NextAction::Done));
+        let result: Result<bool, BoxDispatchError> = async {
             // Reconcile prior schedules only after a response, never during acceptance.
             if !matches!(action, Some(NextAction::RetryAt { .. }))
-                && !self.storage.contains_task(&task_id).await?
+                && !self.storage.contains_task(&key).await?
             {
                 if action.is_none() && attempt.attempt_id().is_none() {
                     self.retry_in_memory(&attempt);
                 }
-                return Ok(());
+                return Ok(true);
             }
             self.storage
                 .transaction(Box::new(move |state| {
                     state.validate(now)?;
-                    let id = &task.task_id;
+                    let id = &task.task.tracking_key();
                     if task.attempt_id().is_some()
                         && state.tasks.get(id).and_then(DispatcherTask::attempt_id)
                             != task.attempt_id()
                     {
-                        return Ok(());
+                        return Ok(false);
                     }
                     match action {
                         Some(NextAction::Done) => {
@@ -490,8 +535,7 @@ impl<S: DispatcherStorage, P: ProcessorFetcher> DispatcherCore<S, P> {
                             state.tasks.insert(
                                 id.clone(),
                                 DispatcherTask {
-                                    task_id: id.clone(),
-                                    task_name: task.task_name.clone(),
+                                    task: task.task.clone(),
                                     state: TaskSchedule::Pending,
                                     next_attempt_at_ms: at_ms,
                                     infrastructure_failures: 0,
@@ -504,14 +548,22 @@ impl<S: DispatcherStorage, P: ProcessorFetcher> DispatcherCore<S, P> {
                             }
                         }
                     }
-                    Ok(())
+                    Ok(true)
                 }))
                 .await
         }
         .await;
-        if let Err(error) = result {
-            log_processor_failure(&task_id, &error.to_string());
-            self.retry_in_memory(&attempt);
+        match result {
+            Ok(true) if done => {
+                if let TaskIdentity::Singleton { task_name } = &attempt.task {
+                    self.singletons.lock().unwrap().remove(task_name);
+                }
+            }
+            Err(error) => {
+                log_processor_failure(attempt.task.kind(), &error.to_string());
+                self.retry_in_memory(&attempt);
+            }
+            _ => {}
         }
     }
 
@@ -523,7 +575,7 @@ impl<S: DispatcherStorage, P: ProcessorFetcher> DispatcherCore<S, P> {
         self.memory_retries
             .lock()
             .unwrap()
-            .insert(pending.task_id.clone(), pending.clone());
+            .insert(pending.task.tracking_key(), pending.clone());
         let core = self.clone();
         platform::spawn(async move {
             platform::sleep_until(
@@ -535,10 +587,10 @@ impl<S: DispatcherStorage, P: ProcessorFetcher> DispatcherCore<S, P> {
                 .memory_retries
                 .lock()
                 .unwrap()
-                .get(&pending.task_id)
+                .get(&pending.task.tracking_key())
                 .is_some_and(|task| Arc::ptr_eq(task, &pending));
             if current {
-                core.launch_processor((*pending).clone());
+                core.launch_processor((*pending).clone(), DispatchIntent::Run);
             }
         });
     }
@@ -546,7 +598,7 @@ impl<S: DispatcherStorage, P: ProcessorFetcher> DispatcherCore<S, P> {
 
 struct AttemptCleanup<S: DispatcherStorage, P: ProcessorFetcher> {
     core: Arc<DispatcherCore<S, P>>,
-    task_id: String,
+    key: String,
     task: Arc<DispatcherTask>,
     observed: bool,
 }
@@ -555,16 +607,16 @@ impl<S: DispatcherStorage, P: ProcessorFetcher> Drop for AttemptCleanup<S, P> {
     fn drop(&mut self) {
         let mut in_flight = self.core.in_flight.lock().unwrap();
         if !in_flight
-            .get(&self.task_id)
+            .get(&self.key)
             .is_some_and(|attempt| Arc::ptr_eq(&attempt.task, &self.task))
         {
             return;
         }
-        in_flight.remove(&self.task_id);
+        in_flight.remove(&self.key);
         drop(in_flight);
         if !self.observed {
             log_processor_failure(
-                &self.task_id,
+                self.task.task.kind(),
                 "processor task exited without an observed response",
             );
             self.core.retry_in_memory(&self.task);
@@ -572,10 +624,10 @@ impl<S: DispatcherStorage, P: ProcessorFetcher> Drop for AttemptCleanup<S, P> {
     }
 }
 
-fn processor_request(url: &str, task_name: &str, task_id: &str) -> Request<String> {
-    Request::post(url)
+fn processor_request(task: &TaskIdentity) -> Request<String> {
+    Request::post(PROCESSOR_URL)
         .header(CONTENT_TYPE, "application/json")
-        .body(json!({ "taskId": task_id, "taskName": task_name }).to_string())
+        .body(json!({ "task": task }).to_string())
         .expect("constant dispatch URL and headers are valid")
 }
 
@@ -634,10 +686,10 @@ fn unix_ms() -> i64 {
         .expect("current timestamp fits i64")
 }
 
-fn log_processor_failure(task_id: &str, error: &str) {
+fn log_processor_failure(kind: &str, error: &str) {
     let error = truncate_text(error, MAX_ERROR_LENGTH);
     #[cfg(not(target_arch = "wasm32"))]
-    tracing::error!(task_id, error, "task processor failed");
+    tracing::error!(kind, error, "task processor failed");
     #[cfg(target_arch = "wasm32")]
-    worker::console_error!("task processor failed {} {}", task_id, error);
+    worker::console_error!("task processor failed {} {}", kind, error);
 }

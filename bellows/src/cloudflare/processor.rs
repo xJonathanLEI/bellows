@@ -3,20 +3,21 @@ use std::{collections::BTreeSet, pin::Pin};
 use http::{Request, Response, StatusCode, header::CONTENT_TYPE};
 use serde_json::{Value, json};
 
-use super::{BoxDispatchError, INVALID_TASK_NAME, TextBody, json_response, validate_task_name};
+use super::{BoxDispatchError, TaskIdentity, TextBody, json_response, validate_task_name};
 use crate::{
-    PublishActivationStrategy, PublishDispatchToken, TaskAttemptOutcome, TaskDefinition,
-    TaskExecutionBackend, Worker, WorkerFactory, run_task_once,
+    PublishActivationStrategy, PublishDispatchToken, SingletonTrigger, TaskAttemptOutcome,
+    TaskDefinition, TaskExecutionBackend, Worker, WorkerFactory, run_task_once,
 };
 
 pub(super) type Cleanup = Pin<Box<dyn Future<Output = Result<(), BoxDispatchError>>>>;
 
 type Attempt = Pin<Box<dyn Future<Output = TaskAttemptOutcome>>>;
 
-// Erase the factory only after checking its own published definition and callback types.
+// Erase the factory only after checking its definition, trigger, and callback types.
 pub(super) struct ProcessorTask<B> {
     name: &'static str,
-    execute: Box<dyn FnOnce(B, u64, u64) -> Attempt>,
+    kind: &'static str,
+    execute: Box<dyn FnOnce(B, u64, Option<u64>) -> Attempt>,
 }
 
 impl<B: TaskExecutionBackend + 'static> ProcessorTask<B> {
@@ -29,13 +30,14 @@ impl<B: TaskExecutionBackend + 'static> ProcessorTask<B> {
     {
         Self {
             name: <F::Worker as Worker>::Task::NAME,
+            kind: "published",
             execute: Box::new(move |backend, worker_id, task_id| {
                 Box::pin(async move {
                     run_task_once(
                         backend,
                         factory,
                         worker_id,
-                        PublishDispatchToken::Task(task_id),
+                        PublishDispatchToken::Task(task_id.expect("validated published identity")),
                     )
                     .await
                 })
@@ -43,7 +45,21 @@ impl<B: TaskExecutionBackend + 'static> ProcessorTask<B> {
         }
     }
 
-    pub async fn run(self, backend: B, worker_id: u64, task_id: u64) -> TaskAttemptOutcome {
+    pub fn singleton<F>(factory: F) -> Self
+    where
+        F: WorkerFactory + 'static,
+        <F::Worker as Worker>::Task: TaskDefinition<Trigger = SingletonTrigger>,
+    {
+        Self {
+            name: <F::Worker as Worker>::Task::NAME,
+            kind: "singleton",
+            execute: Box::new(move |backend, worker_id, _| {
+                Box::pin(run_task_once(backend, factory, worker_id, ()))
+            }),
+        }
+    }
+
+    pub async fn run(self, backend: B, worker_id: u64, task_id: Option<u64>) -> TaskAttemptOutcome {
         (self.execute)(backend, worker_id, task_id).await
     }
 }
@@ -69,16 +85,16 @@ pub(super) trait Processor {
         backend: Self::Backend,
         task: ProcessorTask<Self::Backend>,
         worker_id: u64,
-        task_id: u64,
+        task_id: Option<u64>,
     ) -> Result<TaskAttemptOutcome, BoxDispatchError> {
         Ok(task.run(backend, worker_id, task_id).await)
     }
 
-    fn log_failure(&self, task_id: &str, stage: &'static str) {
+    fn log_failure(&self, kind: &str, stage: &'static str) {
         #[cfg(not(target_arch = "wasm32"))]
-        tracing::error!(task_id, stage, "task processing attempt failed");
+        tracing::error!(kind, stage, "task processing attempt failed");
         #[cfg(target_arch = "wasm32")]
-        worker::console_error!("task processing attempt failed {} {}", task_id, stage);
+        worker::console_error!("task processing attempt failed {} {}", kind, stage);
     }
 }
 
@@ -86,7 +102,7 @@ pub(super) async fn fetch<P: Processor>(
     processor: &P,
     request: Request<TextBody>,
 ) -> Response<String> {
-    let (task_id, id, task_name) = match validate(request).await {
+    let (identity, id) = match validate(request).await {
         Ok(id) => id,
         Err(response) => return response,
     };
@@ -97,7 +113,7 @@ pub(super) async fn fetch<P: Processor>(
     } = match processor.configure() {
         Ok(scope) => scope,
         Err(_) => {
-            processor.log_failure(&task_id, "configuration");
+            processor.log_failure(identity.kind(), "configuration");
             return error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "task processing attempt failed",
@@ -115,7 +131,10 @@ pub(super) async fn fetch<P: Processor>(
         {
             return Err("configuration");
         }
-        let Some(task) = tasks.into_iter().find(|task| task.name == task_name) else {
+        let Some(task) = tasks
+            .into_iter()
+            .find(|task| task.name == identity.name() && task.kind == identity.kind())
+        else {
             return Ok(None);
         };
         let worker_id = random_worker_id(|| processor.random_bytes()).map_err(|_| "worker-id")?;
@@ -144,20 +163,20 @@ pub(super) async fn fetch<P: Processor>(
     let mut failed = false;
     if let Err(stage) = &attempt {
         failed = true;
-        processor.log_failure(&task_id, stage);
+        processor.log_failure(identity.kind(), stage);
     }
     // Collect each result: application failure must not skip Bellows shutdown.
     if let Some(cleanup) = cleanup
         && cleanup.await.is_err()
     {
         failed = true;
-        processor.log_failure(&task_id, "application-cleanup");
+        processor.log_failure(identity.kind(), "application-cleanup");
     }
     if let Some(backend) = backend
         && processor.close(backend).await.is_err()
     {
         failed = true;
-        processor.log_failure(&task_id, "backend-close");
+        processor.log_failure(identity.kind(), "backend-close");
     }
     if failed {
         error(
@@ -166,7 +185,7 @@ pub(super) async fn fetch<P: Processor>(
         )
     } else if let Ok(Some(next_action)) = attempt {
         json_response(
-            json!({ "taskId": task_id, "nextAction": next_action }),
+            json!({ "task": identity, "nextAction": next_action }),
             StatusCode::OK,
         )
     } else {
@@ -189,7 +208,9 @@ fn random_worker_id(
 
 // Keep validation responses inline; this private result never crosses a task boundary.
 #[allow(clippy::result_large_err)]
-async fn validate(request: Request<TextBody>) -> Result<(String, u64, String), Response<String>> {
+async fn validate(
+    request: Request<TextBody>,
+) -> Result<(TaskIdentity, Option<u64>), Response<String>> {
     if request.uri().path() != "/process" {
         return Err(error(StatusCode::NOT_FOUND, "not-found"));
     }
@@ -216,16 +237,23 @@ async fn validate(request: Request<TextBody>) -> Result<(String, u64, String), R
         Err(_) => Err(()),
     }
     .map_err(|()| error(StatusCode::BAD_REQUEST, "invalid JSON"))?;
-    let Some(task_id) = body
-        .as_object()
-        .and_then(|body| body.get("taskId"))
-        .and_then(Value::as_str)
-        .filter(|id| {
-            (1..=16).contains(&id.len())
-                && matches!(id.as_bytes()[0], b'1'..=b'9')
-                && id.bytes().all(|byte| byte.is_ascii_digit())
-        })
-    else {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Envelope {
+        task: TaskIdentity,
+    }
+    let identity = serde_json::from_value::<Envelope>(body)
+        .map_err(|_| error(StatusCode::BAD_REQUEST, "invalid task identity"))?
+        .task;
+    validate_task_name(identity.name())
+        .map_err(|_| error(StatusCode::BAD_REQUEST, "invalid task identity"))?;
+    let TaskIdentity::Published { task_id, .. } = &identity else {
+        return Ok((identity, None));
+    };
+    if !((1..=16).contains(&task_id.len())
+        && matches!(task_id.as_bytes()[0], b'1'..=b'9')
+        && task_id.bytes().all(|byte| byte.is_ascii_digit()))
+    {
         return Err(error(
             StatusCode::BAD_REQUEST,
             "taskId must be a canonical positive decimal string",
@@ -238,12 +266,7 @@ async fn validate(request: Request<TextBody>) -> Result<(String, u64, String), R
             "taskId must encode a positive safe integer canonically",
         ));
     }
-    let task_name = body
-        .get("taskName")
-        .and_then(Value::as_str)
-        .ok_or_else(|| error(StatusCode::BAD_REQUEST, INVALID_TASK_NAME))?;
-    validate_task_name(task_name).map_err(|_| error(StatusCode::BAD_REQUEST, INVALID_TASK_NAME))?;
-    Ok((task_id.to_owned(), id, task_name.to_owned()))
+    Ok((identity, Some(id)))
 }
 
 fn error(status: StatusCode, message: &str) -> Response<String> {

@@ -21,8 +21,341 @@ use crate::{
 };
 
 const SECRET: &str = "postgres://user:secret@private/database";
-const CANONICAL: &str = "taskId must be a canonical positive decimal string";
+const INVALID_IDENTITY: &str = "invalid task identity";
 const SAFE: &str = "taskId must encode a positive safe integer canonically";
+
+#[tokio::test]
+async fn published_identity_preserves_canonical_id_validation() {
+    for id in [
+        "",
+        "0",
+        "-1",
+        "+1",
+        "01",
+        " 1",
+        "1 ",
+        "1\n",
+        "1.0",
+        "1e1",
+        "١",
+        "１",
+        "10000000000000000",
+    ] {
+        let state = Arc::new(State::default());
+        let harness = Harness::new(vec![state.clone()]);
+        envelope(
+            fetch(
+                &harness,
+                request(json!({ "taskId": id, "taskName": Task::NAME })),
+            )
+            .await,
+            400,
+            json!({ "error": "taskId must be a canonical positive decimal string" }),
+        );
+        untouched(&harness, &state);
+    }
+}
+
+fn identity_request(identity: Value) -> Request<TextBody> {
+    raw_request(
+        "/process",
+        "POST",
+        Some("application/json"),
+        Ok(json!({ "task": identity }).to_string()),
+    )
+}
+
+fn singleton_identity() -> Value {
+    json!({ "kind": "singleton", "taskName": SingletonTask::NAME })
+}
+
+#[cfg(feature = "in_memory")]
+#[tokio::test]
+async fn singleton_requests_create_and_reuse_one_backend_managed_row() {
+    use crate::backends::in_memory::InMemoryBackend;
+
+    struct MemoryProcessor {
+        backend: InMemoryBackend,
+        state: Arc<State>,
+    }
+    impl Processor for MemoryProcessor {
+        type Settings = ();
+        type Backend = InMemoryBackend;
+
+        fn configure(&self) -> Result<Scope<(), Self::Backend>, BoxDispatchError> {
+            Ok(Scope {
+                settings: (),
+                tasks: vec![ProcessorTask::singleton(SingletonFactory(
+                    self.state.clone(),
+                ))],
+                cleanup: None,
+            })
+        }
+        fn random_bytes(&self) -> Result<[u8; 6], BoxDispatchError> {
+            Ok([0, 0, 0, 0, 0, 23])
+        }
+        async fn acquire(&self, (): ()) -> Result<Self::Backend, BoxDispatchError> {
+            Ok(self.backend.clone())
+        }
+        async fn close(&self, _: Self::Backend) -> Result<(), BoxDispatchError> {
+            self.state.event("close");
+            Ok(())
+        }
+    }
+    let processor = MemoryProcessor {
+        backend: InMemoryBackend::new(),
+        state: Arc::default(),
+    };
+    for _ in 0..2 {
+        let response = fetch(&processor, identity_request(singleton_identity())).await;
+        assert_eq!(response.status(), 200);
+        let body: Value = serde_json::from_str(response.body()).unwrap();
+        assert_eq!(body["task"], singleton_identity());
+        assert_eq!(body["nextAction"]["type"], "retryAt");
+    }
+    let claimed = processor
+        .backend
+        .claim_singleton::<SingletonTask>(24, Instant::now() + Duration::from_secs(20))
+        .await
+        .unwrap();
+    assert_eq!(
+        *processor.state.payloads.lock().unwrap(),
+        [
+            (claimed.task_id, "unit".to_owned()),
+            (claimed.task_id, "unit".to_owned())
+        ]
+    );
+    assert_eq!(processor.state.count("close"), 2);
+}
+
+#[tokio::test]
+async fn singleton_outcomes_use_claimed_id_and_await_cleanup_and_shutdown() {
+    for mode in [
+        "done",
+        "scheduled",
+        "failure",
+        "scheduled-failure",
+        "future",
+        "leased",
+    ] {
+        let clocks = crate::time::deadlines::ClockSnapshot::now();
+        let at = Instant::now() + Duration::from_secs(60);
+        let state = Arc::new(State {
+            claim: match mode {
+                "future" => Claim::Future(at),
+                "leased" => Claim::Leased,
+                _ => Claim::Found,
+            },
+            outcome: match mode {
+                "scheduled" => Outcome::Reschedule(at),
+                "failure" => Outcome::Failure,
+                "scheduled-failure" => Outcome::ScheduledFailure(at),
+                _ => Outcome::Success,
+            },
+            cleanup_gate: Some(gate()),
+            close_gate: Some(gate()),
+            ..State::default()
+        });
+        let mut harness = Harness::new(vec![state.clone()]);
+        harness.registry = Registry::Singleton;
+        let before = crate::time::clock::SystemTime::now();
+        let response = fetch(&harness, identity_request(singleton_identity()));
+        tokio::pin!(response);
+        tokio::select! {
+            _ = &mut response => panic!("response before cleanup"),
+            _ = wait(&state.cleaning) => {}
+        }
+        state.cleanup_gate.as_ref().unwrap().add_permits(1);
+        tokio::select! {
+            _ = &mut response => panic!("response before close"),
+            _ = wait(&state.closing) => {}
+        }
+        state.close_gate.as_ref().unwrap().add_permits(1);
+        let response = response.await;
+        let body: Value = serde_json::from_str(response.body()).unwrap();
+        let at_ms = body["nextAction"]["atMs"].as_u64().unwrap();
+        envelope(
+            response,
+            200,
+            json!({ "task": singleton_identity(), "nextAction": { "type": "retryAt", "atMs": at_ms } }),
+        );
+        let unix_ms = |t: crate::time::clock::SystemTime| {
+            t.duration_since(crate::time::clock::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64
+        };
+        if ["scheduled", "scheduled-failure", "future"].contains(&mode) {
+            let expected = unix_ms(clocks.to_system_time(at).unwrap());
+            assert!((expected..=expected + 1).contains(&at_ms));
+        } else {
+            let delay = if mode == "leased" {
+                Duration::from_secs(20)
+            } else {
+                Duration::ZERO
+            };
+            assert!(
+                (unix_ms(before + delay)
+                    ..=unix_ms(crate::time::clock::SystemTime::now() + delay) + 1)
+                    .contains(&at_ms)
+            );
+        }
+        assert_eq!(
+            *state.claims.lock().unwrap(),
+            [(SingletonTask::NAME.to_owned(), 23, 73)]
+        );
+        if ["future", "leased"].contains(&mode) {
+            assert!(state.builds.lock().unwrap().is_empty());
+        } else {
+            assert_eq!(*state.builds.lock().unwrap(), [23]);
+            assert_eq!(*state.payloads.lock().unwrap(), [(73, "unit".to_owned())]);
+            assert_eq!(state.count("singleton-build"), 1);
+            assert_eq!(
+                state.count(if mode.contains("failure") {
+                    "fail"
+                } else {
+                    "finish"
+                }),
+                1
+            );
+        }
+        assert_eq!(state.count("cleanup"), 1);
+        assert_eq!(state.count("close"), 1);
+        assert!(harness.logs.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn singleton_uncertainty_overrides_hints_and_sanitizes_diagnostics() {
+    for stage in ["claim", "finalization", "ownership", "cleanup", "close"] {
+        let state = Arc::new(State {
+            claim: if stage == "claim" {
+                Claim::Error
+            } else {
+                Claim::Found
+            },
+            finalization_error: stage == "finalization",
+            finalization_lost: stage == "ownership",
+            cleanup_error: stage == "cleanup",
+            close_error: stage == "close",
+            ..State::default()
+        });
+        let mut harness = Harness::new(vec![state.clone()]);
+        harness.registry = Registry::Singleton;
+        envelope(
+            fetch(&harness, identity_request(singleton_identity())).await,
+            500,
+            json!({ "error": "task processing attempt failed" }),
+        );
+        assert_eq!(state.count("cleanup"), 1);
+        assert_eq!(state.count("close"), 1);
+        if stage == "claim" {
+            assert!(state.builds.lock().unwrap().is_empty());
+        }
+        assert!(
+            harness
+                .logs
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(kind, _)| kind == "singleton")
+        );
+    }
+}
+
+#[tokio::test]
+async fn singleton_lease_loss_aborts_worker_before_cleanup_and_shutdown() {
+    let state = Arc::new(State {
+        renewal_loss: true,
+        processing_gate: Some(gate()),
+        ..State::default()
+    });
+    let mut harness = Harness::new(vec![state.clone()]);
+    harness.registry = Registry::Singleton;
+    let response = fetch(&harness, identity_request(singleton_identity()));
+    tokio::pin!(response);
+    tokio::select! {
+        _ = &mut response => panic!("response before lease loss"),
+        _ = async { wait(&state.started).await; wait(&state.renewing).await; } => {}
+    }
+    state.renewal_gate.add_permits(1);
+    envelope(
+        response.await,
+        500,
+        json!({ "error": "task processing attempt failed" }),
+    );
+    assert_eq!(state.count("finish"), 0);
+    assert_eq!(state.count("fail"), 0);
+    assert_eq!(state.count("worker-dropped"), 1);
+    assert_eq!(state.count("cleanup"), 1);
+    assert_eq!(state.count("close"), 1);
+}
+
+#[tokio::test]
+async fn malformed_identities_and_old_envelopes_reject_before_configuration() {
+    for body in [
+        json!({ "taskId": "17", "taskName": Task::NAME }),
+        json!({ "task": { "kind": "singleton", "taskName": SingletonTask::NAME, "taskId": "17" } }),
+        json!({ "task": { "kind": "singleton", "taskName": SingletonTask::NAME, "extra": true } }),
+        json!({ "task": { "kind": "publish", "taskName": Task::NAME, "taskId": "17" } }),
+        json!({ "task": { "kind": "unknown", "taskName": Task::NAME } }),
+        json!({ "task": { "kind": "published", "taskName": Task::NAME } }),
+        json!({ "task": { "kind": "published", "taskName": Task::NAME, "taskId": "17", "extra": true } }),
+    ] {
+        let state = Arc::new(State::default());
+        let harness = Harness::new(vec![state.clone()]);
+        envelope(
+            fetch(
+                &harness,
+                raw_request(
+                    "/process",
+                    "POST",
+                    Some("application/json"),
+                    Ok(body.to_string()),
+                ),
+            )
+            .await,
+            400,
+            json!({ "error": INVALID_IDENTITY }),
+        );
+        untouched(&harness, &state);
+    }
+}
+
+#[tokio::test]
+async fn wrong_kind_and_cross_kind_duplicate_names_never_acquire() {
+    for mode in ["published", "singleton", "duplicate"] {
+        let state = Arc::new(State {
+            cleanup_gate: Some(gate()),
+            ..State::default()
+        });
+        let mut harness = Harness::new(vec![state.clone()]);
+        harness.registry = if mode == "duplicate" {
+            Registry::MixedDuplicate
+        } else {
+            Registry::Singleton
+        };
+        let identity = if mode == "published" {
+            json!({ "kind": "published", "taskName": SingletonTask::NAME, "taskId": "17" })
+        } else {
+            json!({ "kind": "singleton", "taskName": Task::NAME })
+        };
+        let response = fetch(&harness, identity_request(identity));
+        tokio::pin!(response);
+        tokio::select! {
+            _ = &mut response => panic!("response before cleanup"),
+            _ = wait(&state.cleaning) => {}
+        }
+        state.cleanup_gate.as_ref().unwrap().add_permits(1);
+        envelope(
+            response.await,
+            if mode == "duplicate" { 500 } else { 404 },
+            json!({ "error": if mode == "duplicate" { "task processing attempt failed" } else { "unknown task name" } }),
+        );
+        assert_eq!(state.count("acquire"), 0);
+        assert!(state.builds.lock().unwrap().is_empty());
+        assert_eq!(state.count("cleanup"), 1);
+    }
+}
 
 fn retry_envelope(
     response: Response<String>,
@@ -40,7 +373,7 @@ fn retry_envelope(
     envelope(
         response,
         200,
-        json!({ "taskId": "17", "nextAction": { "type": "retryAt", "atMs": at_ms } }),
+        json!({ "task": { "kind": "published", "taskId": "17", "taskName": Task::NAME }, "nextAction": { "type": "retryAt", "atMs": at_ms } }),
     );
 }
 
@@ -113,7 +446,7 @@ async fn application_cleanup_is_optional() {
         )
         .await,
         200,
-        json!({ "taskId": "17", "nextAction": { "type": "done" } }),
+        json!({ "task": { "kind": "published", "taskId": "17", "taskName": Task::NAME }, "nextAction": { "type": "done" } }),
     );
     assert_eq!(state.count("cleanup"), 0);
     assert_eq!(state.count("close"), 1);
@@ -143,6 +476,42 @@ impl TaskDefinition for CountTask {
 
 struct EmptyNameTask;
 struct EmptyNameFactory;
+
+struct SingletonTask;
+
+impl TaskDefinition for SingletonTask {
+    const NAME: &str = " singleton/雪🦀 ";
+    type Trigger = SingletonTrigger;
+    type Callback = String;
+}
+
+struct SingletonFactory(Arc<State>);
+struct SingletonWorker(Arc<State>);
+
+impl WorkerFactory for SingletonFactory {
+    type Worker = SingletonWorker;
+
+    fn build(&self, worker_id: u64) -> Self::Worker {
+        self.0.event("singleton-build");
+        self.0.builds.lock().unwrap().push(worker_id);
+        SingletonWorker(self.0.clone())
+    }
+}
+
+impl Worker for SingletonWorker {
+    type Task = SingletonTask;
+
+    async fn process(self, id: u64, (): ()) -> TaskResult<String> {
+        BusinessWorker(self.0)
+            .process(
+                id,
+                Payload {
+                    name: "unit".to_owned(),
+                },
+            )
+            .await
+    }
+}
 
 impl TaskDefinition for EmptyNameTask {
     const NAME: &str = "";
@@ -415,13 +784,46 @@ impl TaskExecutionBackend for Execution {
 
     async fn claim_singleton<T>(
         &self,
-        _: u64,
-        _: Instant,
+        worker_id: u64,
+        lease_expiration: Instant,
     ) -> Result<ClaimedTask<()>, ClaimTaskError>
     where
         T: TaskDefinition,
     {
-        panic!("must claim a published task")
+        self.0
+            .claims
+            .lock()
+            .unwrap()
+            .push((T::NAME.to_owned(), worker_id, 73));
+        match self.0.claim {
+            Claim::Leased => {
+                return Err(ClaimTaskError::TaskLeased {
+                    expiration: lease_expiration,
+                });
+            }
+            Claim::Future(at) => {
+                return Err(ClaimTaskError::TaskUnavailable {
+                    available_from: Some(at),
+                });
+            }
+            Claim::Error => return Err(ClaimTaskError::Backend(SECRET.into())),
+            Claim::Unavailable => {
+                return Err(ClaimTaskError::TaskUnavailable {
+                    available_from: None,
+                });
+            }
+            Claim::Missing => return Err(ClaimTaskError::TaskNotFound),
+            Claim::Found => {}
+        }
+        Ok(ClaimedTask {
+            task_id: 73,
+            task_payload: (),
+            lease_expiration: if self.0.renewal_loss {
+                Instant::now()
+            } else {
+                lease_expiration
+            },
+        })
     }
 
     async fn renew(&self, _: u64, _: u64, _: Instant) -> Result<RenewedTaskLease, RenewTaskError> {
@@ -481,6 +883,8 @@ enum Registry {
     EmptyName,
     Duplicate,
     UnrelatedDuplicate,
+    Singleton,
+    MixedDuplicate,
 }
 
 struct Harness {
@@ -535,6 +939,16 @@ impl Processor for Harness {
             Registry::EmptyName => vec![first(), ProcessorTask::new(EmptyNameFactory)],
             Registry::Duplicate => vec![first(), first()],
             Registry::UnrelatedDuplicate => vec![first(), second(), second()],
+            Registry::Singleton => vec![
+                first(),
+                second(),
+                ProcessorTask::singleton(SingletonFactory(state.clone())),
+            ],
+            Registry::MixedDuplicate => {
+                let mut singleton = ProcessorTask::singleton(SingletonFactory(state.clone()));
+                singleton.name = Task::NAME;
+                vec![first(), singleton]
+            }
         };
         let mut scope = Scope {
             settings: state.clone(),
@@ -586,7 +1000,7 @@ impl Processor for Harness {
         backend: Execution,
         task: ProcessorTask<Execution>,
         worker_id: u64,
-        task_id: u64,
+        task_id: Option<u64>,
     ) -> Result<TaskAttemptOutcome, BoxDispatchError> {
         // This private seam covers an adapter-visible error rather than a runtime outcome.
         if backend.0.attempt_error {
@@ -608,17 +1022,20 @@ impl Processor for Harness {
         }
     }
 
-    fn log_failure(&self, task_id: &str, stage: &'static str) {
-        self.logs.lock().unwrap().push((task_id.to_owned(), stage));
+    fn log_failure(&self, kind: &str, stage: &'static str) {
+        self.logs.lock().unwrap().push((kind.to_owned(), stage));
     }
 }
 
-fn request(body: Value) -> Request<TextBody> {
+fn request(mut body: Value) -> Request<TextBody> {
+    if let Some(body) = body.as_object_mut() {
+        body.insert("kind".to_owned(), json!("published"));
+    }
     raw_request(
         "/process",
         "POST",
         Some("application/json"),
-        Ok(body.to_string()),
+        Ok(json!({ "task": body }).to_string()),
     )
 }
 
@@ -787,7 +1204,7 @@ async fn body_shape_and_canonical_id_validation_have_no_side_effects() {
         envelope(
             fetch(&harness, request(body)).await,
             400,
-            json!({ "error": CANONICAL }),
+            json!({ "error": INVALID_IDENTITY }),
         );
         untouched(&harness, &state);
     }
@@ -817,9 +1234,7 @@ async fn boundary_ids_use_explicit_tokens_and_only_claimed_payloads() {
         let state = Arc::new(State::default());
         let harness = Harness::new(vec![state.clone()]);
         *harness.samples.lock().unwrap() = VecDeque::from([Ok([0; 6]), Ok([255; 6])]);
-        let mut input = request(
-            json!({ "taskName": Task::NAME, "taskId": task_id, "payload": { "name": "untrusted" } }),
-        );
+        let mut input = request(json!({ "taskName": Task::NAME, "taskId": task_id }));
         input.headers_mut().insert(
             CONTENT_TYPE,
             "Application/JSON; charset=utf-8".parse().unwrap(),
@@ -827,7 +1242,7 @@ async fn boundary_ids_use_explicit_tokens_and_only_claimed_payloads() {
         envelope(
             fetch(&harness, input).await,
             200,
-            json!({ "taskId": task_id, "nextAction": { "type": "done" } }),
+            json!({ "task": { "kind": "published", "taskId": task_id, "taskName": Task::NAME }, "nextAction": { "type": "done" } }),
         );
         let worker_id = (1_u64 << 48) - 1;
         let id = task_id.parse::<u64>().unwrap();
@@ -880,7 +1295,7 @@ async fn invalid_names_reject_even_with_one_registration_before_configuration() 
         envelope(
             fetch(&harness, request(body)).await,
             400,
-            json!({ "error": INVALID_TASK_NAME }),
+            json!({ "error": INVALID_IDENTITY }),
         );
         untouched(&harness, &state);
     }
@@ -923,10 +1338,10 @@ async fn registry_validation_and_unknown_names_cleanup_without_acquisition() {
             assert!(state.builds.lock().unwrap().is_empty());
             let mut stages = vec![];
             if invalid {
-                stages.push(("17".to_owned(), "configuration"));
+                stages.push(("published".to_owned(), "configuration"));
             }
             if cleanup_error {
-                stages.push(("17".to_owned(), "application-cleanup"));
+                stages.push(("published".to_owned(), "application-cleanup"));
             }
             assert_eq!(*harness.logs.lock().unwrap(), stages);
         }
@@ -958,10 +1373,15 @@ async fn heterogeneous_routing_uses_each_definition_and_its_claimed_payload() {
         });
         let harness = Harness::new(vec![state.clone()]);
         envelope(
-            fetch(&harness, request(json!({
-                "taskId": "17", "taskName": name, "payload": { "name": "untrusted", "count": 99 }
-            }))).await,
-            200, json!({ "taskId": "17", "nextAction": { "type": "done" } }),
+            fetch(
+                &harness,
+                request(json!({
+                    "taskId": "17", "taskName": name
+                })),
+            )
+            .await,
+            200,
+            json!({ "task": { "kind": "published", "taskId": "17", "taskName": name }, "nextAction": { "type": "done" } }),
         );
         assert_eq!(*state.claims.lock().unwrap(), [(name.to_owned(), 23, 17)]);
         assert_eq!(*state.decoded.lock().unwrap(), [name]);
@@ -1035,7 +1455,7 @@ async fn persisted_name_mismatch_never_decodes_or_builds_either_worker() {
         )
         .await,
         200,
-        json!({ "taskId": "17", "nextAction": { "type": "done" } }),
+        json!({ "task": { "kind": "published", "taskId": "17", "taskName": Task::NAME }, "nextAction": { "type": "done" } }),
     );
     assert_eq!(
         *state.claims.lock().unwrap(),
@@ -1075,7 +1495,7 @@ async fn no_claim_outcomes_preserve_cleanup_and_report_next_actions() {
             Claim::Missing => envelope(
                 response,
                 200,
-                json!({ "taskId": "17", "nextAction": { "type": "done" } }),
+                json!({ "task": { "kind": "published", "taskId": "17", "taskName": Task::NAME }, "nextAction": { "type": "done" } }),
             ),
             Claim::Leased => retry_envelope(
                 response,
@@ -1149,7 +1569,7 @@ async fn attempt_finalization_cleanup_and_close_each_hold_the_response() {
             envelope(
                 response,
                 200,
-                json!({ "taskId": "17", "nextAction": { "type": "done" } }),
+                json!({ "task": { "kind": "published", "taskId": "17", "taskName": Task::NAME }, "nextAction": { "type": "done" } }),
             );
         } else {
             retry_envelope(response, before, crate::time::clock::SystemTime::now());
@@ -1207,7 +1627,7 @@ async fn finalization_errors_return_uncertain_responses() {
             assert_eq!(state.count("close"), 1);
             assert_eq!(
                 *harness.logs.lock().unwrap(),
-                [("17".to_owned(), "attempt")]
+                [("published".to_owned(), "attempt")]
             );
         }
     }
@@ -1240,7 +1660,7 @@ async fn invalid_wire_dates_return_uncertainty_after_cleanup() {
         assert_eq!(state.count("close"), 1);
         assert_eq!(
             *harness.logs.lock().unwrap(),
-            [("17".to_owned(), "attempt")]
+            [("published".to_owned(), "attempt")]
         );
     }
 }
@@ -1276,7 +1696,10 @@ async fn infrastructure_failures_are_sanitized_and_cleanup_owned_resources() {
             500,
             json!({ "error": "task processing attempt failed" }),
         );
-        assert_eq!(*harness.logs.lock().unwrap(), [("17".to_owned(), stage)]);
+        assert_eq!(
+            *harness.logs.lock().unwrap(),
+            [("published".to_owned(), stage)]
+        );
         assert_eq!(
             state.count("cleanup"),
             usize::from(stage != "configuration")
@@ -1308,7 +1731,8 @@ async fn multiple_failures_do_not_skip_shutdown_or_diagnostics() {
     );
     assert_eq!(
         *harness.logs.lock().unwrap(),
-        ["attempt", "application-cleanup", "backend-close"].map(|stage| ("17".to_owned(), stage))
+        ["attempt", "application-cleanup", "backend-close"]
+            .map(|stage| ("published".to_owned(), stage))
     );
     assert_eq!(
         *state.events.lock().unwrap(),
@@ -1352,13 +1776,13 @@ async fn concurrent_requests_have_fresh_scopes_and_backends() {
     second_gate.add_permits(1);
     tokio::select! {
         _ = &mut first_response => panic!("first response released with second"),
-        response = &mut second_response => envelope(response, 200, json!({ "taskId": "18", "nextAction": { "type": "done" } })),
+        response = &mut second_response => envelope(response, 200, json!({ "task": { "kind": "published", "taskId": "18", "taskName": CountTask::NAME }, "nextAction": { "type": "done" } })),
     }
     first_gate.add_permits(1);
     envelope(
         first_response.await,
         200,
-        json!({ "taskId": "17", "nextAction": { "type": "done" } }),
+        json!({ "task": { "kind": "published", "taskId": "17", "taskName": Task::NAME }, "nextAction": { "type": "done" } }),
     );
     assert_eq!(*first.builds.lock().unwrap(), [1]);
     assert_eq!(*second.builds.lock().unwrap(), [2]);
@@ -1420,6 +1844,6 @@ async fn renewal_loss_aborts_worker_but_retains_and_awaits_application_cleanup()
     assert_eq!(state.count("fail"), 0);
     assert_eq!(
         *harness.logs.lock().unwrap(),
-        [("17".to_owned(), "attempt")]
+        [("published".to_owned(), "attempt")]
     );
 }

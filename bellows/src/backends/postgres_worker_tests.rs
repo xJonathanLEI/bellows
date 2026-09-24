@@ -46,7 +46,7 @@ async fn discovery_native_and_workers_share_exact_read_only_keyset_semantics() {
     assert_eq!(native.begin_sweep().await.unwrap().upper_id, None);
     assert!(ops.read_page(&empty, None).await.unwrap().is_empty());
     assert!(native.read_page(&empty, None).await.unwrap().is_empty());
-    // A singleton larger than every published ID must not extend the window.
+    // Singleton-only windows retain exact BIGINT IDs in both drivers.
     f.admin
         .batch_execute(&format!(
             "INSERT INTO {} (task_id, task_name, task_unique_key, payload_json)
@@ -55,8 +55,21 @@ async fn discovery_native_and_workers_share_exact_read_only_keyset_semantics() {
         ))
         .await
         .unwrap();
-    assert_eq!(ops.begin_sweep().await.unwrap().upper_id, None);
-    assert_eq!(native.begin_sweep().await.unwrap().upper_id, None);
+    let singleton_only = ops.begin_sweep().await.unwrap();
+    assert_eq!(singleton_only.upper_id, Some(i64::MAX));
+    assert_eq!(native.begin_sweep().await.unwrap().upper_id, Some(i64::MAX));
+    let singleton_page = ops.read_page(&singleton_only, None).await.unwrap();
+    assert_eq!(
+        singleton_page,
+        native.read_page(&singleton_only, None).await.unwrap()
+    );
+    assert_eq!(singleton_page.len(), 1);
+    assert_eq!(singleton_page[0].task_id, i64::MAX);
+    assert!(singleton_page[0].is_singleton);
+    f.admin
+        .batch_execute(&format!("DELETE FROM {}", f.table))
+        .await
+        .unwrap();
     f.admin
         .batch_execute(&format!(
             "INSERT INTO {table} (task_id, task_name, payload_json) OVERRIDING SYSTEM VALUE
@@ -67,7 +80,9 @@ async fn discovery_native_and_workers_share_exact_read_only_keyset_semantics() {
          (2100, 'past', '!'), (2110, 'exact', '!'), (2120, 'future', '!'),
          (2130, 'expired owner', '!'), (2140, 'occupied', '!'),
          (9007199254740991, 'safe', '!'), (9007199254740992, 'unsafe', '!'),
-         (9007199254740993, 'unsafe exact', '!'), (9223372036854775806, 'upper', '!')",
+         (9007199254740993, 'unsafe exact', '!'), (9223372036854775806, 'upper', '!');
+         UPDATE {table} SET task_unique_key = task_id::text
+         WHERE task_id IN (2110, 2120, 2130, 2140, 9007199254740993, 9223372036854775806)",
             table = f.table,
         ))
         .await
@@ -140,7 +155,6 @@ async fn discovery_native_and_workers_share_exact_read_only_keyset_semantics() {
         .batch_execute(&format!(
             "DELETE FROM {table} WHERE task_id = 10;
          UPDATE {table} SET available_from_unix_ms = 9223372036854775807 WHERE task_id = 20;
-         DELETE FROM {table} WHERE task_unique_key IS NOT NULL;
          INSERT INTO {table} (task_id, task_name, payload_json) OVERRIDING SYSTEM VALUE
          VALUES (5, 'late behind cursor', '!'), (9223372036854775807, 'new publication', '!')",
             table = f.table,
@@ -181,6 +195,12 @@ async fn discovery_native_and_workers_share_exact_read_only_keyset_semantics() {
         remaining.iter().map(|row| row.task_id).collect::<Vec<_>>(),
         expected
     );
+    for row in &remaining {
+        assert_eq!(
+            row.is_singleton,
+            [2110, 2130, 9007199254740993, i64::MAX - 1].contains(&row.task_id)
+        );
+    }
     let after: Vec<String> = f
         .admin
         .query(&snapshot_sql, &[])

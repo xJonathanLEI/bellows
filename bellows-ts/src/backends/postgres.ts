@@ -30,6 +30,7 @@ export type { PostgresBackendOptions } from "./postgres-operations.js";
 export {
   initializePostgresSchema,
   PostgresPublishedTaskIdError,
+  PostgresSingletonTaskIdError,
 } from "./postgres-operations.js";
 
 type NotificationPayload =

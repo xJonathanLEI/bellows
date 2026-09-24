@@ -43,7 +43,7 @@ impl PostgresDiscoveryBackend {
         })
     }
 
-    /// Captures database statement time and the maximum published ID in one read.
+    /// Captures database statement time and the maximum task ID in one read.
     pub async fn begin_sweep(&self) -> Result<PostgresSweepWindow, DiscoveryError> {
         self.operations.begin_sweep().await
     }
@@ -54,8 +54,8 @@ impl PostgresDiscoveryBackend {
     /// IDs retain the full signed-BIGINT range; consumer-specific ID validation belongs after discovery.
     /// An empty page ends the pass. This is not a snapshot: concurrent changes behind the cursor
     /// are left for the next pass. Eligibility does not reserve execution; claims remain authoritative.
-    /// Published rows are eligible when availability is null or at/before the cutoff, including
-    /// expired leases with populated owners. Singleton rows are always excluded.
+    /// Rows are eligible when availability is null or at/before the cutoff, including
+    /// expired leases with populated owners, for both published and singleton tasks.
     pub async fn read_page(
         &self,
         window: &PostgresSweepWindow,
