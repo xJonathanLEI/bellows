@@ -278,6 +278,74 @@ For an ORM, implement `PostgresPublishingExecutor::query_task_id` by forwarding 
 
 All paths validate explicit schema names and qualify the task table; with no schema option, they use the executor's existing search path. External publication does not initialize schemas/tables, issue `SET search_path`, or fall back to `public`.
 
+#### Composing publication with SQL-produced rows
+
+`backends::postgres_publishing::prepare_postgres_publication_from_encoded_rows::<T>` is a pure composition API, available with native `postgres` or wasm `cloudflare`. It returns an owned fragment with `sql()`, `parameters()`, and `read_receipts()`, without requiring an executor trait. The fragment is a single `INSERT ... SELECT ... RETURNING` body; Bellows owns its task columns and defaults. This example inserts posts and publishes one immediate task per inserted post in **one SQL execution**:
+
+```rust
+use bellows::{PublishTrigger, TaskDefinition, backends::PublishedTask};
+use bellows::backends::postgres_publishing::{
+    PostgresBackendOptions, PostgresEncodedRowsPublicationOptions,
+    PostgresEncodedRowsSource, prepare_postgres_publication_from_encoded_rows,
+};
+use serde::{Deserialize, Serialize};
+
+#[derive(Serialize, Deserialize)]
+struct PostPayload { name: String }
+struct PostCreated;
+impl TaskDefinition for PostCreated {
+    const NAME: &str = "post_created";
+    type Trigger = PublishTrigger<PostPayload>;
+    type Callback = ();
+}
+
+// Assumes posts(name text) and the Bellows schema were initialized administratively.
+async fn create_posts(
+    pool: &sqlx::PgPool,
+    names: &[String],
+) -> Result<Vec<PublishedTask>, Box<dyn std::error::Error>> {
+    let fragment = prepare_postgres_publication_from_encoded_rows::<PostCreated>(
+        PostgresEncodedRowsPublicationOptions {
+            backend: PostgresBackendOptions { schema: Some("bellows".into()) },
+            source: PostgresEncodedRowsSource {
+                relation: "delivery_inputs".into(),
+                payload_column: "encoded_payload".into(),
+            },
+            parameter_offset: 1,
+        },
+    )?;
+    let sql = format!(
+        "WITH inserted_posts AS (
+            INSERT INTO posts (name) SELECT unnest($1::text[]) RETURNING name
+         ), delivery_inputs AS (
+            SELECT json_build_object('name', name)::text AS encoded_payload
+            FROM inserted_posts
+         ), published AS ({}) SELECT task_id FROM published",
+        fragment.sql(),
+    );
+    let mut tx = pool.begin().await?;
+    let ids: Vec<String> = sqlx::query_scalar(&sql)
+        .bind(names)
+        .bind(&fragment.parameters()[0])
+        .fetch_all(&mut *tx).await?;
+    let receipts = fragment.read_receipts(&ids)?;
+    tx.commit().await?;
+    Ok(receipts) // Explicit dispatch, if needed, belongs after this confirmed commit.
+}
+```
+
+For `tokio_postgres`, compose the same SQL and bind `&[&names, &fragment.parameters()[0]]` to `transaction.query(...)`. Extract each `task_id` with `row.try_get::<_, &str>("task_id")`, collect driver errors before decoding, and pass the exact strings to `read_receipts`. The public function's API docs include compiled SQLx and `tokio_postgres` binding examples. Connection drivers and transaction finalization remain caller-owned, including on Workers.
+
+**Encoded rows are a trusted boundary.** Each source row must contain a non-null PostgreSQL `text` value already compatible with the task's payload deserializer. The builder cannot serialize values that exist only in SQL. Rust's ordinary payload format is JSON; TypeScript accepts whatever its task codec consumes, including non-JSON text. Cross-language tasks must agree on their encoded payload contract.
+
+Source relation/column names are individual, double-quoted identifiers matching `[a-z_][a-z0-9_]*`, at most 63 ASCII bytes; arbitrary SQL and qualified paths are rejected. The embedded backend options retain existing schema validation and search-path behavior. The only bind is the task name, never interpolated, at position `parameter_offset + 1` (offset `0..=65534`, checked against addition overflow and PostgreSQL's parameter limit).
+
+The [TypeScript counterpart](./bellows-ts/README.md#compose-publication-from-encoded-sql-rows) has the same immediate-only, one-task-per-source-row contract. Empty sources return no tasks and empty receipts. Neither API promises row order or output-to-task positional correspondence. Callback-bearing definitions register no callback; singletons, scheduling, and awaitable publication are outside this primitive.
+
+Both decoders require canonical positive decimal `task_id` **text** and validate all IDs before returning any receipts. Rust preserves exact positive IDs through `i64::MAX`; TypeScript rejects IDs beyond `Number.MAX_SAFE_INTEGER`. Rust's `PostgresPublicationReceiptError.task_id` and TypeScript's unsafe-ID error retain exact input text. This stricter positive-ID rule does not change legacy publication's acceptance rules.
+
+Preparation and decoding do not perform I/O, initialize tables, change `search_path`, retry, dispatch, or finalize transactions. Decode inside the transaction and let failure abort it; receipts are provisional until caller commit. Do not automatically retry uncertain statement or commit outcomes. No migrations or changes to task execution are required.
+
 #### Receipts, notifications, and dispatch
 
 A receipt returned inside a transaction is **provisional**: the caller can roll back, and a later commit can fail. Receipt-validation errors can likewise refer to a row still pending in that transaction; they do not roll it back. Lower-level Rust receipts convert PostgreSQL's nonnegative signed `i64` IDs to exact `u64` values without a JavaScript safe-integer ceiling. TypeScript returns numeric receipts only for exact safe integers; otherwise `PostgresPublishedTaskIdError.taskId` retains the exact string ID, whether the insert committed in standalone publication or is still transaction-local. Retain exact IDs for recovery rather than blindly republishing; a database/transport exception after sending SQL is not proof of rollback.

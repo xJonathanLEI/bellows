@@ -14,10 +14,13 @@ import {
   validatePostgresSchemaName,
 } from "../src/backends/postgres-operations.js";
 import {
+  type PostgresPublicationFragment,
+  type PostgresPublicationRow,
   PostgresPublishedTaskIdError,
   PostgresPublishingBackend,
   type PostgresPublishingExecutor,
   type PostgresPublishParameters,
+  preparePostgresPublicationFromEncodedRows,
 } from "../src/backends/postgres-publishing.js";
 import {
   definePublishTask,
@@ -1718,6 +1721,261 @@ test("postgres publishing valid transaction receipt can precede commit failure w
   f.assertCallerOwned();
   await f.client.query("SELECT 1");
 });
+
+test.each([
+  [undefined, "json"],
+  ["app_tasks", "json"],
+  [undefined, "text"],
+] as const)("encoded-row publication composes one posts insert with empty/multiple tasks (schema=%s, codec=%s)", async (schema, encoding) => {
+  const f = await publicationTransactionFixture();
+  await f.observer.query("CREATE TABLE posts (title TEXT NOT NULL UNIQUE)");
+  if (schema) {
+    await f.observer.query("CREATE SCHEMA app_tasks");
+    await initializePostgresSchema(f.database.url, schema);
+  }
+  const table = schema ? "app_tasks.bellows_tasks" : "bellows_tasks";
+  const codec =
+    encoding === "json"
+      ? echoTask.codec
+      : {
+          encode: ({ name }: { name: string }) => `post:${name}`,
+          decode: (value: string) => {
+            if (!value.startsWith("post:"))
+              throw new Error("Invalid post encoding");
+            return { name: value.slice(5) };
+          },
+        };
+  const encode = vi.fn(codec.encode);
+  const task = definePublishTask<{ name: string }, string>(
+    "post_created ' 🦀",
+    { ...codec, encode },
+  );
+  const fragment = preparePostgresPublicationFromEncodedRows(task, {
+    schema,
+    source: { relation: "delivery_inputs", payloadColumn: "encoded_payload" },
+    parameterOffset: 1,
+  });
+  const sql = postsPublicationStatement(
+    fragment,
+    encoding === "json"
+      ? "json_build_object('name', title)::text"
+      : "'post:' || title",
+  );
+  const executor = track(
+    await PostgresExecutionBackend.connect(f.database.url, { schema }),
+  );
+  const query = vi.spyOn(f.client, "query");
+  let committedPosts = 0;
+  try {
+    for (const count of [0, 1, 7]) {
+      const titles = Array.from(
+        { length: count },
+        (_, i) => `${count}/${i}: "雪🦀"\n'`,
+      );
+      await f.begin();
+      query.mockClear();
+      const result = await f.client.query<PostgresPublicationRow>(sql, [
+        titles,
+        ...fragment.parameters,
+      ]);
+      const receipts = fragment.readReceipts(result.rows);
+      expect(query).toHaveBeenCalledExactlyOnceWith(sql, [titles, task.name]);
+      expect(receipts).toHaveLength(count);
+      expect(new Set(receipts.map(({ taskId }) => taskId)).size).toBe(count);
+      expect(encode).not.toHaveBeenCalled();
+      expect((await f.client.query(`SELECT * FROM ${table}`)).rows).toEqual(
+        expect.arrayContaining(
+          receipts.map(({ taskId }) =>
+            expect.objectContaining({
+              task_id: String(taskId),
+              task_name: task.name,
+              task_unique_key: null,
+              callback_id: null,
+              lease_worker_id: null,
+              available_from_unix_ms: null,
+            }),
+          ),
+        ),
+      );
+      expect((await f.client.query("SELECT count(*) FROM posts")).rows).toEqual(
+        [{ count: String(committedPosts + count) }],
+      );
+      expect(
+        (await f.observer.query("SELECT count(*) FROM posts")).rows,
+      ).toEqual([{ count: String(committedPosts) }]);
+      expect(
+        (await f.observer.query(`SELECT count(*) FROM ${table}`)).rows,
+      ).toEqual([{ count: "0" }]);
+      f.assertCallerOwned();
+      await f.commit();
+      committedPosts += count;
+      expect(
+        (await f.observer.query("SELECT count(*) FROM posts")).rows,
+      ).toEqual([{ count: String(committedPosts) }]);
+      const decoded: string[] = [];
+      for (const { taskId } of receipts) {
+        const claimed = await executor.claimPublished(
+          task,
+          17,
+          taskId,
+          Date.now() + 60_000,
+        );
+        decoded.push(claimed.taskPayload.name);
+        await executor.finish(task, 17, taskId, "no callback registered", null);
+      }
+      // Neither returned set has a positional correspondence with the input.
+      expect(decoded.sort()).toEqual([...titles].sort());
+      expect(
+        (await f.observer.query(`SELECT count(*) FROM ${table}`)).rows,
+      ).toEqual([{ count: "0" }]);
+    }
+    if (schema) {
+      expect(
+        (await f.observer.query("SELECT count(*) FROM bellows_tasks")).rows,
+      ).toEqual([{ count: "0" }]);
+    }
+  } finally {
+    query.mockRestore();
+  }
+});
+
+test("encoded-row posts and tasks roll back together on outer rollback and either insert failure", async () => {
+  const f = await publicationTransactionFixture();
+  await f.observer.query("CREATE TABLE posts (title TEXT NOT NULL UNIQUE)");
+  const fragment = preparePostgresPublicationFromEncodedRows(echoTask, {
+    source: { relation: "delivery_inputs", payloadColumn: "encoded_payload" },
+    parameterOffset: 1,
+  });
+  const counts = async (client: Client | PoolClient) =>
+    (
+      await client.query(
+        `SELECT (SELECT count(*) FROM posts) AS posts,
+              (SELECT count(*) FROM bellows_tasks) AS tasks`,
+      )
+    ).rows;
+  await f.begin();
+  const result = await f.client.query<PostgresPublicationRow>(
+    postsPublicationStatement(fragment),
+    [["a", "b", "c"], ...fragment.parameters],
+  );
+  expect(fragment.readReceipts(result.rows)).toHaveLength(3);
+  expect(await counts(f.client)).toEqual([{ posts: "3", tasks: "3" }]);
+  expect(await counts(f.observer)).toEqual([{ posts: "0", tasks: "0" }]);
+  await f.rollback();
+  expect(await counts(f.observer)).toEqual([{ posts: "0", tasks: "0" }]);
+
+  for (const failure of ["posts", "tasks"]) {
+    await f.begin();
+    // The task failure deliberately violates the trusted non-null encoded-text boundary.
+    const sql = postsPublicationStatement(
+      fragment,
+      failure === "tasks"
+        ? "NULL::text"
+        : "json_build_object('name', title)::text",
+    );
+    await expect(
+      f.client.query(sql, [
+        failure === "posts" ? ["duplicate", "duplicate"] : ["a", "b"],
+        ...fragment.parameters,
+      ]),
+    ).rejects.toMatchObject({
+      code: failure === "posts" ? "23505" : "23502",
+      table: failure === "posts" ? "posts" : "bellows_tasks",
+    });
+    await expect(f.client.query("SELECT 1")).rejects.toMatchObject({
+      code: "25P02",
+    });
+    expect(await counts(f.observer)).toEqual([{ posts: "0", tasks: "0" }]);
+    f.assertCallerOwned();
+    await f.rollback();
+    expect(await counts(f.client)).toEqual([{ posts: "0", tasks: "0" }]);
+  }
+});
+
+test("encoded-row decoding keeps exact pending IDs and lets the caller abort the whole statement", async () => {
+  const f = await publicationTransactionFixture();
+  await f.observer.query("CREATE TABLE posts (title TEXT NOT NULL)");
+  const fragment = preparePostgresPublicationFromEncodedRows(echoTask, {
+    source: { relation: "delivery_inputs", payloadColumn: "encoded_payload" },
+    parameterOffset: 1,
+  });
+  for (const [start, count, unsafeId] of [
+    ["9007199254740990", 2, null],
+    ["9007199254740991", 2, "9007199254740992"],
+    ["9007199254740993", 1, "9007199254740993"],
+    ["9223372036854775807", 1, "9223372036854775807"],
+  ] as const) {
+    await f.observer.query(
+      "SELECT setval('bellows_tasks_task_id_seq', $1::bigint, false)",
+      [start],
+    );
+    await f.begin();
+    const result = await f.client.query<PostgresPublicationRow>(
+      postsPublicationStatement(fragment),
+      [
+        Array.from({ length: count }, (_, i) => `post ${i}`),
+        ...fragment.parameters,
+      ],
+    );
+    const exactIds = Array.from({ length: count }, (_, i) =>
+      String(BigInt(start) + BigInt(i)),
+    );
+    expect(result.rows.map(({ task_id }) => task_id).sort()).toEqual(
+      exactIds.sort(),
+    );
+    if (unsafeId === null) {
+      expect(
+        fragment
+          .readReceipts(result.rows)
+          .map(({ taskId }) => taskId)
+          .sort(),
+      ).toEqual([Number.MAX_SAFE_INTEGER - 1, Number.MAX_SAFE_INTEGER]);
+    } else {
+      expect(() => fragment.readReceipts(result.rows)).toThrow(
+        expect.objectContaining({
+          name: "PostgresPublishedTaskIdError",
+          taskId: unsafeId,
+        }),
+      );
+    }
+    // Decoding has not finalized anything. The transaction can still be inspected and aborted.
+    expect((await f.client.query("SELECT count(*) FROM posts")).rows).toEqual([
+      { count: String(count) },
+    ]);
+    expect(
+      (await f.client.query("SELECT count(*) FROM bellows_tasks")).rows,
+    ).toEqual([{ count: String(count) }]);
+    expect((await f.observer.query("SELECT count(*) FROM posts")).rows).toEqual(
+      [{ count: "0" }],
+    );
+    expect(
+      (await f.observer.query("SELECT count(*) FROM bellows_tasks")).rows,
+    ).toEqual([{ count: "0" }]);
+    f.assertCallerOwned();
+    await f.rollback();
+    expect((await f.client.query("SELECT count(*) FROM posts")).rows).toEqual([
+      { count: "0" },
+    ]);
+    expect(
+      (await f.client.query("SELECT count(*) FROM bellows_tasks")).rows,
+    ).toEqual([{ count: "0" }]);
+  }
+});
+
+function postsPublicationStatement(
+  fragment: PostgresPublicationFragment,
+  payloadExpression = "json_build_object('name', title)::text",
+): string {
+  return `
+WITH inserted_posts AS (
+  INSERT INTO posts (title) SELECT unnest($1::text[]) RETURNING title
+), delivery_inputs AS (
+  SELECT ${payloadExpression} AS encoded_payload FROM inserted_posts
+), published_tasks AS (
+  ${fragment.sql}
+)
+SELECT task_id FROM published_tasks`;
+}
 
 test("postgres publishing transaction notifications wait for commit and exclude rollback", async () => {
   const f = await publicationTransactionFixture();

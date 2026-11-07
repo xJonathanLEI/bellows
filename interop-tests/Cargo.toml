@@ -9,9 +9,9 @@ build = "build.rs"
 bellows = { workspace = true, features = ["postgres"] }
 serde_json.workspace = true
 serde = { workspace = true, features = ["derive", "std"] }
+sqlx.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
 
 [dev-dependencies]
 serde_json.workspace = true
-sqlx.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }

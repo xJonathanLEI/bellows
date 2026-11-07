@@ -411,6 +411,75 @@ Execute Bellows's generated insert once; do not reconstruct it or interpolate ap
 
 Explicit schema options are validated and qualify the task table. Omitting `schema` uses the executor's current search path. Neither external construction nor publication initializes tables, issues `SET search_path`, or falls back to `public`.
 
+#### Compose publication from encoded SQL rows
+
+`preparePostgresPublicationFromEncodedRows` from `backends/postgres-publishing` returns a readonly `{ sql, parameters, readReceipts }` description. It lets an application insert business rows and one immediate task per resulting row in **one parameterized SQL execution**, without knowing Bellows's task storage layout. There is no executor or database-independent backend-interface change.
+
+The source must be a named relation, usually a preceding CTE, whose selected column supplies one **non-null PostgreSQL `text` value already compatible with the task codec**. This is a trusted encoding boundary: the builder cannot invoke a JavaScript encoder on rows that exist only in PostgreSQL. The default codec accepts SQL-generated JSON text; custom codecs may require other text formats. The caller owns that agreement. Callback-bearing definitions are accepted without callback registration; singletons, future scheduling, per-row task names, and awaitable callbacks are not part of this API.
+
+This example assumes the `bellows` schema has been initialized administratively and an application table `posts(title TEXT NOT NULL)` already exists:
+
+```ts
+import type { Pool } from "pg";
+import { definePublishTask } from "@xjonathanlei/bellows";
+import {
+  type PostgresPublicationRow,
+  preparePostgresPublicationFromEncodedRows,
+} from "@xjonathanlei/bellows/backends/postgres-publishing";
+
+const postCreated = definePublishTask<{ title: string }>("post_created");
+
+async function createPosts(pool: Pool, titles: string[]) {
+  const existingParameters = [titles];
+  const fragment = preparePostgresPublicationFromEncodedRows(postCreated, {
+    schema: "bellows",
+    source: {
+      relation: "delivery_inputs",
+      payloadColumn: "encoded_payload",
+    },
+    parameterOffset: existingParameters.length,
+  });
+  const sql = `
+    WITH inserted_posts AS (
+      INSERT INTO posts (title)
+      SELECT unnest($1::text[])
+      RETURNING title
+    ), delivery_inputs AS (
+      SELECT json_build_object('title', title)::text AS encoded_payload
+      FROM inserted_posts
+    ), published_tasks AS (
+      ${fragment.sql}
+    )
+    SELECT task_id FROM published_tasks
+  `;
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const result = await client.query<PostgresPublicationRow>(
+      sql,
+      [...existingParameters, ...fragment.parameters],
+    );
+    // Validate ALL returned IDs inside the transaction, before committing.
+    const receipts = fragment.readReceipts(result.rows);
+    await client.query("COMMIT");
+    return receipts;
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => undefined);
+    // No automatic retry: an uncertain statement/commit outcome is not a known abort.
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+```
+
+The fragment is a single `INSERT ... SELECT ... RETURNING` body, without a transaction or trailing statement sequence. Task names are bound, never interpolated. Source relation and column identifiers are quoted and must match `[a-z_][a-z0-9_]*` with at most 63 ASCII bytes; qualified paths, arbitrary SQL, and names PostgreSQL would truncate are rejected. `schema` retains the existing backend-option validation and search-path semantics. `parameterOffset` defaults to zero: an offset of `N` uses `$N+1` for the single task-name parameter. Only integer offsets in `0..65534` are accepted, keeping the bind within PostgreSQL's 65535-parameter limit. Append the returned parameters without renumbering SQL.
+
+Return every publication row's `task_id` as exact decimal **text**. Do not convert it through a number or assume any output-to-task positional correspondence: neither result order nor correlation is promised. Empty source relations insert no tasks, and `readReceipts([])` returns an empty collection. The decoder rejects noncanonical/nonpositive IDs with `TypeError` and IDs outside JavaScript's safe-integer range with `PostgresPublishedTaskIdError`, retaining their exact text. It validates the whole collection before returning receipts. Existing publishing APIs retain their legacy ID acceptance behavior. TypeScript's numeric receipts are limited to `Number.MAX_SAFE_INTEGER`; Rust's integer representation can retain positive PostgreSQL IDs through `i64::MAX`, so these representations are not equivalent above the TypeScript limit.
+
+Preparation and decoding never execute SQL, open or close resources, initialize tables, change `search_path`, retry, dispatch, or finalize a transaction. **Let decoder failures abort the enclosing transaction.** Receipts remain provisional until its commit succeeds. The insert's ordinary trigger notifications arrive at commit; any explicit dispatch must follow confirmed commit and must not fail or replay a committed business mutation. A rollback attempt after a transport error does not prove that a preceding commit failed.
+
 #### Receipts, notifications, and dispatch
 
 Receipts inside a transaction are **provisional**: caller rollback or a later commit failure can leave no committed task. Both PostgreSQL publishing implementations return `{ taskId: number }` only for exact safe integers, including `Number.MAX_SAFE_INTEGER`. Otherwise they throw the same `PostgresPublishedTaskIdError`, exported from both `backends/postgres-publishing` and `backends/postgres`, with the exact ID in readonly `taskId: string`. That row may have committed in standalone publication or may still be pending in a caller transaction; receipt validation does not undo the insert or finalize the transaction. Inspect the retained ID instead of automatically republishing. A database/transport exception after sending SQL does not establish rollback.

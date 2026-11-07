@@ -33,7 +33,10 @@ use bellows::{
         postgres::{PostgresBackend, PostgresBackendOptions, initialize_postgres_schema},
         postgres_discovery::PostgresDiscoveryBackend,
         postgres_execution::PostgresExecutionBackend,
-        postgres_publishing::PostgresPublishingBackend,
+        postgres_publishing::{
+            PostgresEncodedRowsPublicationOptions, PostgresEncodedRowsSource,
+            PostgresPublishingBackend, prepare_postgres_publication_from_encoded_rows,
+        },
     },
     dispatcher::WorkerDispatcher,
     run_task_once,
@@ -84,6 +87,240 @@ async fn discovery_default_schema_is_read_only_and_never_initialized_on_connect(
     backend.close().await.unwrap();
     assert!(backend.begin_sweep().await.is_err());
     admin.close().await.unwrap();
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn encoded_rows_compose_with_posts_and_share_the_callers_transaction() {
+    for schema in [None, Some("tasks")] {
+        let database = TestDatabase::new("encoded_posts").await;
+        let mut connection = PgConnection::connect(database.url()).await.unwrap();
+        if schema.is_some() {
+            connection.execute("CREATE SCHEMA tasks").await.unwrap();
+        }
+        initialize_postgres_schema(database.url(), schema.unwrap_or("public"))
+            .await
+            .unwrap();
+        let options = PostgresBackendOptions {
+            schema: schema.map(str::to_owned),
+        };
+        let fragment = prepare_postgres_publication_from_encoded_rows::<EchoTaskSpec>(
+            PostgresEncodedRowsPublicationOptions {
+                backend: options.clone(),
+                source: PostgresEncodedRowsSource {
+                    relation: "delivery_inputs".into(),
+                    payload_column: "encoded_payload".into(),
+                },
+                parameter_offset: 1,
+            },
+        )
+        .unwrap();
+        let sql = format!(
+            "WITH inserted_posts AS (
+                INSERT INTO posts (name) SELECT unnest($1::text[]) RETURNING name
+             ), delivery_inputs AS (
+                SELECT json_build_object('name', name)::text AS encoded_payload FROM inserted_posts
+             ), published AS ({})
+             SELECT task_id FROM published",
+            fragment.sql(),
+        );
+        let mut observer = PgConnection::connect(database.url()).await.unwrap();
+        connection
+            .execute("CREATE TABLE posts (name text NOT NULL CHECK (name <> 'rejected'))")
+            .await
+            .unwrap();
+        let task_count_sql = format!(
+            "SELECT count(*) FROM {}.bellows_tasks",
+            schema.unwrap_or("public")
+        );
+        let execution = PostgresExecutionBackend::connect_with_options(database.url(), options)
+            .await
+            .unwrap();
+
+        for size in [0, 1, 7] {
+            let mut expected = (0..size)
+                .map(|n| format!("post {n} ' \"🦀\"\n"))
+                .collect::<Vec<_>>();
+            let mut transaction = connection.begin().await.unwrap();
+            // Exactly one application + task statement, with the caller's bind before Bellows's.
+            let ids: Vec<String> = sqlx::query_scalar(&sql)
+                .bind(&expected)
+                .bind(&fragment.parameters()[0])
+                .fetch_all(&mut *transaction)
+                .await
+                .unwrap();
+            let receipts = fragment.read_receipts(&ids).unwrap();
+            assert_eq!(receipts.len(), size);
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("SELECT count(*) FROM posts")
+                    .fetch_one(&mut observer)
+                    .await
+                    .unwrap(),
+                0
+            );
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>(&task_count_sql)
+                    .fetch_one(&mut observer)
+                    .await
+                    .unwrap(),
+                0
+            );
+            transaction.commit().await.unwrap();
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("SELECT count(*) FROM posts")
+                    .fetch_one(&mut observer)
+                    .await
+                    .unwrap(),
+                size as i64
+            );
+            let mut consumed = Vec::new();
+            for receipt in receipts {
+                let claimed = execution
+                    .claim_published::<EchoTaskSpec>(
+                        17,
+                        receipt.task_id,
+                        Instant::now() + Duration::from_secs(60),
+                    )
+                    .await
+                    .unwrap();
+                consumed.push(claimed.task_payload.name);
+                // Callback-bearing definition, but no callback was registered by the fragment.
+                execution
+                    .finish::<EchoTaskSpec>(17, receipt.task_id, "no callback".into(), None)
+                    .await
+                    .unwrap();
+            }
+            expected.sort();
+            consumed.sort();
+            assert_eq!(consumed, expected);
+            connection.execute("DELETE FROM posts").await.unwrap();
+        }
+
+        // Successful statements and receipt-validation failures both remain caller-owned.
+        for invalid_receipt in [false, true] {
+            let mut transaction = connection.begin().await.unwrap();
+            let mut ids: Vec<String> = sqlx::query_scalar(&sql)
+                .bind(vec!["rollback"])
+                .bind(&fragment.parameters()[0])
+                .fetch_all(&mut *transaction)
+                .await
+                .unwrap();
+            if invalid_receipt {
+                ids.push("01".into());
+                assert!(fragment.read_receipts(&ids).is_err());
+            } else {
+                assert_eq!(fragment.read_receipts(&ids).unwrap().len(), 1);
+            }
+            transaction.rollback().await.unwrap();
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("SELECT count(*) FROM posts")
+                    .fetch_one(&mut observer)
+                    .await
+                    .unwrap(),
+                0
+            );
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>(&task_count_sql)
+                    .fetch_one(&mut observer)
+                    .await
+                    .unwrap(),
+                0
+            );
+        }
+        // Either insert can fail; neither application nor task rows survive.
+        connection.execute(format!(
+            "ALTER TABLE {}.bellows_tasks ADD CONSTRAINT reject_payload CHECK (payload_json NOT LIKE '%task_failure%')",
+            schema.unwrap_or("public"),
+        ).as_str()).await.unwrap();
+        for name in ["rejected", "task_failure"] {
+            let mut transaction = connection.begin().await.unwrap();
+            assert!(
+                sqlx::query_scalar::<_, String>(&sql)
+                    .bind(vec!["otherwise valid", name])
+                    .bind(&fragment.parameters()[0])
+                    .fetch_all(&mut *transaction)
+                    .await
+                    .is_err()
+            );
+            transaction.rollback().await.unwrap();
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("SELECT count(*) FROM posts")
+                    .fetch_one(&mut observer)
+                    .await
+                    .unwrap(),
+                0
+            );
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>(&task_count_sql)
+                    .fetch_one(&mut observer)
+                    .await
+                    .unwrap(),
+                0
+            );
+        }
+        execution.close().await.unwrap();
+        connection.close().await.unwrap();
+        observer.close().await.unwrap();
+        database.cleanup().await;
+    }
+}
+
+#[tokio::test]
+async fn encoded_rows_return_exact_ids_through_postgres_bigint_max() {
+    let database = TestDatabase::new("encoded_ids").await;
+    initialize_postgres_schema(database.url(), "public")
+        .await
+        .unwrap();
+    let fragment = prepare_postgres_publication_from_encoded_rows::<AckTaskSpec>(
+        PostgresEncodedRowsPublicationOptions {
+            backend: PostgresBackendOptions::default(),
+            source: PostgresEncodedRowsSource {
+                relation: "inputs".into(),
+                payload_column: "payload".into(),
+            },
+            parameter_offset: 0,
+        },
+    )
+    .unwrap();
+    let sql = format!(
+        "WITH inputs AS (SELECT 'null'::text AS payload), published AS ({}) SELECT task_id FROM published",
+        fragment.sql(),
+    );
+    let mut connection = PgConnection::connect(database.url()).await.unwrap();
+    let execution = PostgresExecutionBackend::connect(database.url())
+        .await
+        .unwrap();
+    for id in [9_007_199_254_740_991_i64, 9_007_199_254_740_992, i64::MAX] {
+        sqlx::query("SELECT setval(pg_get_serial_sequence('bellows_tasks', 'task_id'), $1, false)")
+            .bind(id)
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        let mut transaction = connection.begin().await.unwrap();
+        let ids: Vec<String> = sqlx::query_scalar(&sql)
+            .bind(&fragment.parameters()[0])
+            .fetch_all(&mut *transaction)
+            .await
+            .unwrap();
+        assert_eq!(ids, [id.to_string()]);
+        let receipts = fragment.read_receipts(&ids).unwrap();
+        assert_eq!(receipts[0].task_id, id as u64);
+        transaction.commit().await.unwrap();
+        execution
+            .claim_published::<AckTaskSpec>(
+                17,
+                receipts[0].task_id,
+                Instant::now() + Duration::from_secs(60),
+            )
+            .await
+            .unwrap();
+        execution
+            .finish::<AckTaskSpec>(17, receipts[0].task_id, (), None)
+            .await
+            .unwrap();
+    }
+    execution.close().await.unwrap();
+    connection.close().await.unwrap();
     database.cleanup().await;
 }
 

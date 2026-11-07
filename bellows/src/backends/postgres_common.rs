@@ -88,6 +88,28 @@ pub(super) fn discovery_page_sql(table_name: &str) -> String {
 }
 
 pub(super) fn publish_sql(table_name: &str) -> String {
+    publication_sql(table_name, ["$1", "$2", "$3", "$4"], None)
+}
+
+// Inputs are internal SQL expressions, never caller-supplied SQL. Ordinary publication retains
+// its four-bind/numeric-return contract; encoded-row publication uses the same insertion defaults.
+pub(super) fn publication_sql(
+    table_name: &str,
+    [task_name, payload, callback, available]: [&str; 4],
+    source: Option<&str>,
+) -> String {
+    let (input, returned_id) = match source {
+        Some(source) => (
+            format!(
+                "SELECT {task_name}, NULL, {payload}, {callback}, NULL, {available} FROM {source}"
+            ),
+            "task_id::text AS task_id",
+        ),
+        None => (
+            format!("VALUES ({task_name}, NULL, {payload}, {callback}, NULL, {available})"),
+            "task_id",
+        ),
+    };
     format!(
         r#"
 INSERT INTO {table_name} AS tasks (
@@ -98,8 +120,8 @@ INSERT INTO {table_name} AS tasks (
     lease_worker_id,
     available_from_unix_ms
 )
-VALUES ($1, NULL, $2, $3, NULL, $4)
-RETURNING task_id
+{input}
+RETURNING {returned_id}
 "#
     )
 }

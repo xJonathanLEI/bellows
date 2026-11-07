@@ -194,6 +194,40 @@ export class PostgresPublishedTaskIdError extends Error {
   }
 }
 
+export function readPostgresPublishedTaskId(rawTaskId: string): PublishedTask {
+  const taskId = Number(rawTaskId);
+  if (!Number.isSafeInteger(taskId) || String(taskId) !== rawTaskId) {
+    throw new PostgresPublishedTaskIdError(rawTaskId);
+  }
+  return { taskId };
+}
+
+/** Internal shared insertion layout; all arguments are Bellows-generated SQL, not caller SQL. */
+export function postgresPublicationSql(
+  tableName: string,
+  [taskName, payload, callbackId, availableFromMs]: readonly [
+    string,
+    string,
+    string,
+    string,
+  ],
+  sourceRelation?: string,
+): string {
+  const values = `${taskName}, NULL, ${payload}, ${callbackId}, NULL, ${availableFromMs}`;
+  return `
+INSERT INTO ${tableName} (
+    task_name,
+    task_unique_key,
+    payload_json,
+    callback_id,
+    lease_worker_id,
+    available_from_unix_ms
+)
+${sourceRelation === undefined ? `VALUES (${values})` : `SELECT ${values} FROM ${sourceRelation}`}
+RETURNING task_id::text AS task_id
+`;
+}
+
 export function validatePostgresSchemaName(schemaName: string): string {
   if (
     typeof schemaName !== "string" ||
@@ -254,28 +288,11 @@ export class PostgresPublishingOperations {
     availableFromMs: number | null,
   ): Promise<PublishedTask> {
     const result = await this.executor.query(
-      `
-INSERT INTO ${this.tableName} (
-    task_name,
-    task_unique_key,
-    payload_json,
-    callback_id,
-    lease_worker_id,
-    available_from_unix_ms
-)
-VALUES ($1, NULL, $2, $3, NULL, $4)
-RETURNING task_id::text AS task_id
-      `,
+      postgresPublicationSql(this.tableName, ["$1", "$2", "$3", "$4"]),
       [task.name, task.codec.encode(payload), callbackId, availableFromMs],
     );
 
-    const rawTaskId = result.rows[0].task_id;
-    const taskId = Number(rawTaskId);
-    if (!Number.isSafeInteger(taskId) || String(taskId) !== rawTaskId) {
-      throw new PostgresPublishedTaskIdError(rawTaskId);
-    }
-
-    return { taskId };
+    return readPostgresPublishedTaskId(result.rows[0].task_id);
   }
 }
 
@@ -698,7 +715,7 @@ WHERE task_id = $1
   }
 }
 
-function parseSchemaOption(
+export function parseSchemaOption(
   options: PostgresBackendOptions,
 ): string | undefined {
   return options.schema === undefined
@@ -706,7 +723,7 @@ function parseSchemaOption(
     : validatePostgresSchemaName(options.schema);
 }
 
-function qualifiedTasksTable(schemaName: string | undefined): string {
+export function qualifiedTasksTable(schemaName: string | undefined): string {
   if (schemaName === undefined) {
     return "bellows_tasks";
   }

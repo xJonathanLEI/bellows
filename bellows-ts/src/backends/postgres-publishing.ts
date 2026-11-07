@@ -16,6 +16,14 @@ export type {
   PostgresPublishParameters,
 } from "./postgres-operations.js";
 export { PostgresPublishedTaskIdError } from "./postgres-operations.js";
+export type {
+  PostgresEncodedRowsPublicationOptions,
+  PostgresEncodedRowsPublicationParameters,
+  PostgresEncodedRowsSource,
+  PostgresPublicationFragment,
+  PostgresPublicationRow,
+} from "./postgres-publication.js";
+export { preparePostgresPublicationFromEncodedRows } from "./postgres-publication.js";
 
 /**
  * Publishing-only PostgreSQL backend, without a listener, callback registry, or execution API.

@@ -14,29 +14,44 @@ const ADMIN_DATABASE_URL: &str = "postgres://postgres:postgres@localhost:5432/po
 
 #[tokio::test]
 async fn rust_publisher_can_drive_rust_worker() {
-    run_publish_to_worker_scenario(PublisherKind::Rust, WorkerKind::Rust).await;
+    run_publish_to_worker_scenario(PublisherKind::Rust, WorkerKind::Rust, false).await;
 }
 
 #[tokio::test]
 async fn rust_publisher_can_drive_typescript_worker() {
-    run_publish_to_worker_scenario(PublisherKind::Rust, WorkerKind::TypeScript).await;
+    run_publish_to_worker_scenario(PublisherKind::Rust, WorkerKind::TypeScript, false).await;
 }
 
 #[tokio::test]
 async fn typescript_publisher_can_drive_rust_worker() {
-    run_publish_to_worker_scenario(PublisherKind::TypeScript, WorkerKind::Rust).await;
+    run_publish_to_worker_scenario(PublisherKind::TypeScript, WorkerKind::Rust, false).await;
 }
 
 #[tokio::test]
 async fn typescript_publisher_can_drive_typescript_worker() {
-    run_publish_to_worker_scenario(PublisherKind::TypeScript, WorkerKind::TypeScript).await;
+    run_publish_to_worker_scenario(PublisherKind::TypeScript, WorkerKind::TypeScript, false).await;
 }
 
-async fn run_publish_to_worker_scenario(publisher: PublisherKind, worker: WorkerKind) {
+#[tokio::test]
+async fn rust_fragment_can_drive_typescript_worker() {
+    run_publish_to_worker_scenario(PublisherKind::Rust, WorkerKind::TypeScript, true).await;
+}
+
+#[tokio::test]
+async fn typescript_fragment_can_drive_rust_worker() {
+    run_publish_to_worker_scenario(PublisherKind::TypeScript, WorkerKind::Rust, true).await;
+}
+
+async fn run_publish_to_worker_scenario(
+    publisher: PublisherKind,
+    worker: WorkerKind,
+    fragment: bool,
+) {
     let database = TestDatabase::new(&format!(
-        "{}_publisher_to_{}_worker",
+        "{}_{}_{}",
         publisher.label(),
-        worker.label()
+        worker.label(),
+        if fragment { "f" } else { "a" },
     ))
     .await;
     let mut worker_process = None;
@@ -44,7 +59,7 @@ async fn run_publish_to_worker_scenario(publisher: PublisherKind, worker: Worker
 
     let result = async {
         let task_name = format!(
-            "{}-{}-{}",
+            "post ' \"🦀\"\n{}-{}-{}",
             publisher.label(),
             worker.label(),
             unique_suffix()
@@ -57,7 +72,12 @@ async fn run_publish_to_worker_scenario(publisher: PublisherKind, worker: Worker
             .expect_ready()
             .await?;
 
-        publisher_process = Some(spawn_publisher(publisher, database.url(), &task_name)?);
+        publisher_process = Some(spawn_publisher(
+            publisher,
+            database.url(),
+            &task_name,
+            fragment,
+        )?);
 
         let published = publisher_process
             .as_mut()
@@ -69,23 +89,21 @@ async fn run_publish_to_worker_scenario(publisher: PublisherKind, worker: Worker
             .expect("worker process should be available")
             .expect_processed()
             .await?;
-        let awaited = publisher_process
-            .as_mut()
-            .expect("publisher process should be available")
-            .expect_awaited()
-            .await?;
+        if !fragment {
+            let awaited = publisher_process
+                .as_mut()
+                .expect("publisher process should be available")
+                .expect_awaited()
+                .await?;
+            if published.task_id != awaited.task_id || awaited.name != task_name {
+                return Err("awaitable callback did not match publication".into());
+            }
+        }
 
         if published.task_id != processed.task_id {
             return Err(format!(
                 "publisher task id {} did not match worker task id {}",
                 published.task_id, processed.task_id
-            ));
-        }
-
-        if published.task_id != awaited.task_id {
-            return Err(format!(
-                "publisher task id {} did not match awaited task id {}",
-                published.task_id, awaited.task_id
             ));
         }
 
@@ -100,13 +118,6 @@ async fn run_publish_to_worker_scenario(publisher: PublisherKind, worker: Worker
             return Err(format!(
                 "worker reported unexpected task name: expected {task_name}, got {}",
                 processed.name
-            ));
-        }
-
-        if awaited.name != task_name {
-            return Err(format!(
-                "awaitable callback reported unexpected task name: expected {task_name}, got {}",
-                awaited.name
             ));
         }
 
@@ -359,7 +370,6 @@ fn spawn_worker(worker: WorkerKind, database_url: &str) -> Result<InteropProcess
             ("typescript worker", command)
         }
     };
-
     spawn_process(label, command)
 }
 
@@ -367,8 +377,9 @@ fn spawn_publisher(
     publisher: PublisherKind,
     database_url: &str,
     task_name: &str,
+    fragment: bool,
 ) -> Result<InteropProcess, String> {
-    let (label, command) = match publisher {
+    let (label, mut command) = match publisher {
         PublisherKind::Rust => {
             let mut command = Command::new(env!("CARGO_BIN_EXE_rust_publisher"));
             command.args([database_url, task_name]);
@@ -382,6 +393,9 @@ fn spawn_publisher(
             ("typescript publisher", command)
         }
     };
+    if fragment {
+        command.arg("fragment");
+    }
 
     spawn_process(label, command)
 }
@@ -450,6 +464,10 @@ struct TestDatabase {
 impl TestDatabase {
     async fn new(test_name: &str) -> Self {
         let database_name = format!("bellows_{}_{}", test_name, unique_suffix());
+        assert!(
+            database_name.len() <= 63,
+            "test database name would be truncated"
+        );
 
         let mut admin = PgConnection::connect(ADMIN_DATABASE_URL)
             .await
