@@ -51,6 +51,241 @@ use tokio::sync::{
 struct EchoTaskSpec;
 
 #[tokio::test]
+async fn completion_is_atomic_with_callbacks_in_every_mode() {
+    struct CallbackSingleton;
+    impl TaskDefinition for CallbackSingleton {
+        const NAME: &str = "completion_singleton";
+        type Callback = String;
+        type Trigger = SingletonTrigger;
+    }
+
+    let database = TestDatabase::new("completion").await;
+    let mut admin = PgConnection::connect(database.url()).await.unwrap();
+    admin.execute("CREATE SCHEMA completion").await.unwrap();
+    initialize_postgres_schema(database.url(), "completion")
+        .await
+        .unwrap();
+    let backend = PostgresExecutionBackend::connect_with_options(
+        database.url(),
+        PostgresBackendOptions {
+            schema: Some("completion".into()),
+        },
+    )
+    .await
+    .unwrap();
+    let mut listener = sqlx::postgres::PgListener::connect(database.url())
+        .await
+        .unwrap();
+    listener.listen("bellows_tasks").await.unwrap();
+    let state_sql =
+        "SELECT row_to_json(t)::text FROM completion.bellows_tasks t WHERE task_id = $1";
+
+    for kind in 0..4 {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let available = matches!(kind, 1 | 2).then_some(deadline);
+        let finish = |owner, id, payload| {
+            let backend = &backend;
+            async move {
+                if kind >= 2 {
+                    backend
+                        .finish::<CallbackSingleton>(owner, id, payload, available)
+                        .await
+                } else {
+                    backend
+                        .finish::<EchoTaskSpec>(owner, id, payload, available)
+                        .await
+                }
+            }
+        };
+        for registered in [true, false] {
+            let id = if kind >= 2 {
+                backend
+                    .claim_singleton::<CallbackSingleton>(17, deadline)
+                    .await
+                    .unwrap()
+                    .task_id
+            } else {
+                let id: i64 = sqlx::query_scalar(
+                    "INSERT INTO completion.bellows_tasks (task_name, payload_json)
+                     VALUES ($1, $2) RETURNING task_id",
+                )
+                .bind(EchoTaskSpec::NAME)
+                .bind(r#"{"name":"callback"}"#)
+                .fetch_one(&mut admin)
+                .await
+                .unwrap();
+                let id = u64::try_from(id).unwrap();
+                backend
+                    .claim_published::<EchoTaskSpec>(17, id, deadline)
+                    .await
+                    .unwrap();
+                id
+            };
+            let id_db = i64::try_from(id).unwrap();
+            // Rust must keep using the persisted name, not the supplied definition's name.
+            sqlx::query("UPDATE completion.bellows_tasks SET task_name = $2, callback_id = $3 WHERE task_id = $1")
+                .bind(id_db).bind("persisted \"🦀\"\nname")
+                .bind(registered.then_some(i64::MAX))
+                .execute(&mut admin).await.unwrap();
+            let before: String = sqlx::query_scalar(state_sql)
+                .bind(id_db)
+                .fetch_one(&mut admin)
+                .await
+                .unwrap();
+            for (owner, task) in [(18, id), (17, 0)] {
+                assert!(matches!(
+                    finish(owner, task, String::new()).await,
+                    Err(FinishTaskError::LeaseLost)
+                ));
+            }
+            let wrong_kind = if kind >= 2 {
+                backend
+                    .finish::<EchoTaskSpec>(17, id, String::new(), available)
+                    .await
+            } else {
+                backend
+                    .finish::<CallbackSingleton>(17, id, String::new(), available)
+                    .await
+            };
+            assert!(matches!(wrong_kind, Err(FinishTaskError::LeaseLost)));
+            if registered {
+                let Err(FinishTaskError::Backend(error)) = finish(17, id, "x".repeat(9000)).await
+                else {
+                    panic!("expected oversized notification failure");
+                };
+                assert!(error.source().unwrap().is::<sqlx::Error>());
+                if kind == 0 {
+                    // A deferred constraint fails after the result row: fetch_optional must
+                    // consume implicit commit, not return success on the first streamed row.
+                    admin
+                        .execute(
+                            "CREATE TABLE completion.reference (
+                            task_id bigint REFERENCES completion.bellows_tasks (task_id)
+                            DEFERRABLE INITIALLY DEFERRED
+                         )",
+                        )
+                        .await
+                        .unwrap();
+                    sqlx::query("INSERT INTO completion.reference VALUES ($1)")
+                        .bind(id_db)
+                        .execute(&mut admin)
+                        .await
+                        .unwrap();
+                    let Err(FinishTaskError::Backend(error)) =
+                        finish(17, id, "commit rejected".into()).await
+                    else {
+                        panic!("expected implicit-commit failure")
+                    };
+                    let source = error
+                        .source()
+                        .unwrap()
+                        .downcast_ref::<sqlx::Error>()
+                        .unwrap();
+                    assert_eq!(
+                        source.as_database_error().unwrap().code().as_deref(),
+                        Some("23503")
+                    );
+                    admin
+                        .execute("DROP TABLE completion.reference")
+                        .await
+                        .unwrap();
+                }
+            }
+            let unchanged: String = sqlx::query_scalar(state_sql)
+                .bind(id_db)
+                .fetch_one(&mut admin)
+                .await
+                .unwrap();
+            assert_eq!(unchanged, before);
+
+            // Oversized callback text is harmless when no callback was registered.
+            let payload = if registered {
+                "hello \"🦀\"\n\\".into()
+            } else {
+                "x".repeat(9000)
+            };
+            assert_eq!(finish(17, id, payload.clone()).await.unwrap().task_id, id);
+            let after: Option<String> = sqlx::query_scalar(state_sql)
+                .bind(id_db)
+                .fetch_optional(&mut admin)
+                .await
+                .unwrap();
+            if kind == 0 {
+                assert!(after.is_none());
+            } else {
+                let after: serde_json::Value = serde_json::from_str(&after.unwrap()).unwrap();
+                let before: serde_json::Value = serde_json::from_str(&before).unwrap();
+                assert!(after["lease_worker_id"].is_null());
+                assert!(after["callback_id"].is_null());
+                assert_eq!(after["task_unique_key"], before["task_unique_key"]);
+                assert_eq!(after["payload_json"], before["payload_json"]);
+                assert_eq!(
+                    after["available_from_unix_ms"].is_null(),
+                    available.is_none()
+                );
+                if available.is_some() {
+                    assert!(
+                        after["available_from_unix_ms"].as_i64().unwrap()
+                            > SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap()
+                                .as_millis() as i64
+                    );
+                }
+            }
+            assert!(matches!(
+                finish(17, id, String::new()).await,
+                Err(FinishTaskError::LeaseLost)
+            ));
+
+            // The committed barrier bounds delivery and suppression checks, including failures
+            // and repeated completion, without relying on notification timing.
+            sqlx::query("SELECT pg_notify('bellows_tasks', 'completion-barrier')")
+                .execute(&mut admin)
+                .await
+                .unwrap();
+            let mut callbacks = Vec::new();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let notification = listener.recv().await.unwrap();
+                    if notification.payload() == "completion-barrier" {
+                        break;
+                    }
+                    let value: serde_json::Value =
+                        serde_json::from_str(notification.payload()).unwrap();
+                    if value["kind"] == "task_callback" {
+                        callbacks.push(value);
+                    }
+                }
+            })
+            .await
+            .expect("notification barrier was not delivered");
+            let expected = if registered {
+                vec![serde_json::json!({
+                    "kind": "task_callback",
+                    "task_name": "persisted \"🦀\"\nname",
+                    "callback_id": i64::MAX,
+                    "callback_payload_json": serde_json::to_string(&payload).unwrap(),
+                })]
+            } else {
+                vec![]
+            };
+            assert_eq!(callbacks, expected);
+
+            if kind >= 2 {
+                // Reuse the same singleton and its cleared callback on the next iteration.
+                sqlx::query("UPDATE completion.bellows_tasks SET task_name = $1, available_from_unix_ms = 0 WHERE task_id = $2")
+                    .bind(CallbackSingleton::NAME).bind(id_db).execute(&mut admin).await.unwrap();
+            }
+        }
+    }
+    drop(listener);
+    backend.close().await.unwrap();
+    admin.close().await.unwrap();
+    database.cleanup().await;
+}
+
+#[tokio::test]
 async fn discovery_default_schema_is_read_only_and_never_initialized_on_connect() {
     let database = TestDatabase::new("discovery_default").await;
     let backend = PostgresDiscoveryBackend::connect(database.url())

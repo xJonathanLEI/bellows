@@ -521,6 +521,14 @@ const backend = await PostgresBackend.connect(
 await backend.initialize();
 ```
 
+#### Atomic task completion
+
+Both PostgreSQL execution backends use one parameterized `finish` statement to delete or reschedule the owned task and conditionally notify its callback. PostgreSQL's implicit transaction commits both effects together; notification failure rolls back the mutation. Rescheduling and singleton completion clear the old callback registration. Callback codecs run before SQL even without a registered callback; encoding failure executes no SQL, and encoded values remain opaque text inside notifications.
+
+Completion issues **one SQL execution instead of three without a callback or four with one**. These counts exclude connection setup, cold statement preparation, claims, renewals, and side effects; they are not whole-task roundtrip or throughput claims.
+
+Successful return confirms statement completion and implicit commit. Cancellation or connection loss after sending SQL does not prove rollback; do not automatically retry an uncertain completion. Await backend `close()` to drain owned activity. See the [shared completion contract](../README.md#atomic-task-completion) for cancellation and shutdown guarantees across Rust and TypeScript.
+
 ## Testing
 
 Run the test suite:

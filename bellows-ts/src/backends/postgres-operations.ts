@@ -553,122 +553,75 @@ WHERE task_id = $2
     availableFromMs: number | null,
   ): Promise<FinishedTask> {
     const callbackPayloadJson = task.callbackCodec.encode(callbackPayload);
-    const client = await this.pool.connect();
-
-    try {
-      await client.query("BEGIN");
-
-      const finishedRow =
-        task.kind === "singleton"
-          ? (
-              await client.query<{
-                callback_id: number | string | null;
-              }>(
-                `
+    // $1/$2 fence ownership; $3/$4/$5 describe the callback; updates also bind $6 availability.
+    // Keep the encoded payload as opaque text, and the callback ID in PostgreSQL's BIGINT domain.
+    const notification = `
+SELECT 1 AS finished,
+       CASE WHEN callback_id IS NOT NULL THEN
+           pg_notify(
+               $3::text,
+               json_build_object(
+                   'kind', 'task_callback',
+                   'task_name', $4::text,
+                   'callback_id', callback_id,
+                   'callback_payload_json', $5::text
+               )::text
+           )
+       END AS notification
+`;
+    const parameters = [
+      taskId,
+      workerId,
+      POSTGRES_NOTIFY_CHANNEL,
+      task.name,
+      callbackPayloadJson,
+    ];
+    // Await the completed query, including implicit commit, rather than streaming its first row.
+    const result =
+      task.kind === "singleton" || availableFromMs !== null
+        ? await this.pool.query<{ finished: number }>(
+            `
 WITH claimed AS (
     SELECT task_id, callback_id
     FROM ${this.tableName}
     WHERE task_id = $1
       AND lease_worker_id = $2
-      AND task_unique_key IS NOT NULL
+      AND task_unique_key IS ${task.kind === "singleton" ? "NOT NULL" : "NULL"}
     FOR UPDATE
 ), updated AS (
     UPDATE ${this.tableName} AS tasks
     SET lease_worker_id = NULL,
         callback_id = NULL,
-        available_from_unix_ms = $3
+        available_from_unix_ms = $6
     WHERE tasks.task_id IN (SELECT task_id FROM claimed)
     RETURNING tasks.task_id
 )
-SELECT claimed.callback_id
+${notification}
 FROM claimed
 JOIN updated ON updated.task_id = claimed.task_id
-                `,
-                [taskId, workerId, availableFromMs],
-              )
-            ).rows[0]
-          : availableFromMs !== null
-            ? (
-                await client.query<{
-                  callback_id: number | string | null;
-                }>(
-                  `
-WITH claimed AS (
-    SELECT task_id, callback_id
-    FROM ${this.tableName}
+            `,
+            [...parameters, availableFromMs],
+          )
+        : await this.pool.query<{ finished: number }>(
+            `
+WITH finished AS (
+    DELETE FROM ${this.tableName}
     WHERE task_id = $1
       AND lease_worker_id = $2
       AND task_unique_key IS NULL
-    FOR UPDATE
-), updated AS (
-    UPDATE ${this.tableName} AS tasks
-    SET lease_worker_id = NULL,
-        callback_id = NULL,
-        available_from_unix_ms = $3
-    WHERE tasks.task_id IN (SELECT task_id FROM claimed)
-    RETURNING tasks.task_id
+    RETURNING callback_id
 )
-SELECT claimed.callback_id
-FROM claimed
-JOIN updated ON updated.task_id = claimed.task_id
-                  `,
-                  [taskId, workerId, availableFromMs],
-                )
-              ).rows[0]
-            : (
-                await client.query<{
-                  callback_id: number | string | null;
-                }>(
-                  `
-DELETE FROM ${this.tableName}
-WHERE task_id = $1
-  AND lease_worker_id = $2
-  AND task_unique_key IS NULL
-RETURNING callback_id
-                  `,
-                  [taskId, workerId],
-                )
-              ).rows[0];
+${notification}
+FROM finished
+            `,
+            parameters,
+          );
 
-      if (!finishedRow) {
-        await client.query("ROLLBACK");
-        throw new LeaseLostError();
-      }
-
-      if (finishedRow.callback_id !== null) {
-        await client.query(
-          `
-SELECT pg_notify(
-    $1,
-    json_build_object(
-      'kind',
-      'task_callback',
-      'task_name',
-      $2::text,
-      'callback_id',
-      $3::bigint,
-      'callback_payload_json',
-      $4::text
-    )::text
-)
-          `,
-          [
-            POSTGRES_NOTIFY_CHANNEL,
-            task.name,
-            finishedRow.callback_id,
-            callbackPayloadJson,
-          ],
-        );
-      }
-
-      await client.query("COMMIT");
-      return { taskId };
-    } catch (error) {
-      await client.query("ROLLBACK").catch(() => undefined);
-      throw error;
-    } finally {
-      client.release();
+    if (!result.rows[0]) {
+      throw new LeaseLostError();
     }
+
+    return { taskId };
   }
 
   private async loadClaimFailure(

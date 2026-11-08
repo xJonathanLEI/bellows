@@ -19,12 +19,12 @@ use crate::backends::{
 use crate::{PublishActivationStrategy, TaskDefinition};
 
 use super::postgres_common::{
-    DISCOVERY_PAGE_SIZE, NOTIFY_CHANNEL, NOTIFY_SQL, NotificationPayload, PostgresBackendOptions,
-    PostgresDiscoveryCandidate, PostgresSweepWindow, PreparedPublication, claim_earliest_sql,
-    claim_published_sql, claim_singleton_sql, discovery_page_sql, discovery_window_sql,
-    earliest_availability_sql, fail_sql, finish_published_sql, finish_rescheduled_sql,
-    finish_singleton_sql, instant_to_unix_ms, published_state_sql, published_task, renew_sql,
-    singleton_state_sql, unix_ms_to_instant, unix_timestamp_ms, validate_schema_name,
+    DISCOVERY_PAGE_SIZE, NOTIFY_CHANNEL, PostgresBackendOptions, PostgresDiscoveryCandidate,
+    PostgresSweepWindow, PreparedPublication, claim_earliest_sql, claim_published_sql,
+    claim_singleton_sql, discovery_page_sql, discovery_window_sql, earliest_availability_sql,
+    fail_sql, finish_published_sql, finish_rescheduled_sql, finish_singleton_sql,
+    instant_to_unix_ms, published_state_sql, published_task, renew_sql, singleton_state_sql,
+    unix_ms_to_instant, unix_timestamp_ms, validate_schema_name,
 };
 use super::postgres_publishing::{PostgresPublishQuery, PostgresPublishingExecutor};
 
@@ -617,78 +617,36 @@ impl PostgresTaskOperations {
         })?;
         let available_from_unix_ms = available_from.map(instant_to_unix_ms);
 
-        let mut tx =
-            self.pool.begin().await.map_err(|err| {
-                FinishTaskError::Backend(Box::new(PostgresBackendError::Sqlx(err)))
-            })?;
-
-        let finished_row = match (
+        let (sql, reschedule) = match (
             <T::Trigger as crate::ActivationStrategy>::KIND,
             available_from,
         ) {
             (crate::ActivationStrategyKind::Singleton, _) => {
-                sqlx::query(&finish_singleton_sql(&self.table_name))
-                    .bind(task_id_db)
-                    .bind(worker_id_db)
-                    .bind(available_from_unix_ms)
-                    .fetch_optional(&mut *tx)
-                    .await
-                    .map_err(|err| {
-                        FinishTaskError::Backend(Box::new(PostgresBackendError::Sqlx(err)))
-                    })?
+                (finish_singleton_sql(&self.table_name), true)
             }
             (crate::ActivationStrategyKind::Publish, Some(_)) => {
-                sqlx::query(&finish_rescheduled_sql(&self.table_name))
-                    .bind(task_id_db)
-                    .bind(worker_id_db)
-                    .bind(available_from_unix_ms)
-                    .fetch_optional(&mut *tx)
-                    .await
-                    .map_err(|err| {
-                        FinishTaskError::Backend(Box::new(PostgresBackendError::Sqlx(err)))
-                    })?
+                (finish_rescheduled_sql(&self.table_name), true)
             }
             (crate::ActivationStrategyKind::Publish, None) => {
-                sqlx::query(&finish_published_sql(&self.table_name))
-                    .bind(task_id_db)
-                    .bind(worker_id_db)
-                    .fetch_optional(&mut *tx)
-                    .await
-                    .map_err(|err| {
-                        FinishTaskError::Backend(Box::new(PostgresBackendError::Sqlx(err)))
-                    })?
+                (finish_published_sql(&self.table_name), false)
             }
         };
-
-        let Some(finished_row) = finished_row else {
-            tx.rollback().await.ok();
-            return Err(FinishTaskError::LeaseLost);
-        };
-
-        let task_name = finished_row.get::<String, _>("task_name");
-        let callback_id = finished_row.get::<Option<i64>, _>("callback_id");
-
-        if let Some(callback_id) = callback_id {
-            let payload_json = serde_json::to_string(&NotificationPayload::TaskCallback {
-                task_name,
-                callback_id,
-                callback_payload_json,
-            })
-            .expect("postgres callback notification payload should serialize");
-
-            sqlx::query(NOTIFY_SQL)
-                .bind(NOTIFY_CHANNEL)
-                .bind(payload_json)
-                .execute(&mut *tx)
-                .await
-                .map_err(|err| {
-                    FinishTaskError::Backend(Box::new(PostgresBackendError::Sqlx(err)))
-                })?;
+        let mut query = sqlx::query(&sql)
+            .bind(task_id_db)
+            .bind(worker_id_db)
+            .bind(NOTIFY_CHANNEL)
+            .bind(callback_payload_json);
+        if reschedule {
+            query = query.bind(available_from_unix_ms);
         }
-
-        tx.commit()
+        // Consume statement completion, not just its first row: implicit-commit errors matter.
+        let finished_row = query
+            .fetch_optional(&self.pool)
             .await
             .map_err(|err| FinishTaskError::Backend(Box::new(PostgresBackendError::Sqlx(err))))?;
+        if finished_row.is_none() {
+            return Err(FinishTaskError::LeaseLost);
+        }
 
         Ok(FinishedTask { task_id })
     }

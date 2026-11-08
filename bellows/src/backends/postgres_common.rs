@@ -2,14 +2,11 @@
 
 use std::{io, sync::Arc};
 
-use serde::{Deserialize, Serialize};
-
 use crate::{PublishActivationStrategy, TaskDefinition, backends::PublishedTask, time::Instant};
 
 use super::postgres_publishing::PostgresPublishQuery;
 
 pub(super) const NOTIFY_CHANNEL: &str = "bellows_tasks";
-pub(super) const NOTIFY_SQL: &str = "SELECT pg_notify($1, $2)";
 
 /// Options shared by PostgreSQL backends.
 #[derive(Debug, Clone, Default)]
@@ -299,6 +296,9 @@ WHERE task_id = $2
     )
 }
 
+// Finish parameters: task ID, worker ID, notification channel, encoded callback, and (for
+// updates only) nullable availability. Keep the notification in the consumed final SELECT:
+// its implicit transaction commits both effects or neither, even if the consumer is cancelled.
 pub(super) fn finish_singleton_sql(table_name: &str) -> String {
     format!(
         r#"
@@ -313,11 +313,19 @@ WITH claimed AS (
     UPDATE {table_name} AS tasks
     SET lease_worker_id = NULL,
         callback_id = NULL,
-        available_from_unix_ms = $3
+        available_from_unix_ms = $5
     WHERE tasks.task_id IN (SELECT task_id FROM claimed)
     RETURNING tasks.task_id
 )
-SELECT claimed.task_name, claimed.callback_id
+SELECT 1 AS finished,
+       CASE WHEN claimed.callback_id IS NOT NULL THEN
+           pg_notify($3::text, json_build_object(
+               'kind', 'task_callback',
+               'task_name', claimed.task_name,
+               'callback_id', claimed.callback_id,
+               'callback_payload_json', $4::text
+           )::text)
+       END AS notification
 FROM claimed
 JOIN updated ON updated.task_id = claimed.task_id
 "#
@@ -338,11 +346,19 @@ WITH claimed AS (
     UPDATE {table_name} AS tasks
     SET lease_worker_id = NULL,
         callback_id = NULL,
-        available_from_unix_ms = $3
+        available_from_unix_ms = $5
     WHERE tasks.task_id IN (SELECT task_id FROM claimed)
     RETURNING tasks.task_id
 )
-SELECT claimed.task_name, claimed.callback_id
+SELECT 1 AS finished,
+       CASE WHEN claimed.callback_id IS NOT NULL THEN
+           pg_notify($3::text, json_build_object(
+               'kind', 'task_callback',
+               'task_name', claimed.task_name,
+               'callback_id', claimed.callback_id,
+               'callback_payload_json', $4::text
+           )::text)
+       END AS notification
 FROM claimed
 JOIN updated ON updated.task_id = claimed.task_id
 "#
@@ -352,16 +368,29 @@ JOIN updated ON updated.task_id = claimed.task_id
 pub(super) fn finish_published_sql(table_name: &str) -> String {
     format!(
         r#"
-DELETE FROM {table_name}
-WHERE task_id = $1
-  AND lease_worker_id = $2
-  AND task_unique_key IS NULL
-RETURNING task_name, callback_id
+WITH finished AS (
+    DELETE FROM {table_name}
+    WHERE task_id = $1
+      AND lease_worker_id = $2
+      AND task_unique_key IS NULL
+    RETURNING task_name, callback_id
+)
+SELECT 1 AS finished,
+       CASE WHEN callback_id IS NOT NULL THEN
+           pg_notify($3::text, json_build_object(
+               'kind', 'task_callback',
+               'task_name', task_name,
+               'callback_id', callback_id,
+               'callback_payload_json', $4::text
+           )::text)
+       END AS notification
+FROM finished
 "#
     )
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(super) enum NotificationPayload {
     NewTaskAvailable {

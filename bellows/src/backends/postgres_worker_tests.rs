@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use tokio::{net::TcpStream, sync::oneshot, time::timeout};
 use tokio_postgres::{NoTls, config::SslMode};
 
+use super::super::postgres_common::NotificationPayload;
 use super::*;
 use crate::{
     Backend, PublishTrigger, SingletonTrigger, TaskExecutionBackend,
@@ -1721,16 +1722,69 @@ async fn singleton_claims_are_atomic_guard_names_and_retain_rescheduled_rows() {
     f.cleanup().await;
 }
 
+async fn assert_callbacks(
+    f: &Fixture,
+    listener: &mut sqlx::postgres::PgListener,
+    expected: &[(&str, &str)],
+) {
+    // A committed signal on the same channel bounds absence assertions without sleeps.
+    let barrier = serde_json::to_string(&NotificationPayload::NewTaskAvailable {
+        task_name: f.schema.clone(),
+        task_id: 0,
+        available_from_unix_ms: None,
+    })
+    .unwrap();
+    f.admin
+        .query_typed(
+            "SELECT pg_notify($1, $2)",
+            &[(&NOTIFY_CHANNEL, Type::TEXT), (&barrier, Type::TEXT)],
+        )
+        .await
+        .unwrap();
+    let mut actual = Vec::new();
+    timeout(LIMIT, async {
+        loop {
+            let notification = listener.recv().await.unwrap();
+            if notification.payload() == barrier {
+                break;
+            }
+            if let NotificationPayload::TaskCallback {
+                task_name,
+                callback_id,
+                callback_payload_json,
+            } = serde_json::from_str(notification.payload()).unwrap()
+                && callback_id == f.callback_id
+            {
+                actual.push((
+                    task_name,
+                    serde_json::from_str::<String>(&callback_payload_json).unwrap(),
+                ));
+            }
+        }
+    })
+    .await
+    .expect("notification barrier was not delivered");
+    assert_eq!(
+        actual,
+        expected
+            .iter()
+            .map(|(name, payload)| (name.to_string(), payload.to_string()))
+            .collect::<Vec<_>>()
+    );
+}
+
 #[tokio::test]
 async fn callbacks_are_delivered_transactionally_for_deletion_and_rescheduling() {
-    let f = Fixture::new().await;
+    let mut f = Fixture::new().await;
+    f.callback_id = i64::MAX;
     let ops = f.connect().await;
     let mut listener = sqlx::postgres::PgListener::connect(DATABASE_URL)
         .await
         .unwrap();
     listener.listen(NOTIFY_CHANNEL).await.unwrap();
-    for kind in 0..3 {
-        let id = if kind == 2 {
+    for kind in 0..4 {
+        let available = matches!(kind, 1 | 2).then(expiration);
+        let id = if kind >= 2 {
             ops.claim_singleton::<Singleton>(17, expiration())
                 .await
                 .unwrap()
@@ -1744,12 +1798,30 @@ async fn callbacks_are_delivered_transactionally_for_deletion_and_rescheduling()
         };
         f.callback(id).await;
         let before = f.state(id).await;
+        for (owner, task) in [(18, id), (17, 0)] {
+            let result = if kind >= 2 {
+                ops.finish::<Singleton>(owner, task, String::new(), available)
+                    .await
+            } else {
+                ops.finish::<Echo>(owner, task, String::new(), available)
+                    .await
+            };
+            assert!(matches!(result, Err(FinishTaskError::LeaseLost)));
+        }
+        let wrong_kind = if kind >= 2 {
+            ops.finish::<Echo>(17, id, String::new(), available).await
+        } else {
+            ops.finish::<Singleton>(17, id, String::new(), available)
+                .await
+        };
+        assert!(matches!(wrong_kind, Err(FinishTaskError::LeaseLost)));
+        assert_eq!(f.state(id).await, before);
         // PostgreSQL rejects an oversized NOTIFY. Deletion or rescheduling must roll back with it.
-        let result = if kind == 2 {
-            ops.finish::<Singleton>(17, id, "x".repeat(9000), Some(expiration()))
+        let result = if kind >= 2 {
+            ops.finish::<Singleton>(17, id, "x".repeat(9000), available)
                 .await
         } else {
-            ops.finish::<Echo>(17, id, "x".repeat(9000), (kind == 1).then(expiration))
+            ops.finish::<Echo>(17, id, "x".repeat(9000), available)
                 .await
         };
         let Err(FinishTaskError::Backend(error)) = result else {
@@ -1761,52 +1833,86 @@ async fn callbacks_are_delivered_transactionally_for_deletion_and_rescheduling()
             before,
             "failed notification must not commit partial completion"
         );
-        let payload = "hello \"🦀\"";
-        if kind == 2 {
-            ops.finish::<Singleton>(17, id, payload.into(), Some(expiration()))
+        if kind == 0 {
+            // The final SELECT can return a row before a deferred constraint rejects commit.
+            // query_typed_opt must consume that error rather than reporting completion.
+            f.admin
+                .batch_execute(&format!(
+                    "CREATE TABLE \"{}\".completion_reference (
+                    task_id bigint REFERENCES {} (task_id) DEFERRABLE INITIALLY DEFERRED
+                 )",
+                    f.schema, f.table,
+                ))
                 .await
                 .unwrap();
-        } else {
-            ops.finish::<Echo>(17, id, payload.into(), (kind == 1).then(expiration))
+            f.admin
+                .execute_typed(
+                    &format!(
+                        "INSERT INTO \"{}\".completion_reference VALUES ($1)",
+                        f.schema
+                    ),
+                    &[(&(id as i64), Type::INT8)],
+                )
+                .await
+                .unwrap();
+            let Err(FinishTaskError::Backend(error)) = ops
+                .finish::<Echo>(17, id, "commit rejected".into(), None)
+                .await
+            else {
+                panic!("expected implicit-commit failure")
+            };
+            let source = error
+                .source()
+                .unwrap()
+                .downcast_ref::<tokio_postgres::Error>()
+                .unwrap();
+            assert_eq!(
+                source.code(),
+                Some(&tokio_postgres::error::SqlState::FOREIGN_KEY_VIOLATION)
+            );
+            assert_eq!(f.state(id).await, before);
+            f.admin
+                .batch_execute(&format!("DROP TABLE \"{}\".completion_reference", f.schema))
                 .await
                 .unwrap();
         }
-        timeout(LIMIT, async {
-            loop {
-                let notification = listener.recv().await.unwrap();
-                if let NotificationPayload::TaskCallback {
-                    task_name,
-                    callback_id,
-                    callback_payload_json,
-                } = serde_json::from_str(notification.payload()).unwrap()
-                    && callback_id == f.callback_id
-                {
-                    assert_eq!(
-                        task_name,
-                        if kind == 2 {
-                            Singleton::NAME
-                        } else {
-                            Echo::NAME
-                        }
-                    );
-                    assert_eq!(
-                        serde_json::from_str::<String>(&callback_payload_json).unwrap(),
-                        payload
-                    );
-                    break;
-                }
-            }
-        })
-        .await
-        .expect("typed callback notification was not delivered");
+        assert_callbacks(&f, &mut listener, &[]).await;
+        let payload = "hello \"🦀\"";
+        if kind >= 2 {
+            ops.finish::<Singleton>(17, id, payload.into(), available)
+                .await
+                .unwrap();
+        } else {
+            ops.finish::<Echo>(17, id, payload.into(), available)
+                .await
+                .unwrap();
+        }
+        assert_callbacks(
+            &f,
+            &mut listener,
+            &[(
+                if kind >= 2 {
+                    Singleton::NAME
+                } else {
+                    Echo::NAME
+                },
+                payload,
+            )],
+        )
+        .await;
         if kind == 0 {
             assert!(f.state(id).await.is_none());
         } else {
             let state = f.state(id).await.unwrap();
             assert_eq!((state.owner, state.callback), (None, None));
-            assert!(state.available.unwrap() > unix_timestamp_ms(SystemTime::now()));
+            assert_eq!(state.payload, before.unwrap().payload);
+            if available.is_some() {
+                assert!(state.available.unwrap() > unix_timestamp_ms(SystemTime::now()));
+            } else {
+                assert_eq!(state.available, None);
+            }
+            f.make_available(id).await;
             if kind == 1 {
-                f.make_available(id).await;
                 assert_eq!(
                     ops.claim_earliest_published::<Echo>(18, expiration())
                         .await
@@ -1814,12 +1920,25 @@ async fn callbacks_are_delivered_transactionally_for_deletion_and_rescheduling()
                         .task_id,
                     id
                 );
-                ops.finish::<Echo>(18, id, String::new(), None)
+                ops.finish::<Echo>(18, id, "x".repeat(9000), None)
                     .await
                     .unwrap();
                 assert!(f.state(id).await.is_none());
+            } else {
+                assert_eq!(
+                    ops.claim_singleton::<Singleton>(18, expiration())
+                        .await
+                        .unwrap()
+                        .task_id,
+                    id
+                );
+                ops.finish::<Singleton>(18, id, "x".repeat(9000), None)
+                    .await
+                    .unwrap();
             }
         }
+        // A subsequent callback-free completion must not replay the cleared callback.
+        assert_callbacks(&f, &mut listener, &[]).await;
     }
     drop(listener);
     ops.close().await.unwrap();
@@ -2088,7 +2207,33 @@ async fn close_waits_for_an_active_operation_and_finalization_commits_before_ret
 }
 
 #[tokio::test]
-async fn cancelled_finalization_and_serialization_failure_leave_the_row_owned() {
+async fn callback_serialization_failure_executes_no_sql_and_leaves_the_row_owned() {
+    let f = Fixture::new().await;
+    let ops = f.connect().await;
+    let id = f.echo("serialization failure").await;
+    ops.claim_published::<Echo>(17, id, expiration())
+        .await
+        .unwrap();
+    for registered in [false, true] {
+        if registered {
+            f.callback(id).await;
+        }
+        let before = f.state(id).await;
+        // Holding the only client proves the failure occurs before connection acquisition/SQL.
+        let client = ops.client().await.unwrap();
+        assert!(matches!(
+            timeout(LIMIT, ops.finish::<RejectedCallbackTask>(17, id, RejectedCallback, None)).await.unwrap(),
+            Err(FinishTaskError::Backend(error)) if error.source().unwrap().is::<serde_json::Error>()
+        ));
+        drop(client);
+        assert_eq!(f.state(id).await, before);
+    }
+    ops.close().await.unwrap();
+    f.cleanup().await;
+}
+
+#[tokio::test]
+async fn cancelled_sent_finalization_commits_atomically_and_close_drains_the_driver() {
     let f = Fixture::new().await;
     let ops = f.connect().await;
     let id = f.echo("cancelled finish").await;
@@ -2096,12 +2241,10 @@ async fn cancelled_finalization_and_serialization_failure_leave_the_row_owned() 
         .await
         .unwrap();
     f.callback(id).await;
-    let before = f.state(id).await;
-    assert!(matches!(
-        ops.finish::<RejectedCallbackTask>(17, id, RejectedCallback, None).await,
-        Err(FinishTaskError::Backend(error)) if error.source().unwrap().is::<serde_json::Error>()
-    ));
-    assert_eq!(f.state(id).await, before);
+    let mut listener = sqlx::postgres::PgListener::connect(DATABASE_URL)
+        .await
+        .unwrap();
+    listener.listen(NOTIFY_CHANNEL).await.unwrap();
 
     f.admin
         .batch_execute(&format!(
@@ -2116,21 +2259,19 @@ async fn cancelled_finalization_and_serialization_failure_leave_the_row_owned() 
     f.wait_for_blocked_query().await;
     attempt.abort();
     assert!(attempt.await.unwrap_err().is_cancelled());
+    // SQL was sent on a healthy connection. Cancelling its consumer does not cancel the
+    // autocommit statement; close must await the driver even after the client guard is dropped.
+    let mut close = Box::pin(ops.close());
+    pending(close.as_mut()).await;
     f.admin.batch_execute("COMMIT").await.unwrap();
-    // This round trip queues behind Transaction::drop's rollback, so an aborted DELETE cannot
-    // leak into the next operation on the shared client or commit when it is closed.
-    timeout(LIMIT, ops.renew(17, id, expiration()))
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(f.state(id).await.unwrap().callback, Some(f.callback_id));
-    ops.fail(17, id, None).await.unwrap();
-    let state = f.state(id).await.unwrap();
-    assert_eq!(
-        (state.owner, state.available, state.callback),
-        (None, None, Some(f.callback_id))
-    );
-    ops.close().await.unwrap();
+    timeout(LIMIT, close).await.unwrap().unwrap();
+    assert!(matches!(
+        &*ops.shared.driver.lock().await,
+        Driver::Closed(Ok(()))
+    ));
+    assert!(f.state(id).await.is_none());
+    assert_callbacks(&f, &mut listener, &[(Echo::NAME, "")]).await;
+    drop(listener);
     f.cleanup().await;
 }
 

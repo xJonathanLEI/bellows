@@ -20,12 +20,12 @@ use crate::{
 };
 
 use super::postgres_common::{
-    DISCOVERY_PAGE_SIZE, NOTIFY_CHANNEL, NOTIFY_SQL, NotificationPayload, PostgresBackendOptions,
-    PostgresDiscoveryCandidate, PostgresSweepWindow, PreparedPublication, claim_earliest_sql,
-    claim_published_sql, claim_singleton_sql, discovery_page_sql, discovery_window_sql,
-    earliest_availability_sql, fail_sql, finish_published_sql, finish_rescheduled_sql,
-    finish_singleton_sql, instant_to_unix_ms, published_state_sql, published_task, renew_sql,
-    singleton_state_sql, unix_ms_to_instant, unix_timestamp_ms,
+    DISCOVERY_PAGE_SIZE, NOTIFY_CHANNEL, PostgresBackendOptions, PostgresDiscoveryCandidate,
+    PostgresSweepWindow, PreparedPublication, claim_earliest_sql, claim_published_sql,
+    claim_singleton_sql, discovery_page_sql, discovery_window_sql, earliest_availability_sql,
+    fail_sql, finish_published_sql, finish_rescheduled_sql, finish_singleton_sql,
+    instant_to_unix_ms, published_state_sql, published_task, renew_sql, singleton_state_sql,
+    unix_ms_to_instant, unix_timestamp_ms,
 };
 use super::postgres_publishing::{PostgresPublishQuery, PostgresPublishingExecutor};
 
@@ -608,64 +608,37 @@ impl PostgresTaskOperations {
             finish_error(PostgresWorkerError::CallbackSerialization(Arc::new(error)))
         })?;
         let available = available_from.map(instant_to_unix_ms);
-        let mut client = self.client().await.map_err(finish_error)?;
-        let tx = client.transaction().await.map_err(finish_error)?;
-        let result = async {
-            let (sql, reschedule) = match (T::Trigger::KIND, available_from) {
-                (ActivationStrategyKind::Singleton, _) => {
-                    (finish_singleton_sql(&self.table_name), true)
-                }
-                (ActivationStrategyKind::Publish, Some(_)) => {
-                    (finish_rescheduled_sql(&self.table_name), true)
-                }
-                (ActivationStrategyKind::Publish, None) => {
-                    (finish_published_sql(&self.table_name), false)
-                }
-            };
-            let mut params: Vec<(&(dyn ToSql + Sync), Type)> =
-                vec![(&task_id_db, Type::INT8), (&worker_id_db, Type::INT8)];
-            if reschedule {
-                params.push((&available, Type::INT8));
+        let client = self.client().await.map_err(finish_error)?;
+        let (sql, reschedule) = match (T::Trigger::KIND, available_from) {
+            (ActivationStrategyKind::Singleton, _) => {
+                (finish_singleton_sql(&self.table_name), true)
             }
-            let row = tx
-                .query_typed_opt(&sql, &params)
-                .await
-                .map_err(finish_error)?;
-            let Some(row) = row else {
-                return Err(FinishTaskError::LeaseLost);
-            };
-            let callback_id: Option<i64> = row.try_get("callback_id").map_err(finish_error)?;
-            if let Some(callback_id) = callback_id {
-                let payload = serde_json::to_string(&NotificationPayload::TaskCallback {
-                    task_name: row.try_get("task_name").map_err(finish_error)?,
-                    callback_id,
-                    callback_payload_json,
-                })
-                .expect("postgres callback notification payload should serialize");
-                tx.query_typed(
-                    NOTIFY_SQL,
-                    &[(&NOTIFY_CHANNEL, Type::TEXT), (&payload, Type::TEXT)],
-                )
-                .await
-                .map_err(finish_error)?;
+            (ActivationStrategyKind::Publish, Some(_)) => {
+                (finish_rescheduled_sql(&self.table_name), true)
             }
-            Ok(FinishedTask { task_id })
+            (ActivationStrategyKind::Publish, None) => {
+                (finish_published_sql(&self.table_name), false)
+            }
+        };
+        let mut params: Vec<(&(dyn ToSql + Sync), Type)> = vec![
+            (&task_id_db, Type::INT8),
+            (&worker_id_db, Type::INT8),
+            (&NOTIFY_CHANNEL, Type::TEXT),
+            (&callback_payload_json, Type::TEXT),
+        ];
+        if reschedule {
+            params.push((&available, Type::INT8));
         }
-        .await;
-        match result {
-            Ok(finished) => {
-                tx.commit().await.map_err(finish_error)?;
-                Ok(finished)
-            }
-            Err(error) => {
-                // Await rollback on ordinary error paths, including a failed callback notification.
-                // Transaction's Drop also queues rollback if this future is cancelled mid-query.
-                if let Err(rollback) = tx.rollback().await {
-                    tracing::warn!(%rollback, "postgres finalization rollback failed");
-                }
-                Err(error)
-            }
+        // Await the complete statement, including implicit commit. Cancellation after sending
+        // does not establish rollback; close still drains the owned connection driver.
+        let row = client
+            .query_typed_opt(&sql, &params)
+            .await
+            .map_err(finish_error)?;
+        if row.is_none() {
+            return Err(FinishTaskError::LeaseLost);
         }
+        Ok(FinishedTask { task_id })
     }
 }
 

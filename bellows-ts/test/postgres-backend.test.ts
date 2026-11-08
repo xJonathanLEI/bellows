@@ -473,7 +473,8 @@ test.each([
   "delete",
   "reschedule",
   "singleton",
-])("postgres execution rolls back failed callback finalization: %s", async (mode) => {
+  "singleton-immediate",
+])("postgres completion uses one atomic statement: %s", async (mode) => {
   const database = track(
     await TestPostgresDatabase.create("callback_rollback"),
   );
@@ -481,7 +482,58 @@ test.each([
   const table = `"${schema}".bellows_tasks`;
   const admin = new Client({ connectionString: database.url });
   await admin.connect();
+  const notifications = new AsyncChannel<string>();
+  admin.on("notification", ({ channel, payload }) => {
+    if (channel === "bellows_tasks" && payload !== undefined) {
+      notifications.send(payload);
+    }
+  });
+  // A later committed signal bounds notification absence without timing-based sleeps.
+  const callbacksThroughBarrier = async () => {
+    const barrier = randomUUID();
+    await admin.query("SELECT pg_notify('bellows_tasks', $1)", [barrier]);
+    const callbacks: string[] = [];
+    for (;;) {
+      const payload = await notifications.recv();
+      if (payload === barrier) return callbacks;
+      if (payload === null) throw new Error("Notification listener closed");
+      const decoded: unknown = JSON.parse(payload);
+      if (
+        typeof decoded === "object" &&
+        decoded !== null &&
+        "kind" in decoded &&
+        decoded.kind === "task_callback"
+      ) {
+        callbacks.push(payload);
+      }
+    }
+  };
+  const finishOnce = async <T>(
+    operation: () => Promise<T>,
+    expectedQueries = 1,
+  ): Promise<T> => {
+    const poolQuery = vi.spyOn(Pool.prototype, "query");
+    const driverQuery = vi.spyOn(Client.prototype, "query");
+    try {
+      return await operation();
+    } finally {
+      try {
+        // These are separate observation layers, not two executions of the same query.
+        expect(poolQuery).toHaveBeenCalledTimes(expectedQueries);
+        expect(driverQuery).toHaveBeenCalledTimes(expectedQueries);
+        for (const [sql, parameters] of driverQuery.mock.calls) {
+          expect(typeof sql).toBe("string");
+          expect(sql).not.toMatch(/\b(BEGIN|COMMIT|ROLLBACK)\b|;/i);
+          expect(Array.isArray(parameters)).toBe(true);
+        }
+      } finally {
+        driverQuery.mockRestore();
+        poolQuery.mockRestore();
+      }
+    }
+  };
   try {
+    await admin.query("LISTEN bellows_tasks");
     await admin.query(`CREATE SCHEMA "${schema}"`);
     await initializePostgresSchema(database.url, schema);
     const publisher = track(
@@ -492,23 +544,25 @@ test.each([
     );
     const singleton = defineSingletonTask<string>("callback_singleton");
     const expiration = Date.now() + 60_000;
-    const task = mode === "singleton" ? singleton : echoTask;
-    const taskId =
-      mode === "singleton"
-        ? (await executor.claimSingleton(singleton, 17, expiration)).taskId
-        : (await publisher.publish(echoTask, { name: "callback" })).taskId;
-    if (mode !== "singleton") {
+    const isSingleton = mode.startsWith("singleton");
+    const task = isSingleton ? singleton : echoTask;
+    const taskId = isSingleton
+      ? (await executor.claimSingleton(singleton, 17, expiration)).taskId
+      : (await publisher.publish(echoTask, { name: "callback" })).taskId;
+    if (!isSingleton) {
       await executor.claimPublished(echoTask, 17, taskId, expiration);
     }
+    const callbackId = "9223372036854775807";
     await admin.query(
       `UPDATE ${table} SET callback_id = $1 WHERE task_id = $2`,
-      [123, taskId],
+      [callbackId, taskId],
     );
-    const state = async () =>
-      (await admin.query(`SELECT * FROM ${table} WHERE task_id = $1`, [taskId]))
+    const state = async (id = taskId) =>
+      (await admin.query(`SELECT * FROM ${table} WHERE task_id = $1`, [id]))
         .rows;
     const before = await state();
-    const available = mode === "delete" ? null : expiration;
+    const available =
+      mode === "delete" || mode === "singleton-immediate" ? null : expiration;
     const failingCodecTask = {
       ...task,
       callbackCodec: {
@@ -519,15 +573,24 @@ test.each([
       },
     };
     await expect(
-      executor.finish(failingCodecTask, 17, taskId, "callback", available),
+      finishOnce(
+        () =>
+          executor.finish(failingCodecTask, 17, taskId, "callback", available),
+        0,
+      ),
     ).rejects.toThrow("intentional callback serialization failure");
     expect(await state()).toEqual(before);
     // PostgreSQL rejects oversized NOTIFY payloads. The task mutation must roll back too.
     await expect(
-      executor.finish(task, 17, taskId, "x".repeat(9000), available),
-    ).rejects.toThrow();
+      finishOnce(() =>
+        executor.finish(task, 17, taskId, "x".repeat(9000), available),
+      ),
+    ).rejects.toMatchObject({
+      code: "22023",
+      message: "payload string too long",
+    });
     expect(await state()).toEqual(before);
-    if (mode === "singleton") {
+    if (isSingleton) {
       const publishedSameName = definePublishTask<void>(singleton.name);
       await expect(
         executor.claimPublished(publishedSameName, 18, taskId, expiration),
@@ -535,16 +598,63 @@ test.each([
       await expect(
         executor.claimEarliestPublished(publishedSameName, 18, expiration),
       ).rejects.toEqual(new TaskUnavailableError(null));
-      await expect(
-        executor.finish(publishedSameName, 17, taskId, undefined, null),
-      ).rejects.toBeInstanceOf(LeaseLostError);
+      for (const deadline of [null, expiration]) {
+        await expect(
+          finishOnce(() =>
+            executor.finish(publishedSameName, 17, taskId, undefined, deadline),
+          ),
+        ).rejects.toBeInstanceOf(LeaseLostError);
+      }
     } else {
       await expect(
-        executor.finish(singleton, 17, taskId, "callback", null),
+        finishOnce(() =>
+          executor.finish(singleton, 17, taskId, "callback", null),
+        ),
+      ).rejects.toBeInstanceOf(LeaseLostError);
+    }
+    for (const [workerId, requestedTaskId] of [
+      [18, taskId],
+      [17, taskId + 1],
+    ]) {
+      await expect(
+        finishOnce(() =>
+          executor.finish(
+            task,
+            workerId,
+            requestedTaskId,
+            "callback",
+            available,
+          ),
+        ),
       ).rejects.toBeInstanceOf(LeaseLostError);
     }
     expect(await state()).toEqual(before);
-    await executor.finish(task, 17, taskId, 'hello "🦀"', available);
+    expect(await callbacksThroughBarrier()).toEqual([]);
+    const suppliedTask = {
+      ...task,
+      name: `${task.name}_supplied`,
+      callbackCodec: {
+        encode: (value: string) => `opaque:${value}`,
+        decode: (value: string) => value.slice("opaque:".length),
+      },
+    };
+    const callback = 'hello "🦀"\\\nnot JSON';
+    expect(
+      await finishOnce(() =>
+        executor.finish(suppliedTask, 17, taskId, callback, available),
+      ),
+    ).toEqual({ taskId });
+    const callbacks = await callbacksThroughBarrier();
+    expect(callbacks).toHaveLength(1);
+    const notification = callbacks[0];
+    // Check the wire ID before JSON.parse can round it through a JavaScript number.
+    expect(notification).toMatch(/"callback_id"\s*:\s*9223372036854775807\b/);
+    expect(JSON.parse(notification)).toEqual({
+      kind: "task_callback",
+      task_name: suppliedTask.name,
+      callback_id: Number(callbackId),
+      callback_payload_json: suppliedTask.callbackCodec.encode(callback),
+    });
     if (mode === "delete") {
       expect(await state()).toEqual([]);
     } else {
@@ -553,12 +663,70 @@ test.each([
           ...before[0],
           lease_worker_id: null,
           callback_id: null,
-          available_from_unix_ms: String(expiration),
+          available_from_unix_ms: available === null ? null : String(available),
         },
       ]);
     }
+    await expect(
+      finishOnce(() => executor.finish(task, 17, taskId, "again", available)),
+    ).rejects.toBeInstanceOf(LeaseLostError);
+
+    // Reclaim the retained row (or publish another after deletion). The old callback
+    // must not fire again, even when the encoded value would exceed NOTIFY's limit.
+    let nextTaskId = taskId;
+    if (mode === "delete") {
+      nextTaskId = (await publisher.publish(echoTask, { name: "no callback" }))
+        .taskId;
+    } else if (available !== null) {
+      await admin.query(
+        `UPDATE ${table} SET available_from_unix_ms = NULL WHERE task_id = $1`,
+        [taskId],
+      );
+    }
+    if (isSingleton) {
+      expect(
+        (await executor.claimSingleton(singleton, 17, expiration)).taskId,
+      ).toBe(taskId);
+    } else {
+      await executor.claimPublished(echoTask, 17, nextTaskId, expiration);
+    }
+    const noCallbackBefore = await state(nextTaskId);
+    await expect(
+      finishOnce(
+        () =>
+          executor.finish(
+            failingCodecTask,
+            17,
+            nextTaskId,
+            "no callback",
+            available,
+          ),
+        0,
+      ),
+    ).rejects.toThrow("intentional callback serialization failure");
+    expect(await state(nextTaskId)).toEqual(noCallbackBefore);
+    expect(
+      await finishOnce(() =>
+        executor.finish(task, 17, nextTaskId, "x".repeat(9000), available),
+      ),
+    ).toEqual({ taskId: nextTaskId });
+    expect(await state(nextTaskId)).toEqual(
+      mode === "delete"
+        ? []
+        : [
+            {
+              ...noCallbackBefore[0],
+              lease_worker_id: null,
+              callback_id: null,
+              available_from_unix_ms:
+                available === null ? null : String(available),
+            },
+          ],
+    );
+    expect(await callbacksThroughBarrier()).toEqual([]);
   } finally {
     await admin.end();
+    notifications.close();
   }
 });
 

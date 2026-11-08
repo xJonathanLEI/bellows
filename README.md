@@ -156,6 +156,14 @@ Because the signaling is provided by Postgres itself, this backend works natural
 
 This makes the Postgres backend the built-in option intended for durable distributed deployments, while SQLite remains the lightweight single-process durable option.
 
+#### Atomic task completion
+
+PostgreSQL `finish` uses one parameterized statement to delete or reschedule the owned task and conditionally notify its registered callback, in both Rust drivers (native SQLx and Workers `tokio-postgres`) and TypeScript. The statement's implicit transaction commits the mutation and notification together; a notification error rolls back the mutation. Published rescheduling and singleton completion clear the old callback registration, so later completions do not replay it. Callback encoding happens before SQL, even without a registered callback; an encoding failure executes no SQL.
+
+Completion now issues **one SQL execution instead of three** (`BEGIN`, mutation, `COMMIT`) without a callback, or **one instead of four** with a callback (previously a separate notification statement). These counts cover completion only, excluding connection setup, cold statement preparation, claims, renewals, and task side effects; they are not whole-task roundtrip or throughput claims.
+
+A successful return confirms statement completion and implicit commit. Cancellation or connection loss after SQL is sent does **not** establish rollback: the outcome may be unknown, but mutation and notification remain atomic. Dropping a Workers completion future does not cancel already-sent SQL. Await backend `close()` to drain owned driver activity, including work whose consumer was cancelled; abrupt process or request termination cannot guarantee cleanup. Do not automatically retry an uncertain completion.
+
 ### Publishing without a listener
 
 Use `PostgresPublishingBackend` when your producer only needs typed publication. It exposes no initialization, execution, subscription, or awaitable API. Create the schema and initialize tables separately with [`initialize_postgres_schema`](./bellows/src/backends/postgres.rs) through an administrative connection. This example assumes the existing `bellows` schema is initialized:
